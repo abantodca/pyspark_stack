@@ -15,13 +15,13 @@ x-airflow-common: &airflow-common
     # En Airflow 3 la creacion de usuarios/RBAC vive en el provider FAB:
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     # SQL_ALCHEMY_CONN se movio de [core] a [database] en Airflow 3:
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow-db:5432/${POSTGRES_DB:-airflow}
     AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
     # El scheduler/worker habla con el api-server via la Task Execution API (nuevo en Airflow 3).
     # OJO: debe apuntar al hostname del contenedor api-server, NO a localhost:
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     # Reemplaza al viejo WEBSERVER__SECRET_KEY: el api-server firma tokens JWT.
-    AIRFLOW__API_AUTH__JWT_SECRET: 'supersecretjwtkey'
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:-change-me-in-prod}'
     AIRFLOW_UID: 50000
   volumes:
     - ./dags:/opt/airflow/dags
@@ -143,13 +143,13 @@ services:
     image: postgres:16
     container_name: airflow-db
     environment:
-      - POSTGRES_USER=airflow
-      - POSTGRES_PASSWORD=airflow
-      - POSTGRES_DB=airflow
+      - POSTGRES_USER=${POSTGRES_USER:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -169,7 +169,7 @@ services:
       bash -c "
         airflow db migrate &&
         airflow fab-db migrate &&
-        airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin || true"
+        airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true"
 
   # UI + API REST (antes 'airflow webserver'). Sirve en 8080 dentro del contenedor.
   airflow-apiserver:
