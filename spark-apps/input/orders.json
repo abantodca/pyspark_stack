@@ -1,0 +1,5 @@
+{"order_id": 5001, "customer_id": 101, "amount": 250.5, "status": "shipped"}
+{"order_id": 5002, "customer_id": 102, "amount": 145.0, "status": "cancelled"}
+{"order_id": 5003, "customer_id": 104, "amount": 389.99, "status": "processing"}
+{"order_id": 5004, "customer_id": 105, "amount": 89.99, "status": "shipped"}
+{"order_id": 5005, "customer_id": 106, "amount": 199.0, "status": "returned"}

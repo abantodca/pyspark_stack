@@ -1,0 +1,229 @@
+# -----------------------------------------------------------------------------
+# Config comun de los servicios de Airflow 3.2.2 (LocalExecutor).
+# Airflow 3 parte el monolito: api-server (UI+API), scheduler, dag-processor y triggerer
+# son procesos independientes que comparten esta misma imagen, env y volumenes.
+# -----------------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  # image + build compartidos: la imagen se construye UNA vez y los 5 servicios airflow-*
+  # la reutilizan (evita 5 imagenes duplicadas de ~7GB y que 'up' agarre una imagen vieja).
+  image: pyspark_stack-airflow:3.2.2
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # En Airflow 3 la creacion de usuarios/RBAC vive en el provider FAB:
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    # SQL_ALCHEMY_CONN se movio de [core] a [database] en Airflow 3:
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+    # El scheduler/worker habla con el api-server via la Task Execution API (nuevo en Airflow 3).
+    # OJO: debe apuntar al hostname del contenedor api-server, NO a localhost:
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    # Reemplaza al viejo WEBSERVER__SECRET_KEY: el api-server firma tokens JWT.
+    AIRFLOW__API_AUTH__JWT_SECRET: 'supersecretjwtkey'
+    AIRFLOW_UID: 50000
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./spark-apps:/opt/spark-apps
+    - /var/run/docker.sock:/var/run/docker.sock
+    - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
+  networks:
+    - hadoopnet
+
+services:
+  hdfs-namenode:
+    #image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    image: chandravenkat/hadoop-namenode@sha256:51ad9293ec52083c5003ef0aaab00c3dd7d6335ddf495cc1257f97a272cab4c0
+    container_name: hdfs-namenode
+    environment:
+      - CLUSTER_NAME=hadoop-cluster
+      - CORE_CONF_fs_defaultFS=hdfs://hdfs-namenode:9000
+    ports:
+      - "9870:9870"
+    volumes:
+      - hdfs-nn-data:/hadoop/dfs/name
+      - ./spark-apps:/opt/spark-apps
+    networks:
+      - hadoopnet
+
+  hdfs-datanode:
+    #image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    image: chandravenkat/hadoop-datanode@sha256:ddf6e9ad55af4f73d2ccb6da31d9e3331ffb94d5f046126db4f40aa348d484bf
+    container_name: hdfs-datanode
+    depends_on:
+      - hdfs-namenode
+    environment:
+      - CLUSTER_NAME=hadoop-cluster
+      - CORE_CONF_fs_defaultFS=hdfs://hdfs-namenode:9000
+      - HDFS_CONF_dfs_replication=1
+    volumes:
+      - hdfs-dn-data:/hadoop/dfs/data
+      - ./spark-apps:/opt/spark-apps
+    networks:
+      - hadoopnet
+
+  # Cluster Spark 4.0.3 (imagen oficial Apache, Java 17 + Python 3 para los executors PySpark).
+  # La imagen apache/spark esta pensada para spark-submit/k8s, asi que se arranca el master/worker
+  # standalone en foreground con spark-class (sbin/start-*.sh daemonizan y el contenedor saldria).
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: pyspark_stack-spark:4.0.3
+    container_name: spark-master
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    volumes:
+      - ./spark-apps:/opt/spark-apps
+      - ./spark-events:/tmp/spark-events
+    networks:
+      - hadoopnet
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: pyspark_stack-spark:4.0.3
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    volumes:
+      - ./spark-apps:/opt/spark-apps
+    networks:
+      - hadoopnet
+      
+#  spark-history-server:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile.history
+#    container_name: spark-history
+#    ports:
+#      - "18080:18080"
+#    volumes:
+#      - ./spark-events:/tmp/spark-events
+#      - ./spark-events/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+#    environment:
+#      - SPARK_HISTORY_OPTS=-Dspark.history.fs.logDirectory=file:/tmp/spark-events
+#    command: ["/opt/spark/sbin/start-history-server.sh"]
+#    networks:
+#      - hadoopnet
+
+  # Jupyter con pyspark 4.0.3 (mismo Spark que el cluster). Se construye desde Dockerfile.jupyter
+  # (base apache/spark:4.0.3) porque jupyter/pyspark-notebook solo ofrece hasta Spark 3.5.
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.jupyter
+    image: pyspark_stack-jupyter:4.0.3
+    container_name: jupyter-notebook
+    ports:
+      - "8888:8888"
+      - "4055:4040"
+    volumes:
+      - ./notebooks:/opt/notebooks
+      - ./spark-apps:/opt/spark-apps
+      - ./spark-events:/tmp/spark-events
+    depends_on:
+      - spark-master
+    networks:
+      - hadoopnet
+    environment:
+      # Notebook driver -> conecta al master standalone y a HDFS.
+      - SPARK_MASTER=spark://spark-master:7077
+      - PYSPARK_PYTHON=python3
+      - PYSPARK_DRIVER_PYTHON=python3
+
+  airflow-db:
+    image: postgres:16
+    container_name: airflow-db
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - hadoopnet
+
+  # Init one-shot: migra el esquema (core + FAB) y crea el usuario admin, luego sale.
+  # `airflow db migrate` reemplaza al viejo `airflow db upgrade`.
+  # `airflow fab-db migrate` crea las tablas de auth de FAB (ab_user, ab_role, ...), nuevas en Airflow 3.
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow fab-db migrate &&
+        airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin || true"
+
+  # UI + API REST (antes 'airflow webserver'). Sirve en 8080 dentro del contenedor.
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    restart: always
+    command: api-server
+    ports:
+      - "8082:8080"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    restart: always
+    command: scheduler
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Nuevo en Airflow 3: el parsing de DAGs corre en un proceso propio, ya no dentro del scheduler.
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    restart: always
+    command: dag-processor
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Ejecuta operadores deferrables (opcional pero recomendado; estandar en Airflow 3).
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    restart: always
+    command: triggerer
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_data:
+  hdfs-nn-data:
+  hdfs-dn-data:
+
+networks:
+  hadoopnet:

@@ -1,0 +1,34 @@
+# Cluster Spark 4.0.3 (master/worker) con Python 3.12.
+# La imagen oficial apache/spark:4.0.3 es Ubuntu 22.04 -> trae Python 3.10, pero el driver
+# (Airflow, Python 3.12) exige que los executors corran el MISMO minor de Python
+# ([PYTHON_VERSION_MISMATCH] si no). Se instala Python 3.12 desde el PPA deadsnakes y se
+# fuerza PYSPARK_PYTHON=python3.12 para que los workers PySpark casen con el driver.
+FROM apache/spark:4.0.3-scala2.13-java17-python3-ubuntu
+
+USER root
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends software-properties-common && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends python3.12 python3.12-venv && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 && \
+    python3.12 -m pip install --no-cache-dir pyspark==4.0.3 && \
+    apt-get purge -y software-properties-common && apt-get autoremove -y && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Los executors PySpark arrancan con este interprete (debe casar con el driver 3.12).
+ENV PYSPARK_PYTHON=python3.12
+ENV PYSPARK_DRIVER_PYTHON=python3.12
+
+# --- Conector S3A: habilita leer/escribir s3a:// usando el rol IAM de la EC2 (sin keys) ---
+# Spark 4.0.3 empaqueta Hadoop 3.4.1 => hadoop-aws debe ser 3.4.1 y el AWS SDK v2 el que
+# declara esa version (bundle 2.24.6). Si aparece ClassNotFound/NoSuchMethod de S3A, ajusta estas versiones.
+ARG HADOOP_AWS_VERSION=3.4.1
+ARG AWS_SDK_BUNDLE_VERSION=2.24.6
+RUN curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
+      -o "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" \
+      -o "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar"
+
+USER spark

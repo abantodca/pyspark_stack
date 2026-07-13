@@ -1,0 +1,6 @@
+customer_id,customer_name,city,state,signup_date,total_orders,total_spent,days_active,categories_bought,loyalty_status
+C104,Liam Garcia,Chicago,IL,2025-01-25,2,2000.0,2,2,Engaged
+C102,Ethan Johnson,Austin,TX,2025-01-05,2,750.0,2,1,Engaged
+C103,Emma Davis,New York,NY,2025-03-20,1,150.0,1,1,Casual
+C105,Ava Martinez,San Francisco,CA,2025-02-10,1,250.0,1,1,Casual
+C101,Olivia Thompson,Seattle,WA,2024-10-15,4,4650.0,4,3,Loyal

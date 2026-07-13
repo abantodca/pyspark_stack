@@ -1,0 +1,42 @@
+# Jupyter sobre la imagen OFICIAL de Spark 4.0.3 (Java 17 ya incluido).
+# La base trae Python 3.10, pero el cluster corre Python 3.12 -> se instala Python 3.12
+# (deadsnakes) para que el driver del notebook case con los executors (evita PYTHON_VERSION_MISMATCH).
+# (jupyter/pyspark-notebook solo llega a Spark 3.5, por eso no se usa.)
+FROM apache/spark:4.0.3-scala2.13-java17-python3-ubuntu
+
+USER root
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends software-properties-common && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends python3.12 python3.12-venv && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 && \
+    python3.12 -m pip install --no-cache-dir jupyterlab pyspark==4.0.3 && \
+    apt-get purge -y software-properties-common && apt-get autoremove -y && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /opt/notebooks
+
+# 'six' es dependencia transitiva de python-dateutil (lo importa jupyter_client) pero
+# get-pip.py/pip la dejo sin resolver en esta base -> se instala aparte para evitar
+# ModuleNotFoundError: No module named 'six' al arrancar JupyterLab.
+RUN python3.12 -m pip install --no-cache-dir six
+
+# --- Conector S3A: habilita s3a:// desde el notebook usando el rol IAM de la EC2 ---
+ARG HADOOP_AWS_VERSION=3.4.1
+ARG AWS_SDK_BUNDLE_VERSION=2.24.6
+RUN curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
+      -o "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" \
+      -o "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar"
+
+WORKDIR /opt/notebooks
+EXPOSE 8888
+
+# El driver del notebook y los executors usan Python 3.12 (igual que el cluster).
+ENV PYSPARK_PYTHON=python3.12
+ENV PYSPARK_DRIVER_PYTHON=python3.12
+
+# Sin token/password (entorno local de practica), igual que el compose anterior.
+CMD ["python3.12", "-m", "jupyterlab", \
+     "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", \
+     "--ServerApp.token=", "--ServerApp.password=", "--ServerApp.root_dir=/opt/notebooks"]

@@ -1,0 +1,6 @@
+customer_id,name,email,age,country
+101,John Doe,john@example.com,28,US
+102,Jane Smith,jane@example.com,34,UK
+103,Ali Khan,ali@example.com,40,UAE
+104,Rita Mehra,rita@example.com,25,India
+105,Wei Zhang,wei@example.com,31,China

@@ -1,0 +1,5 @@
+[
+  {"product_id": "P1001", "category": "Books", "unit_price": 200},
+  {"product_id": "P1002", "category": "Electronics", "unit_price": 1200},
+  {"product_id": "P1004", "category": "Stationery", "unit_price": 50}
+]
