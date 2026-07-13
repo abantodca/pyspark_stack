@@ -1,0 +1,56 @@
+===============================
+Customer ETL – Version History
+===============================
+
+Version: v1.3  
+Date: 2026-02-28
+Author: Chandra Venkat
+
+Summary:
+- Improved `customer_etl_job_airflow.sh` to make script work across all platforms
+
+
+Impacted Files:
+- customer_etl_job_airflow.sh
+
+--------------------------------
+
+
+
+===============================
+Customer ETL – Version History
+===============================
+
+Version: v1.2  
+Date: 2025-11-22  
+Author: Chandra Venkat
+
+Summary:
+- Improved `customer_etl_job.py` to support both execution styles used across the course.
+- Early lectures: `spark-submit customer_etl_job.py <run_date>`
+- Later lectures: `spark-submit customer_etl_job.py <env> <run_date> <hdfs_input> <hdfs_output>`
+- This change is backward-compatible and requires no action from learners.
+
+Details:
+- Added small argument-handling logic in `customer_etl_job.py`.
+- No behavior changes to existing commands shown in videos.
+
+Impacted Files:
+- customer_etl_job.py
+
+
+--------------------------------
+
+Version: v1.1  
+Date: 2025-08-20  
+Author: Chandra Venkat
+
+Changes:
+- Replaced container check with [ -f /.dockerenv ]
+- PySpark now accepts 4 args: env, run_date, hdfs_input, hdfs_output
+- All configs centralized in env.sh
+
+Impacted Files:
+- customer_etl_job_airflow.sh
+- customer_etl_job.py
+- env.sh

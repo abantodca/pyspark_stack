@@ -1,0 +1,35 @@
+# --- Secretos / entorno ---
+.env
+*.pem
+*.key
+
+# --- Terraform ---
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
+
+# --- Config de monitoreo con credenciales ---
+monitoring/alertmanager/alertmanager.yml
+
+# --- Python ---
+**/__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# --- Spark ---
+spark-events/*
+!spark-events/.gitkeep
+
+# --- Salidas de notebooks ejecutados ---
+notebooks/**/output/
+spark-apps/notebook-output/
+
+# --- Lambdas empaquetadas ---
+**/lambda/*.zip
+
+# --- SO / editor ---
+.DS_Store
+*.swp
