@@ -401,7 +401,7 @@ services:
     <<: [*restart-policy, *default-logging]
     deploy:
       resources:
-        limits: { memory: 6g }        # el worker es quien ejecuta; dale la RAM
+        limits: { memory: 4g }        # el worker ejecuta; ofrece 3G/2 cores a los executors (mismo valor que producción)
 
   jupyter:
     <<: [*restart-policy, *default-logging]
@@ -487,6 +487,6 @@ Antes de considerar el stack "listo":
 - [ ] Imágenes pineadas por tag inmutable o `@sha256`.
 - [ ] Volúmenes con backup (Postgres + HDFS namenode).
 
-> **Siguiente paso:** ver `02-produccion-aws.md` — guía única de producción con las dos
-> arquitecturas (EC2 con Docker + serverless EMR/MWAA), Terraform, estado remoto en S3+DynamoDB,
-> y automatización de costo con EventBridge + Lambda.
+> **Siguiente paso:** ver `02-produccion-aws.md` — guía única de producción (un solo camino: EC2
+> self-managed + S3 + Lambda/EventBridge), Terraform, estado remoto en S3+DynamoDB, monitoreo,
+> CI/CD y automatización de costo con auto start/stop. La arquitectura está en `03-arquitectura.md`.

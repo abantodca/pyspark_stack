@@ -27,11 +27,13 @@ Jupyter (PySpark 4)                  →  notebooks
 
 - **[docs/01 — Docker Compose explicado](docs/01-docker-compose-explicado.md)** — anatomía del stack,
   bloque por bloque, y refactor de producción.
-- **[docs/02 — Producción en AWS](docs/02-produccion-aws.md)** — la guía grande: Terraform
-  (EC2 / serverless), auto start/stop, **CI/CD (GitHub Actions + OIDC)**, notebooks (papermill),
-  **monitoreo (Prometheus + Grafana + Alertmanager + Loki)**, **secretos con SSM/Secrets Manager**
-  y hardening. Todo copy-paste.
-- **[docs/03 — Arquitectura](docs/03-arquitectura.md)** — diagramas (ASCII + Mermaid) y flujos.
+- **[docs/02 — Producción en AWS](docs/02-produccion-aws.md)** — la guía grande (**un solo camino**:
+  EC2 self-managed + S3 + Lambda/EventBridge): Terraform, auto start/stop, data lake S3 (s3a),
+  disparo de DAGs vía SSM, **CI/CD (GitHub Actions + OIDC)**, notebooks (papermill), **monitoreo
+  (Prometheus + Grafana + Alertmanager + Loki)**, **secretos con SSM/Secrets Manager** y hardening.
+  Todo copy-paste.
+- **[docs/03 — Arquitectura](docs/03-arquitectura.md)** — diagramas (ASCII + Mermaid) y flujos del
+  mismo camino (sin MWAA/EMR/Glue).
 
 ## Arranque rápido (local)
 
@@ -54,19 +56,21 @@ docker compose up -d --build
 
 ### Máquina chica (~8 GB)
 
-Solo Spark + Jupyter (sin HDFS/Airflow). El compose está en la guía 02 §14.2:
+Solo Spark + Jupyter (sin HDFS/Airflow). El compose `docker-compose.dev.yml` está listo para copiar
+en la [guía de producción](docs/02-produccion-aws.md):
 
 ```bash
-docker compose -f docker-compose.dev.yml up -d --build   # crealo desde docs/02 §14.2
+docker compose -f docker-compose.dev.yml up -d --build
 ```
 
 ## Producción en AWS
 
-Ver **[docs/02](docs/02-produccion-aws.md)**: EC2 self-managed (o serverless), Terraform con
-estado remoto, monitoreo, CI/CD y secretos en AWS. Todo el código es copy-paste dentro de la guía.
+Ver **[docs/02](docs/02-produccion-aws.md)**: EC2 self-managed + S3 + Lambda/EventBridge (un solo
+camino), Terraform con estado remoto, monitoreo, CI/CD y secretos en AWS. Todo el código es
+copy-paste dentro de la guía.
 
 ## Seguridad
 
 - Los secretos del `docker-compose.yml` están parametrizados (`${VAR:-default}`): en local usan
-  defaults; en producción se sobreescriben vía `.env` o **AWS SSM / Secrets Manager** (docs/02 §13.1).
+  defaults; en producción se sobreescriben vía `.env` o **AWS SSM / Secrets Manager** (ver la guía de producción).
 - `.env`, estados de Terraform y `alertmanager.yml` están en `.gitignore` — nunca subir secretos reales.

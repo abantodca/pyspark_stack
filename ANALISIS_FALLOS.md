@@ -9,14 +9,14 @@
 > (namenode/datanode/jupyter `healthy`, worker Spark registrado, 3 DAGs sin errores de import).
 >
 > 🆕 **Migración a Airflow 3.2.2 (2026-07-12):** se actualizó Airflow de `2.7.2` a **`3.2.2`** (rama 3.2, el
-> parche más maduro; se descartó `3.3.0` por tener solo 6 días de rodaje). Ver **§5. Migración a Airflow 3.x**.
+> parche más maduro; se descartó `3.3.0` por tener solo 6 días de rodaje). Ver **"Migración a Airflow 3.x"**.
 > Esto cambia la topología: ahora hay **api-server + scheduler + dag-processor + triggerer + init** en vez de
 > `webserver + scheduler`. **Requiere `down -v` + `build --no-cache`** (imagen y esquema de BD nuevos).
 >
 > 🆕🆕 **Stack "lo más actual" + verificación end-to-end (2026-07-12):** por decisión de mantener **Python 3.12**
 > (la imagen de Airflow 3 lo trae) se tuvo que subir **todo el cluster Spark de 3.2.1 → `4.0.3`** (Python 3.11+
 > es incompatible con el cloudpickle de PySpark 3.2.x). Spark 4 exige **Java 17**. Además `postgres 13 → 16`.
-> **Los 3 DAGs quedaron verificados en `success` con salida real.** Ver **§5.3** (Spark 4/JDK 17), **§6**
+> **Los 3 DAGs quedaron verificados en `success` con salida real.** Ver **"Efecto dominó Python 3.12 → Spark 4.0.3 → Java 17"** (Spark 4/JDK 17) y **"Verificación end-to-end"**
 > (historia de verificación: cloudpickle, imagen vieja, `PYTHON_VERSION_MISMATCH`, permisos HDFS, `Wrong FS`,
 > des-sincronización del bind-mount).
 >
@@ -41,7 +41,7 @@ Stack de datos local levantado con `docker-compose.yml`:
 | `airflow-triggerer` | build `Dockerfile.airflow` | Operadores deferrables |
 
 > **Airflow 3.2.2** (migrado el 2026-07-12 desde 2.7.2) — imagen base `apache/airflow:3.2.2-python3.12`.
-> Ver **§5. Migración a Airflow 3.x** para el detalle de rupturas y comandos.
+> Ver **"Migración a Airflow 3.x"** para el detalle de rupturas y comandos.
 
 Flujo del pipeline principal (`customer_etl`):
 `DAG (Airflow) → customer_etl_job_airflow.sh → env.sh → sube landing a HDFS → spark-submit customer_etl_job.py → getmerge del resultado a shared_output/`.
@@ -292,7 +292,7 @@ La cadena de decisiones:
 > `[PYTHON_VERSION_MISMATCH] Python in worker has different version: 3.10 than that in driver: 3.12`. **Fix:** se
 > construyen imágenes propias (`Dockerfile.spark` para master/worker y `Dockerfile.jupyter`) que instalan
 > **Python 3.12** desde el PPA *deadsnakes*, y los `spark-submit` de los DAGs pasan
-> `--conf spark.pyspark.python=python3.12 --conf spark.pyspark.driver.python=python3.12`. Ver **§6**.
+> `--conf spark.pyspark.python=python3.12 --conf spark.pyspark.driver.python=python3.12`. Ver **"Verificación end-to-end"**.
 
 ### 5.4 Providers (fijados al constraints file oficial de 3.2.2)
 
@@ -360,7 +360,7 @@ metadata desde las tasks, y SubDAGs / SequentialExecutor eliminados. Ayuda: `air
 dentro del contenedor y la guía oficial *Upgrading to Airflow 3*. Tras el primer arranque,
 `docker compose logs airflow-dag-processor` muestra errores de parseo si los hubiera.
 
-Además, en los DAGs Spark se añadieron flags al `spark-submit` (ver §6):
+Además, en los DAGs Spark se añadieron flags al `spark-submit` (ver "Verificación end-to-end"):
 `--conf spark.pyspark.python=python3.12 --conf spark.pyspark.driver.python=python3.12` (alinear Python
 driver/executor) y, en el de HDFS, `export HADOOP_USER_NAME=root` + `--conf spark.hadoop.fs.defaultFS=hdfs://hdfs-namenode:9000`.
 
@@ -392,7 +392,7 @@ el verde encadenó varios fallos; se documentan porque son **reproducibles** al 
    **Fix:** en `customer_etl_dag.py`, `default_var="dev"` → **`default="dev"`**.
 
 3. **`PicklingError: IndexError: tuple index out of range` (cloudpickle) al ejecutar el wordcount.** PySpark 3.2.1
-   no serializa lambdas en Python 3.12. **Fix de fondo:** subir todo Spark a **4.0.3** (ver §5.3). Esto arrastró
+   no serializa lambdas en Python 3.12. **Fix de fondo:** subir todo Spark a **4.0.3** (ver "Efecto dominó Python 3.12 → Spark 4.0.3 → Java 17"). Esto arrastró
    JDK 17 y las imágenes propias del cluster.
 
 4. **`[PYTHON_VERSION_MISMATCH] worker 3.10 vs driver 3.12`.** La imagen oficial `apache/spark:4.0.3` trae Python
