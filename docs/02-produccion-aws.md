@@ -1,32 +1,34 @@
-# Guía experta — Producción en AWS (Terraform, EC2 + Serverless + automatización)
+# Guía experta — Producción en AWS (Terraform, EC2 self-managed + automatización)
 
-> Guía única de producción para el stack (HDFS/Spark/Jupyter/Airflow). Cubre **las dos
-> arquitecturas** y cuándo usar cada una, con Terraform copy-paste, estado remoto y
-> **automatización con EventBridge + Lambda** para bajar el costo al mínimo.
+> Guía única de producción para el stack (HDFS/Spark/Jupyter/Airflow). Implementa **una sola
+> arquitectura** —la de [`docs/03-arquitectura.md`](03-arquitectura.md)— con Terraform copy-paste,
+> estado remoto y **automatización con EventBridge + Lambda** para bajar el costo al mínimo.
 >
-> - **Arquitectura A — EC2 con Docker** (lift-and-shift): rápido, idéntico al local. Con
->   *auto start/stop* por horario vía **EventBridge + Lambda**.
-> - **Arquitectura B — Serverless** (S3 + EMR Serverless + MWAA / Step Functions): pago por uso,
->   sin servidores que administrar. La opción moderna y barata para producción real.
+> **La arquitectura (un solo camino):** el stack completo corre *self-managed* en **una EC2** con
+> Docker. Alrededor, servicios AWS lo complementan: **S3** como data lake (`s3a://` con rol IAM),
+> **Lambda + EventBridge** para disparar los DAGs (por cron o por evento) y para el *auto
+> start/stop* de la EC2, **Prometheus + Grafana + Alertmanager + Loki** para observabilidad, y
+> **CI/CD con GitHub Actions (OIDC)**. **No usa MWAA, EMR ni Glue** (ver el porqué en la guía de arquitectura).
 
 Índice:
-1. [Panorama y elección de arquitectura](#1-panorama-y-elección-de-arquitectura)
-2. [Comparativa de costos](#2-comparativa-de-costos)
+1. [Panorama de la arquitectura](#1-panorama-de-la-arquitectura)
+2. [Costo](#2-costo)
 3. [Prerrequisitos](#3-prerrequisitos)
-4. [Fundamentos comunes: backend Terraform (S3 + DynamoDB)](#4-fundamentos-comunes-backend-terraform)
-5. [Arquitectura A — EC2 con Docker](#5-arquitectura-a--ec2-con-docker)
+4. [Fundamentos: backend Terraform (S3 + DynamoDB)](#4-fundamentos-backend-terraform)
+5. [Núcleo: EC2 con Docker](#5-núcleo-ec2-con-docker)
    - 5.1 [Variables y red (SSH-only)](#51-variables-y-red)
    - 5.2 [IAM + key pair](#52-iam--key-pair)
    - 5.3 [EC2 + EBS + user_data](#53-ec2--ebs--user_data)
    - 5.4 [**Automatización: EventBridge + Lambda (auto start/stop)**](#54-automatización-eventbridge--lambda)
    - 5.5 [Desplegar, subir código y túnel SSH](#55-desplegar-subir-código-y-túnel-ssh)
-6. [Arquitectura B — Serverless (EMR + MWAA)](#6-arquitectura-b--serverless)
-   - 6.1 [S3 + Glue Catalog](#61-s3--glue-catalog)
-   - 6.2 [IAM (EMR + MWAA)](#62-iam-emr--mwaa)
-   - 6.3 [EMR Serverless](#63-emr-serverless)
-   - 6.4 [Red + MWAA](#64-red--mwaa)
-   - 6.5 [Adaptar jobs y DAG](#65-adaptar-jobs-y-dag)
-7. [**Variante ultra-barata: EventBridge + Lambda en vez de MWAA**](#7-variante-ultra-barata-eventbridge--lambda)
+6. [Data lake en S3 (s3a con rol IAM) + backups](#6-data-lake-en-s3)
+   - 6.1 [Buckets S3 (data lake + artifacts)](#61-buckets-s3)
+   - 6.2 [IAM: permitir s3a a la EC2 (sin keys)](#62-iam-permitir-s3a-a-la-ec2-sin-keys)
+   - 6.3 [Backups: snapshots EBS automáticos (DLM)](#63-backups-snapshots-ebs-automáticos-dlm)
+7. [Orquestación: Lambda trigger-airflow (SSM) + EventBridge + event-driven](#7-orquestación-lambda-trigger-airflow-ssm--eventbridge--event-driven)
+   - 7.1 [Lambda que dispara los DAGs vía SSM](#71-lambda-que-dispara-los-dags-vía-ssm)
+   - 7.2 [Disparo por cron (EventBridge Scheduler)](#72-disparo-por-cron-eventbridge-scheduler)
+   - 7.3 [Disparo por evento (archivo nuevo en S3)](#73-disparo-por-evento-archivo-nuevo-en-s3)
 8. [Operación, seguridad y ahorro](#8-operación-seguridad-y-ahorro)
 9. [Notebooks: dónde viven y cómo se ejecutan](#9-notebooks-dónde-viven-y-cómo-se-ejecutan)
    - 9.1 [Habilitar papermill](#91-habilitar-papermill)
@@ -55,43 +57,50 @@
 
 ---
 
-## 1. Panorama y elección de arquitectura
+## 1. Panorama de la arquitectura
 
-| Necesidad | Arquitectura recomendada |
-|---|---|
-| Prototipo / entorno idéntico al local / una persona | **A — EC2** (con auto start/stop) |
-| Producción real, cargas intermitentes, mínimo mantenimiento | **B — Serverless** |
-| Máximo ahorro y podés soltar Airflow | **B + Step Functions/Lambda** (§7) |
+Un solo host EC2 corre todo el stack en Docker; AWS *serverless* lo rodea para storage durable
+(S3), disparo de DAGs (Lambda + EventBridge) y ahorro (auto start/stop). El detalle conceptual y
+los diagramas están en [`docs/03-arquitectura.md`](03-arquitectura.md); esta guía es el **cómo**
+(Terraform copy-paste).
 
 **Regla mental:** almacenar es barato y constante; **computar es lo que cuesta, y solo cuando
-corrés**. Toda la guía empuja el gasto hacia *pago por uso* y elimina lo *always-on*.
+corrés**. Por eso la EC2 se apaga fuera de horario (auto start/stop) y el data lake vive en S3.
 
 ```
-Arquitectura A (EC2)                    Arquitectura B (Serverless)
-┌──────────────────────────┐           ┌──────────────────────────────────┐
-│ EC2 + Docker Compose      │           │ S3 (data lake) + Glue Catalog     │
-│  todo el stack en 1 host  │           │ EMR Serverless (Spark, pago/seg)  │
-│  EventBridge+Lambda:      │           │ MWAA  ó  EventBridge+Lambda        │
-│   prende 8am / apaga 18h  │           │  (orquestación)                   │
-└──────────────────────────┘           └──────────────────────────────────┘
+                    ┌───────────── EC2 m6i.xlarge (Elastic IP) ──────────────┐
+ EventBridge  ──►   │  docker compose:                                        │
+  · cron ETL        │   Airflow (5) + Postgres · Spark master/worker ·        │
+  · start/stop  ──► │   HDFS namenode/datanode · Jupyter                      │
+      │             │   MONITOREO: Prometheus · Grafana · Alertmanager · Loki │
+      ▼             └───────┬──────────────────────────────┬─────────────────┘
+  Lambda trigger-airflow    │ s3a:// (rol IAM, sin keys)    │ /data (EBS gp3)
+  Lambda startstop          ▼                               ▼
+                    ┌────────────────┐            (snapshots EBS · DLM)
+                    │ S3 data lake   │  ◄── ObjectCreated raw/ ──► Lambda trigger-airflow
+                    │ raw/curated/…  │
+                    └────────────────┘
 ```
 
 ---
 
-## 2. Comparativa de costos
+## 2. Costo
 
 > Precios **aproximados** us-east-1 (on-demand), sujetos a cambio — validá en
 > [calculator.aws](https://calculator.aws). Escenario: ~1 h de Spark/día, ~50 GB.
 
-| Opción | Qué corre | US$/mes | Naturaleza |
-|---|---|---|---|
-| **A — EC2 `m6i.2xlarge` 24/7** | stack completo | **~300** | Fijo (corras o no) |
-| **A — EC2 apagable** (auto start/stop, 8h×22d) | stack completo o dev-lite | **~70 / ~17** | Fijo reducido |
-| **B — Serverless + MWAA** | EMR + MWAA + NAT | **~175** | $167 fijo + ~$8 uso |
-| **B — Serverless + EventBridge/Lambda** (§7) | EMR + Lambda | **~8–15** | Casi todo por uso |
+| Item | US$/mes |
+|---|---|
+| EC2 `m6i.xlarge` (4 vCPU/16 GB) con **auto start/stop** (8h×22d) | ~34 |
+| EBS gp3 (root 40 + data 200) + snapshots DLM | ~22 |
+| S3 data lake (~50 GB) + requests | ~1.5 |
+| Lambda + EventBridge + SSM | ~0 (free tier) |
+| **Total** | **~58/mes** |
 
-El auto start/stop de §5.4 convierte los ~$300 fijos de A en ~$70 (o ~$17 con el compose dev-lite
-de `docker-compose.dev.yml`). La variante serverless de §7 es la más barata para producción.
+`m6i.xlarge` alcanza porque el cuello no es el dato (~50 MB es trivial) sino la RAM de las JVMs +
+Airflow + monitoreo. Sin auto start/stop (EC2 24/7) serían ~$140/mes: el `start/stop` automático es la
+palanca de ahorro principal. El monitoreo corre dentro de la misma EC2 (costo $0 adicional). Para
+una máquina de desarrollo chica (~8 GB) existe el `docker-compose.dev.yml` del final, solo Spark+Jupyter.
 
 ---
 
@@ -108,16 +117,15 @@ Estructura de carpetas Terraform:
 ```
 infra/
 ├── bootstrap/           # crea backend S3+DynamoDB (una vez, state local)
-├── a-ec2/               # Arquitectura A
-│   ├── lambda/startstop.py
-│   └── *.tf
-└── b-serverless/        # Arquitectura B
-    └── *.tf
+└── prod/                # toda la infra del stack (un solo estado)
+    ├── lambda/startstop.py
+    ├── lambda/trigger_airflow.py
+    └── *.tf              # network, iam, ec2, s3, orchestration, autostop, cicd, secrets
 ```
 
 ---
 
-## 4. Fundamentos comunes: backend Terraform
+## 4. Fundamentos: backend Terraform
 
 Problema huevo-y-gallina: el backend S3 debe existir antes de que Terraform guarde el state ahí.
 Se crea con un mini-Terraform de **state local**, una sola vez.
@@ -171,14 +179,14 @@ resource "aws_dynamodb_table" "tf_lock" {
 cd infra/bootstrap && terraform init && terraform apply && cd ../..
 ```
 
-**Backend compartido** (cada arquitectura usa el mismo bucket, distinto `key`):
+**Backend** (un solo estado remoto para toda la infra de producción):
 
 ```hcl
-# infra/a-ec2/backend.tf   (para B, usar key = "pyspark-stack-serverless/terraform.tfstate")
+# infra/prod/backend.tf
 terraform {
   backend "s3" {
     bucket         = "pyspark-stack-tfstate-abanto-2026"
-    key            = "pyspark-stack-ec2/terraform.tfstate"
+    key            = "pyspark-stack-prod/terraform.tfstate"
     region         = "us-east-1"
     dynamodb_table = "pyspark-stack-tf-lock"
     encrypt        = true
@@ -186,7 +194,7 @@ terraform {
 }
 ```
 
-**Provider común** (mismo archivo en ambas carpetas):
+**Provider** (`infra/prod/providers.tf`):
 
 ```hcl
 # providers.tf
@@ -208,22 +216,33 @@ provider "aws" {
 
 ---
 
-## 5. Arquitectura A — EC2 con Docker
+## 5. Núcleo: EC2 con Docker
 
-Lift-and-shift: una EC2 corre el `docker-compose` completo (o `docker-compose.dev.yml` si tu
-máquina es chica). Acceso **solo por túnel SSH**; ninguna UI expuesta a internet.
+Una EC2 corre el `docker-compose` completo (idéntico al local). Acceso **solo por túnel SSH**;
+ninguna UI expuesta a internet. Es el corazón del stack; las dos secciones siguientes le agregan el
+data lake S3 y el disparo automático de los DAGs.
 
 ### 5.1 Variables y red
 
 ```hcl
-# infra/a-ec2/variables.tf
+# infra/prod/variables.tf
+# Prefijo único de nombres. Cambiá SOLO esto para renombrar todo el proyecto (buckets, roles,
+# lambdas, tags…). Todos los recursos lo interpolan como "${var.name_prefix}-...".
+variable "name_prefix" {
+  type    = string
+  default = "pyspark-stack"
+}
 variable "aws_region" {
   type    = string
   default = "us-east-1"
 }
 variable "instance_type" {
-  type    = string
-  default = "m6i.2xlarge" # dev-lite: "t3.large"
+  type = string
+  # m6i.xlarge = 4 vCPU / 16 GB: corre el stack completo + monitoreo para datos chicos (~50 MB).
+  # IMPORTANTE: familia m6i (NO t3). m6i tiene CPU dedicada y constante; t3 es burstable y al
+  # apagar/prender agota "CPU credits" → caída de rendimiento visible. m6i garantiza el mismo
+  # rendimiento en cada arranque. dev-lite (solo Spark+Jupyter): "t3.large".
+  default = "m6i.xlarge"
 }
 variable "root_volume_gb" {
   type    = number
@@ -253,7 +272,7 @@ variable "stop_cron" {
 ```
 
 ```hcl
-# infra/a-ec2/network.tf
+# infra/prod/network.tf
 data "aws_vpc" "default" {
   default = true
 }
@@ -265,7 +284,7 @@ data "aws_subnets" "default" {
 }
 
 resource "aws_security_group" "pyspark" {
-  name        = "pyspark-stack-sg"
+  name        = "${var.name_prefix}-sg"
   description = "SSH-only desde mi IP. UIs por tunel."
   vpc_id      = data.aws_vpc.default.id
   ingress {
@@ -287,9 +306,9 @@ resource "aws_security_group" "pyspark" {
 ### 5.2 IAM + key pair
 
 ```hcl
-# infra/a-ec2/iam.tf
+# infra/prod/iam.tf
 resource "aws_key_pair" "pyspark" {
-  key_name   = "pyspark-stack-key"
+  key_name   = "${var.name_prefix}-key"
   public_key = var.ssh_public_key
 }
 
@@ -303,7 +322,7 @@ data "aws_iam_policy_document" "ec2_assume" {
   }
 }
 resource "aws_iam_role" "ec2" {
-  name               = "pyspark-stack-ec2-role"
+  name               = "${var.name_prefix}-ec2-role"
   assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
 }
 resource "aws_iam_role_policy_attachment" "ssm" {
@@ -311,7 +330,7 @@ resource "aws_iam_role_policy_attachment" "ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"   # entrar sin abrir puertos
 }
 resource "aws_iam_instance_profile" "ec2" {
-  name = "pyspark-stack-ec2-profile"
+  name = "${var.name_prefix}-ec2-profile"
   role = aws_iam_role.ec2.name
 }
 ```
@@ -319,7 +338,7 @@ resource "aws_iam_instance_profile" "ec2" {
 ### 5.3 EC2 + EBS + user_data
 
 ```hcl
-# infra/a-ec2/ec2.tf
+# infra/prod/ec2.tf
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
@@ -348,7 +367,12 @@ resource "aws_instance" "pyspark" {
   }
   user_data                   = templatefile("${path.module}/user_data.sh.tftpl", {})
   user_data_replace_on_change = true
-  tags = { Name = "pyspark-stack", AutoStartStop = "true" }   # ← la Lambda filtra por este tag
+  # Name = "<prefix>-node" (el workflow de CI busca la instancia por este tag);
+  # AutoStartStop = "true" (la Lambda startstop filtra por él).
+  tags = {
+    Name          = "${var.name_prefix}-node"
+    AutoStartStop = "true"
+  }
 }
 
 resource "aws_ebs_volume" "data" {
@@ -356,7 +380,7 @@ resource "aws_ebs_volume" "data" {
   size              = var.data_volume_gb
   type              = "gp3"
   encrypted         = true
-  tags              = { Name = "pyspark-stack-data" }
+  tags              = { Name = "${var.name_prefix}-data" }   # ← el DLM (backups) respalda por este tag
 }
 resource "aws_volume_attachment" "data" {
   device_name = "/dev/xvdf"
@@ -365,7 +389,7 @@ resource "aws_volume_attachment" "data" {
 }
 ```
 
-**`infra/a-ec2/user_data.sh.tftpl`** (instala Docker + prepara disco de datos):
+**`infra/prod/user_data.sh.tftpl`** (instala Docker + prepara disco de datos):
 
 ```bash
 #!/bin/bash
@@ -395,9 +419,9 @@ echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-pyspark.conf && sysctl --syste
 **El porqué:** en vez de apagar la EC2 a mano, una **Lambda** la prende/apaga y **EventBridge
 Scheduler** la dispara por cron. Con Lambda (en lugar de que Scheduler llame a EC2 directo)
 podés **personalizar la lógica**: no apagar si hay un DAG corriendo, avisar por SNS/Slack, o
-prender solo si hay trabajo en cola. Convierte los ~$300/mes fijos en ~$70 (u ~$17 con dev-lite).
+prender solo si hay trabajo en cola. Convierte los ~$140/mes fijos en ~$34 (u ~$17 con dev-lite).
 
-**Código de la Lambda — `infra/a-ec2/lambda/startstop.py`:**
+**Código de la Lambda — `infra/prod/lambda/startstop.py`:**
 
 ```python
 import os
@@ -432,7 +456,7 @@ def handler(event, context):
     return {"action": action, "instances": ids}
 ```
 
-**Terraform de la automatización — `infra/a-ec2/automation.tf`:**
+**Terraform de la automatización — `infra/prod/automation.tf`:**
 
 ```hcl
 # ---- Empaquetar el código de la Lambda en un zip ----
@@ -453,7 +477,7 @@ data "aws_iam_policy_document" "lambda_assume" {
   }
 }
 resource "aws_iam_role" "lambda" {
-  name               = "pyspark-stack-startstop-lambda"
+  name               = "${var.name_prefix}-startstop-lambda"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
 }
 
@@ -486,7 +510,7 @@ resource "aws_iam_role_policy" "lambda" {
 
 # ---- La función Lambda ----
 resource "aws_lambda_function" "startstop" {
-  function_name    = "pyspark-stack-startstop"
+  function_name    = "${var.name_prefix}-startstop"
   filename         = data.archive_file.startstop.output_path
   source_code_hash = data.archive_file.startstop.output_base64sha256
   handler          = "startstop.handler"
@@ -509,7 +533,7 @@ data "aws_iam_policy_document" "scheduler_assume" {
   }
 }
 resource "aws_iam_role" "scheduler" {
-  name               = "pyspark-stack-scheduler"
+  name               = "${var.name_prefix}-startstop-scheduler"
   assume_role_policy = data.aws_iam_policy_document.scheduler_assume.json
 }
 resource "aws_iam_role_policy" "scheduler" {
@@ -526,7 +550,7 @@ resource "aws_iam_role_policy" "scheduler" {
 
 # ---- Schedules: prender y apagar por cron ----
 resource "aws_scheduler_schedule" "start" {
-  name                         = "pyspark-stack-start"
+  name                         = "${var.name_prefix}-start"
   schedule_expression          = var.start_cron
   schedule_expression_timezone = "UTC"
   flexible_time_window { mode = "OFF" }
@@ -537,7 +561,7 @@ resource "aws_scheduler_schedule" "start" {
   }
 }
 resource "aws_scheduler_schedule" "stop" {
-  name                         = "pyspark-stack-stop"
+  name                         = "${var.name_prefix}-stop"
   schedule_expression          = var.stop_cron
   schedule_expression_timezone = "UTC"
   flexible_time_window { mode = "OFF" }
@@ -554,10 +578,27 @@ resource "aws_scheduler_schedule" "stop" {
 > Lambda, pero metemos la Lambda a propósito para poder **personalizar** (no apagar con jobs
 > activos, notificar, etc.).
 
+**Apagar/prender NO degrada el rendimiento** (cuatro garantías de diseño):
+
+1. **Familia `m6i` (no `t3`)** — CPU dedicada y constante. Los `t3` son *burstable*: acumulan/gastan
+   "CPU credits" y tras un arranque podés arrancar con pocos créditos → throttling visible. `m6i`
+   entrega el 100% de sus vCPU desde el primer segundo, en cada boot.
+2. **EBS `gp3` (no `gp2`)** — IOPS y throughput **provisionados y constantes** (3000 IOPS / 125 MB/s
+   base). `gp2` usa un "burst balance" que se agota; `gp3` no tiene ese pozo que vaciar, así que el
+   disco rinde igual antes y después de cada ciclo.
+3. **Los datos persisten** — al *stop* la instancia conserva sus volúmenes EBS (root + `/data`).
+   HDFS, Postgres y las métricas siguen ahí; no se recalcula ni se recarga nada al prender.
+4. **El stack vuelve solo** — Docker arranca en boot y `restart: unless-stopped` (ver hardening) vuelve
+   a levantar los contenedores. No hay pasos manuales.
+
+> Lo único más lento es la **primera** corrida tras el arranque (~1-2 min): las JVMs de Spark/HDFS
+> hacen *warmup* (JIT, block report del datanode). No es una caída de rendimiento sostenida, es el
+> costo único de encender; para datos de ~50 MB es de segundos.
+
 ### 5.5 Desplegar, subir código y túnel SSH
 
 ```hcl
-# infra/a-ec2/outputs.tf
+# infra/prod/outputs.tf
 output "public_ip"   { value = aws_instance.pyspark.public_ip }
 output "instance_id" { value = aws_instance.pyspark.id }
 output "tunnel_command" {
@@ -566,8 +607,8 @@ output "tunnel_command" {
 ```
 
 ```bash
-cd infra/a-ec2
-terraform init && terraform apply    # ~12 recursos + Lambda + schedules
+cd infra/prod
+terraform init && terraform apply    # EC2 + EBS + S3 + Lambdas + schedules
 
 # Subir el proyecto (excluí infra/ y basura)
 IP=$(terraform output -raw public_ip)
@@ -588,483 +629,322 @@ Spark `localhost:8081`, HDFS `localhost:9870`.
 
 ---
 
-## 6. Arquitectura B — Serverless
+## 6. Data lake en S3
 
-Rediseño moderno: **S3** reemplaza HDFS, **Glue Catalog** el metastore, **EMR Serverless** el
-cluster Spark (pago por segundo), y **MWAA** orquesta. Cómputo cero en reposo.
+HDFS (en la EC2) es el storage *de trabajo* de Spark; **S3 es el data lake durable**: sobrevive al
+apagado de la EC2, es barato y es la fuente/destino de los ETL (`raw/ → curated/ → analytics/`).
+Spark lo lee y escribe con `s3a://` usando el **rol IAM de la EC2** — sin access keys en disco.
 
-Mapa de migración:
-
-| Local (compose) | Serverless AWS |
-|---|---|
-| HDFS namenode/datanode | S3 + Glue Data Catalog |
-| spark-master/worker + `spark-submit` | EMR Serverless + `EmrServerlessStartJobOperator` |
-| 5 contenedores Airflow + Postgres | MWAA (o EventBridge+Lambda, §7) |
-| Jupyter | EMR Studio (opcional) |
-
-Carpeta `infra/b-serverless/` (backend con `key = "pyspark-stack-serverless/terraform.tfstate"`).
-
-### 6.1 S3 + Glue Catalog
+### 6.1 Buckets S3
 
 ```hcl
-# infra/b-serverless/s3.tf
-resource "random_id" "suffix" { byte_length = 4 }
+# infra/prod/locals.tf   (identidad de la cuenta; reutilizada por s3/iam/cicd/secrets)
+# `var.name_prefix` se define en variables.tf y lo usan TODOS los recursos.
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
 locals {
-  datalake  = "pyspark-stack-datalake-${random_id.suffix.hex}"
-  artifacts = "pyspark-stack-artifacts-${random_id.suffix.hex}"
-  dags      = "pyspark-stack-dags-${random_id.suffix.hex}"
+  account_id = data.aws_caller_identity.current.account_id
+  region     = data.aws_region.current.name
+}
+```
+
+```hcl
+# infra/prod/s3.tf
+locals {
+  datalake  = "${var.name_prefix}-datalake-${local.account_id}"
+  artifacts = "${var.name_prefix}-artifacts-${local.account_id}"   # scripts + logs + deploy/
 }
 
-resource "aws_s3_bucket" "datalake" {
-  bucket = local.datalake
-}
-resource "aws_s3_bucket" "artifacts" {
-  bucket = local.artifacts
-}
-resource "aws_s3_bucket" "dags" {
-  bucket = local.dags
-}
+resource "aws_s3_bucket" "datalake"  { bucket = local.datalake }
+resource "aws_s3_bucket" "artifacts" { bucket = local.artifacts }
 
-resource "aws_s3_bucket_versioning" "all" {
-  for_each = toset([aws_s3_bucket.datalake.id, aws_s3_bucket.artifacts.id, aws_s3_bucket.dags.id])
-  bucket   = each.value
-  versioning_configuration {
-    status = "Enabled" # MWAA exige versioning en DAGs
-  }
-}
+# Privados + cifrados + solo-TLS + versionado, para ambos buckets.
 resource "aws_s3_bucket_public_access_block" "all" {
-  for_each                = toset([aws_s3_bucket.datalake.id, aws_s3_bucket.artifacts.id, aws_s3_bucket.dags.id])
+  for_each                = toset([aws_s3_bucket.datalake.id, aws_s3_bucket.artifacts.id])
   bucket                  = each.value
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
 }
+resource "aws_s3_bucket_server_side_encryption_configuration" "all" {
+  for_each = toset([aws_s3_bucket.datalake.id, aws_s3_bucket.artifacts.id])
+  bucket   = each.value
+  rule { apply_server_side_encryption_by_default { sse_algorithm = "AES256" } }
+}
+resource "aws_s3_bucket_versioning" "all" {
+  for_each = toset([aws_s3_bucket.datalake.id, aws_s3_bucket.artifacts.id])
+  bucket   = each.value
+  versioning_configuration { status = "Enabled" }
+}
+resource "aws_s3_bucket_policy" "tls_only" {
+  for_each = toset([aws_s3_bucket.datalake.id, aws_s3_bucket.artifacts.id])
+  bucket   = each.value
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid = "DenyInsecureTransport", Effect = "Deny", Principal = "*", Action = "s3:*",
+      Resource  = ["arn:aws:s3:::${each.value}", "arn:aws:s3:::${each.value}/*"],
+      Condition = { Bool = { "aws:SecureTransport" = "false" } }
+    }]
+  })
+}
+
+# Data lake: transición a clases baratas para bajar costo de almacenamiento.
 resource "aws_s3_bucket_lifecycle_configuration" "datalake" {
   bucket = aws_s3_bucket.datalake.id
   rule {
     id     = "tiering"
     status = "Enabled"
-    transition {
-      days          = 30
-      storage_class = "STANDARD_IA"
-    }
-    transition {
-      days          = 90
-      storage_class = "GLACIER_IR"
-    }
+    transition { days = 30  storage_class = "STANDARD_IA" }
+    transition { days = 90  storage_class = "GLACIER_IR" }
   }
 }
 
-# infra/b-serverless/glue.tf
-resource "aws_glue_catalog_database" "main" {
-  name         = "pyspark_stack_db"
-  location_uri = "s3://${aws_s3_bucket.datalake.id}/curated/"
-}
+output "datalake_bucket"  { value = aws_s3_bucket.datalake.id }
+output "artifacts_bucket" { value = aws_s3_bucket.artifacts.id }
 ```
 
-### 6.2 IAM (EMR + MWAA)
+### 6.2 IAM: permitir s3a a la EC2 (sin keys)
+
+Se agrega una política al **rol de la EC2** (`aws_iam_role.ec2`, definido antes) para que `s3a://`
+funcione con el *instance profile*. La config de Spark (`spark-defaults.conf` con
+`InstanceProfileCredentialsProvider`) se muestra en el hardening.
 
 ```hcl
-# infra/b-serverless/iam.tf
-# ---- Rol de los jobs EMR Serverless ----
-data "aws_iam_policy_document" "emr_assume" {
+# infra/prod/iam.tf   (junto al rol de la EC2)
+data "aws_iam_policy_document" "ec2_s3" {
   statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["emr-serverless.amazonaws.com"]
-    }
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.datalake.arn}/*", "${aws_s3_bucket.artifacts.arn}/*"]
+  }
+  statement {
+    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+    resources = [aws_s3_bucket.datalake.arn, aws_s3_bucket.artifacts.arn]
   }
 }
-resource "aws_iam_role" "emr_exec" {
-  name               = "pyspark-stack-emr-exec"
-  assume_role_policy = data.aws_iam_policy_document.emr_assume.json
-}
-data "aws_iam_policy_document" "emr_exec" {
-  statement {
-    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
-    resources = [aws_s3_bucket.datalake.arn, "${aws_s3_bucket.datalake.arn}/*",
-                 aws_s3_bucket.artifacts.arn, "${aws_s3_bucket.artifacts.arn}/*"]
-  }
-  statement {
-    actions   = ["glue:GetDatabase", "glue:GetTable*", "glue:CreateTable", "glue:UpdateTable",
-                 "glue:GetPartition*", "glue:BatchCreatePartition", "glue:CreatePartition"]
-    resources = ["*"]
-  }
-  statement {
-    actions   = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"]
-    resources = ["*"]
-  }
-}
-resource "aws_iam_role_policy" "emr_exec" {
-  name   = "emr-exec"
-  role   = aws_iam_role.emr_exec.id
-  policy = data.aws_iam_policy_document.emr_exec.json
-}
-
-# ---- Rol de MWAA ----
-data "aws_iam_policy_document" "mwaa_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["airflow.amazonaws.com", "airflow-env.amazonaws.com"]
-    }
-  }
-}
-resource "aws_iam_role" "mwaa_exec" {
-  name               = "pyspark-stack-mwaa-exec"
-  assume_role_policy = data.aws_iam_policy_document.mwaa_assume.json
-}
-data "aws_iam_policy_document" "mwaa_exec" {
-  statement {  # DAGs
-    actions   = ["s3:GetObject*", "s3:GetBucket*", "s3:List*"]
-    resources = [aws_s3_bucket.dags.arn, "${aws_s3_bucket.dags.arn}/*"]
-  }
-  statement {  # Logs
-    actions   = ["logs:CreateLogStream", "logs:CreateLogGroup", "logs:PutLogEvents",
-                 "logs:GetLogEvents", "logs:GetLogRecord", "logs:GetLogGroupFields",
-                 "logs:GetQueryResults", "logs:DescribeLogGroups"]
-    resources = ["arn:aws:logs:*:*:log-group:airflow-pyspark-stack-*"]
-  }
-  statement {
-    actions   = ["cloudwatch:PutMetricData"]
-    resources = ["*"]
-  }
-  statement {
-    actions   = ["sqs:*"]
-    resources = ["arn:aws:sqs:*:*:airflow-celery-*"]
-  }
-  statement { # lanzar/monitorear EMR Serverless
-    actions   = ["emr-serverless:StartApplication", "emr-serverless:StartJobRun",
-                 "emr-serverless:GetJobRun", "emr-serverless:CancelJobRun", "emr-serverless:GetApplication"]
-    resources = ["*"]
-  }
-  statement {
-    actions   = ["iam:PassRole"]
-    resources = [aws_iam_role.emr_exec.arn]
-  }
-  statement {
-    actions   = ["kms:Decrypt", "kms:GenerateDataKey*", "kms:Encrypt", "kms:DescribeKey"]
-    resources = ["*"]
-  }
-}
-resource "aws_iam_role_policy" "mwaa_exec" {
-  name   = "mwaa-exec"
-  role   = aws_iam_role.mwaa_exec.id
-  policy = data.aws_iam_policy_document.mwaa_exec.json
+resource "aws_iam_role_policy" "ec2_s3" {
+  name   = "ec2-s3a"
+  role   = aws_iam_role.ec2.id
+  policy = data.aws_iam_policy_document.ec2_s3.json
 }
 ```
 
-### 6.3 EMR Serverless
-
-```hcl
-# infra/b-serverless/emr.tf
-resource "aws_emrserverless_application" "spark" {
-  name          = "pyspark-stack-spark"
-  release_label = "emr-7.5.0"    # Spark 3.5.x. Verificá el último release.
-  type          = "spark"
-  architecture  = "ARM64"        # Graviton = ~20% más barato (si tu código lo soporta)
-
-  auto_start_configuration {
-    enabled = true
-  }
-  auto_stop_configuration {
-    enabled              = true
-    idle_timeout_minutes = 15 # ← clave del ahorro
-  }
-  maximum_capacity {
-    cpu    = "16 vCPU"
-    memory = "64 GB"
-  }
-  # sin initial_capacity => cero costo en reposo (arranque en frío ~1-2 min)
-}
-output "emr_application_id" {
-  value = aws_emrserverless_application.spark.id
-}
-```
-
-### 6.4 Red + MWAA
-
-```hcl
-# infra/b-serverless/network.tf   (MWAA exige VPC con 2 subnets privadas en 2 AZ)
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.0"
-  name    = "pyspark-stack-vpc"
-  cidr    = "10.20.0.0/16"
-
-  azs             = slice(data.aws_availability_zones.available.names, 0, 2)
-  private_subnets = ["10.20.1.0/24", "10.20.2.0/24"]
-  public_subnets  = ["10.20.101.0/24", "10.20.102.0/24"]
-
-  enable_nat_gateway   = true
-  single_nat_gateway   = true # 1 solo NAT = lo más barato que funciona (~$32/mes)
-  enable_dns_hostnames = true
-}
-resource "aws_vpc_endpoint" "s3" {   # gateway endpoint S3 = GRATIS, evita tráfico por NAT
-  vpc_id            = module.vpc.vpc_id
-  service_name      = "com.amazonaws.us-east-1.s3"
-  vpc_endpoint_type = "Gateway"
-  route_table_ids   = module.vpc.private_route_table_ids
-}
-resource "aws_security_group" "mwaa" {
-  name   = "pyspark-stack-mwaa-sg"
-  vpc_id = module.vpc.vpc_id
-  ingress {
-    from_port = 0
-    to_port   = 0
-    protocol  = "-1"
-    self      = true
-  }
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-```
-
-```hcl
-# infra/b-serverless/mwaa.tf
-resource "aws_s3_object" "requirements" {
-  bucket  = aws_s3_bucket.dags.id
-  key     = "requirements.txt"
-  content = "apache-airflow-providers-amazon>=8.0.0\n"   # trae EmrServerlessStartJobOperator
-  etag    = "manual-v1"
-}
-resource "aws_mwaa_environment" "airflow" {
-  name                 = "pyspark-stack"
-  airflow_version      = "2.10.3"      # ⚠️ MWAA va por detrás de Airflow 3; verificá tu región
-  environment_class    = "mw1.micro"   # la clase más barata
-  source_bucket_arn    = aws_s3_bucket.dags.arn
-  dag_s3_path          = "dags/"
-  requirements_s3_path = aws_s3_object.requirements.key
-  execution_role_arn   = aws_iam_role.mwaa_exec.arn
-  min_workers           = 1
-  max_workers           = 2
-  webserver_access_mode = "PUBLIC_ONLY" # UI con login IAM; PRIVATE_ONLY = solo VPC
-  network_configuration {
-    security_group_ids = [aws_security_group.mwaa.id]
-    subnet_ids         = module.vpc.private_subnets
-  }
-  logging_configuration {
-    dag_processing_logs {
-      enabled   = true
-      log_level = "INFO"
-    }
-    scheduler_logs {
-      enabled   = true
-      log_level = "INFO"
-    }
-    task_logs {
-      enabled   = true
-      log_level = "INFO"
-    }
-    webserver_logs {
-      enabled   = true
-      log_level = "INFO"
-    }
-    worker_logs {
-      enabled   = true
-      log_level = "INFO"
-    }
-  }
-}
-output "mwaa_webserver_url" {
-  value = aws_mwaa_environment.airflow.webserver_url
-}
-```
-
-> ⏱️ Crear MWAA tarda ~20-30 min. Es normal.
-
-### 6.5 Adaptar jobs y DAG
-
-**Jobs PySpark:** cambiá rutas HDFS → S3 (`s3://…`) y subí el script a S3:
+En los jobs PySpark, apuntá las rutas a `s3a://` (el rol resuelve las credenciales solo):
 
 ```python
-df = spark.read.csv("s3://pyspark-stack-datalake-xxxx/raw/customers.csv", header=True)
-df.write.mode("overwrite").parquet("s3://pyspark-stack-datalake-xxxx/curated/customers")
-```
-```bash
-aws s3 cp spark-apps/customer_etl.py s3://pyspark-stack-artifacts-xxxx/scripts/customer_etl.py
+df = spark.read.csv(f"s3a://{DATALAKE}/raw/customers.csv", header=True)
+df.write.mode("overwrite").parquet(f"s3a://{DATALAKE}/curated/customers")
 ```
 
-**DAG con EMR Serverless — `dags/customer_etl_emr.py`:**
+### 6.3 Backups: snapshots EBS automáticos (DLM)
 
-```python
-from datetime import datetime
-from airflow import DAG
-from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobOperator
+`/data` (EBS gp3) guarda HDFS + Postgres + datos de monitoreo: es el estado que **no** vive en S3.
+**Data Lifecycle Manager (DLM)** toma snapshots automáticos y retiene los últimos N — cero código.
 
-with DAG("customer_etl_emr", schedule="@daily", start_date=datetime(2026,1,1),
-         catchup=False, tags=["emr-serverless"]) as dag:
-    EmrServerlessStartJobOperator(
-        task_id="run_customer_etl",
-        application_id="00fxxxxxxxxxxxxx",                               # emr_application_id
-        execution_role_arn="arn:aws:iam::<ACCOUNT>:role/pyspark-stack-emr-exec",
-        job_driver={"sparkSubmit": {
-            "entryPoint": "s3://pyspark-stack-artifacts-xxxx/scripts/customer_etl.py",
-            "sparkSubmitParameters": "--conf spark.executor.cores=4 --conf spark.executor.memory=8g",
-        }},
-        configuration_overrides={"monitoringConfiguration": {
-            "s3MonitoringConfiguration": {"logUri": "s3://pyspark-stack-artifacts-xxxx/logs/"}}},
-        wait_for_completion=True,
-    )
+```hcl
+# infra/prod/backups.tf
+data "aws_iam_policy_document" "dlm_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals { type = "Service", identifiers = ["dlm.amazonaws.com"] }
+  }
+}
+resource "aws_iam_role" "dlm" {
+  name               = "${var.name_prefix}-dlm"
+  assume_role_policy = data.aws_iam_policy_document.dlm_assume.json
+}
+resource "aws_iam_role_policy_attachment" "dlm" {
+  role       = aws_iam_role.dlm.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
+}
+resource "aws_dlm_lifecycle_policy" "data" {
+  description        = "Snapshots diarios del volumen /data"
+  execution_role_arn = aws_iam_role.dlm.arn
+  state              = "ENABLED"
+  policy_details {
+    resource_types = ["VOLUME"]
+    target_tags    = { Name = "${var.name_prefix}-data" }   # el tag del aws_ebs_volume.data
+    schedule {
+      name = "diario-7d"
+      create_rule { interval = 24, interval_unit = "HOURS", times = ["05:00"] }
+      retain_rule { count = 7 }
+      tags_to_add = { SnapshotCreator = "dlm" }
+      copy_tags   = true
+    }
+  }
+}
 ```
 
-El DAG ya **no ejecuta Spark**: solo dispara el job en EMR Serverless. MWAA queda liviano.
+> Restore: creás un volumen desde el snapshot y lo montás en `/data` (o recreás la instancia con
+> `user_data` que ya hace `mount ... /data`). S3 ya está versionado, así que el data lake
+> tiene su propia protección.
 
 ---
 
-## 7. Variante ultra-barata: EventBridge + Lambda en vez de MWAA
+## 7. Orquestación: Lambda trigger-airflow (SSM) + EventBridge + event-driven
 
-**El mayor costo fijo de la Arquitectura B es MWAA (~$135/mes) + NAT (~$32).** Si tu orquestación
-es simple (disparar jobs por horario o por evento), reemplazalos por **EventBridge + una Lambda
-que lanza el job EMR Serverless**. Costo total: **~$8–15/mes**. Y elimina la VPC/NAT porque EMR
-Serverless no necesita VPC.
+Airflow corre dentro de la EC2, **sin su API expuesta a internet**. Para dispararlo desde AWS (por
+cron o cuando llega un archivo a S3) se usa una **Lambda que ejecuta `airflow dags trigger` vía SSM
+`SendCommand`** — sin abrir puertos ni exponer la UI. Es el mismo patrón para los dos disparadores.
 
-**Lambda que dispara el job — `infra/b-serverless/lambda/trigger_emr.py`:**
+### 7.1 Lambda que dispara los DAGs vía SSM
 
 ```python
+# infra/prod/lambda/trigger_airflow.py
 import os
+import json
 import boto3
 
-emr = boto3.client("emr-serverless")
+ssm = boto3.client("ssm")
 
 def handler(event, context):
-    """Lanza un job Spark en EMR Serverless.
-    Disparado por cron (EventBridge Scheduler) o por evento (llegada de archivo a S3)."""
-    # 'script' puede venir en el event (personalización) o de env var por defecto.
-    script = event.get("script", os.environ["DEFAULT_SCRIPT"])
+    """Dispara un DAG de Airflow dentro de la EC2 vía SSM SendCommand.
+    - Por cron (EventBridge): event = {"dag": "customer_etl"}.
+    - Por evento S3: event = {"Records": [{s3: {bucket, object{key}}}]} → pasa bucket/key como --conf.
+    """
+    instance_id = os.environ["INSTANCE_ID"]
+    default_dag = os.environ.get("DEFAULT_DAG", "customer_etl")
 
-    resp = emr.start_job_run(
-        applicationId=os.environ["EMR_APP_ID"],
-        executionRoleArn=os.environ["EMR_ROLE_ARN"],
-        jobDriver={"sparkSubmit": {
-            "entryPoint": script,
-            "sparkSubmitParameters": "--conf spark.executor.cores=4 --conf spark.executor.memory=8g",
-        }},
-        configurationOverrides={"monitoringConfiguration": {
-            "s3MonitoringConfiguration": {"logUri": os.environ["LOG_URI"]}}},
+    conf = {}
+    dag = event.get("dag", default_dag)
+    if "Records" in event:  # vino de S3 ObjectCreated
+        rec = event["Records"][0]["s3"]
+        conf = {"bucket": rec["bucket"]["name"], "key": rec["object"]["key"]}
+
+    trigger = f"airflow dags trigger {dag}"
+    if conf:
+        trigger += f" --conf '{json.dumps(conf)}'"
+    cmd = f"docker exec airflow-scheduler {trigger}"
+
+    resp = ssm.send_command(
+        InstanceIds=[instance_id],
+        DocumentName="AWS-RunShellScript",
+        Comment=f"trigger airflow dag {dag}",
+        Parameters={"commands": [cmd]},
     )
-    return {"jobRunId": resp["jobRunId"], "script": script}
+    return {"dag": dag, "conf": conf, "commandId": resp["Command"]["CommandId"]}
 ```
 
-**Terraform — `infra/b-serverless/orchestration_lite.tf`:**
-
 ```hcl
-data "archive_file" "trigger_emr" {
+# infra/prod/orchestration.tf
+data "archive_file" "trigger_airflow" {
   type        = "zip"
-  source_file = "${path.module}/lambda/trigger_emr.py"
-  output_path = "${path.module}/lambda/trigger_emr.zip"
+  source_file = "${path.module}/lambda/trigger_airflow.py"
+  output_path = "${path.module}/lambda/trigger_airflow.zip"
 }
 
 data "aws_iam_policy_document" "trigger_assume" {
   statement {
     actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["lambda.amazonaws.com"]
-    }
+    principals { type = "Service", identifiers = ["lambda.amazonaws.com"] }
   }
 }
-resource "aws_iam_role" "trigger" {
-  name               = "pyspark-stack-trigger-emr"
+resource "aws_iam_role" "trigger_airflow" {
+  name               = "${var.name_prefix}-trigger-airflow"
   assume_role_policy = data.aws_iam_policy_document.trigger_assume.json
 }
-resource "aws_iam_role_policy" "trigger" {
-  name = "trigger-emr"
-  role = aws_iam_role.trigger.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      { Effect = "Allow", Action = ["emr-serverless:StartJobRun", "emr-serverless:GetJobRun",
-                                     "emr-serverless:StartApplication"], Resource = "*" },
-      { Effect = "Allow", Action = "iam:PassRole", Resource = aws_iam_role.emr_exec.arn },
-      { Effect = "Allow", Action = ["logs:CreateLogGroup", "logs:CreateLogStream",
-                                     "logs:PutLogEvents"], Resource = "arn:aws:logs:*:*:*" },
+data "aws_iam_policy_document" "trigger_airflow" {
+  statement {   # solo puede mandar el comando a NUESTRA instancia
+    actions   = ["ssm:SendCommand"]
+    resources = [
+      "arn:aws:ec2:${local.region}:${local.account_id}:instance/${aws_instance.pyspark.id}",
+      "arn:aws:ssm:${local.region}::document/AWS-RunShellScript",
     ]
-  })
+  }
+  statement {
+    actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
+    resources = ["*"]
+  }
+  statement {
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:aws:logs:*:*:*"]
+  }
 }
-resource "aws_lambda_function" "trigger" {
-  function_name    = "pyspark-stack-trigger-emr"
-  filename         = data.archive_file.trigger_emr.output_path
-  source_code_hash = data.archive_file.trigger_emr.output_base64sha256
-  handler          = "trigger_emr.handler"
+resource "aws_iam_role_policy" "trigger_airflow" {
+  name   = "trigger-airflow"
+  role   = aws_iam_role.trigger_airflow.id
+  policy = data.aws_iam_policy_document.trigger_airflow.json
+}
+resource "aws_lambda_function" "trigger_airflow" {
+  function_name    = "${var.name_prefix}-trigger-airflow"
+  filename         = data.archive_file.trigger_airflow.output_path
+  source_code_hash = data.archive_file.trigger_airflow.output_base64sha256
+  handler          = "trigger_airflow.handler"
   runtime          = "python3.12"
-  role             = aws_iam_role.trigger.arn
+  role             = aws_iam_role.trigger_airflow.arn
   timeout          = 60
   environment {
     variables = {
-      EMR_APP_ID     = aws_emrserverless_application.spark.id
-      EMR_ROLE_ARN   = aws_iam_role.emr_exec.arn
-      DEFAULT_SCRIPT = "s3://${aws_s3_bucket.artifacts.id}/scripts/customer_etl.py"
-      LOG_URI        = "s3://${aws_s3_bucket.artifacts.id}/logs/"
+      INSTANCE_ID = aws_instance.pyspark.id
+      DEFAULT_DAG = "customer_etl"
     }
   }
 }
+```
 
-# --- Opción 1: por CRON (EventBridge Scheduler) ---
+### 7.2 Disparo por cron (EventBridge Scheduler)
+
+```hcl
+# infra/prod/orchestration.tf  (continuación)
 data "aws_iam_policy_document" "sched_assume" {
   statement {
     actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["scheduler.amazonaws.com"]
-    }
+    principals { type = "Service", identifiers = ["scheduler.amazonaws.com"] }
   }
 }
-resource "aws_iam_role" "sched" {
-  name               = "pyspark-stack-emr-scheduler"
+resource "aws_iam_role" "sched_etl" {
+  name               = "${var.name_prefix}-etl-scheduler"
   assume_role_policy = data.aws_iam_policy_document.sched_assume.json
 }
-resource "aws_iam_role_policy" "sched" {
-  name = "invoke"
-  role = aws_iam_role.sched.id
+resource "aws_iam_role_policy" "sched_etl" {
+  name = "invoke-trigger"
+  role = aws_iam_role.sched_etl.id
   policy = jsonencode({ Version = "2012-10-17", Statement = [{
-    Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.trigger.arn }] })
+    Effect = "Allow", Action = "lambda:InvokeFunction",
+    Resource = aws_lambda_function.trigger_airflow.arn }] })
 }
 resource "aws_scheduler_schedule" "daily_etl" {
-  name                         = "pyspark-stack-daily-etl"
+  name                         = "${var.name_prefix}-daily-etl"
   schedule_expression          = "cron(0 6 * * ? *)"   # 06:00 UTC diario
   schedule_expression_timezone = "UTC"
   flexible_time_window { mode = "OFF" }
   target {
-    arn      = aws_lambda_function.trigger.arn
-    role_arn = aws_iam_role.sched.arn
-    input    = jsonencode({ script = "s3://REEMPLAZA/scripts/customer_etl.py" })
+    arn      = aws_lambda_function.trigger_airflow.arn
+    role_arn = aws_iam_role.sched_etl.arn
+    input    = jsonencode({ dag = "customer_etl" })
   }
 }
+```
 
-# --- Opción 2: por EVENTO (llega un archivo nuevo al data lake) ---
+### 7.3 Disparo por evento (archivo nuevo en S3)
+
+Cuando llega un archivo a `raw/`, S3 invoca la Lambda, que dispara el DAG pasando `{bucket,key}`
+como `--conf`. ETL 100% event-driven, sin polling.
+
+```hcl
+# infra/prod/orchestration.tf  (continuación)
 resource "aws_lambda_permission" "s3_invoke" {
   statement_id  = "AllowS3Invoke"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.trigger.function_name
+  function_name = aws_lambda_function.trigger_airflow.function_name
   principal     = "s3.amazonaws.com"
   source_arn    = aws_s3_bucket.datalake.arn
 }
 resource "aws_s3_bucket_notification" "on_upload" {
   bucket = aws_s3_bucket.datalake.id
   lambda_function {
-    lambda_function_arn = aws_lambda_function.trigger.arn
+    lambda_function_arn = aws_lambda_function.trigger_airflow.arn
     events              = ["s3:ObjectCreated:*"]
-    filter_prefix       = "raw/"      # dispara el ETL cuando entra algo a raw/
+    filter_prefix       = "raw/"
   }
   depends_on = [aws_lambda_permission.s3_invoke]
 }
 ```
 
-> **Esto es orquestación event-driven pura:** o corre por cron, o **automáticamente cuando llega
-> un archivo** a `raw/`. Sin MWAA, sin VPC, sin NAT. Para pipelines con dependencias complejas
-> entre tasks, subí a **Step Functions** (state machine) manteniendo el mismo esquema de costo.
+> El DAG recibe `bucket`/`key` en `dag_run.conf` y Spark lee justo ese objeto de `s3a://`. Para
+> pipelines con dependencias complejas entre tasks, el DAG de Airflow ya las modela (no hace falta
+> nada extra) — es la ventaja de mantener Airflow self-managed en vez de disparar jobs sueltos.
 
 ---
 
@@ -1073,49 +953,43 @@ resource "aws_s3_bucket_notification" "on_upload" {
 **Operación (cheat-sheet):**
 
 ```bash
-# Arquitectura A — la Lambda prende/apaga sola. Manual:
-aws ec2 stop-instances  --instance-ids $(cd infra/a-ec2 && terraform output -raw instance_id)
-aws lambda invoke --function-name pyspark-stack-startstop \
-  --payload '{"action":"start"}' /dev/stdout
+# La Lambda startstop prende/apaga la EC2 sola por cron. Manual:
+aws ec2 stop-instances --instance-ids $(cd infra/prod && terraform output -raw instance_id)
+aws lambda invoke --function-name pyspark-stack-startstop --payload '{"action":"start"}' /dev/stdout
 
-# Arquitectura B — EMR se auto-apaga (idle 15m). Apagar MWAA en dev para no pagar el piso:
-cd infra/b-serverless && terraform destroy -target=aws_mwaa_environment.airflow
-# recrear: terraform apply -target=aws_mwaa_environment.airflow
-
-# Disparar un job serverless a mano (variante §7):
-aws lambda invoke --function-name pyspark-stack-trigger-emr /dev/stdout
+# Disparar un DAG a mano (mismo camino que usa EventBridge/S3):
+aws lambda invoke --function-name pyspark-stack-trigger-airflow \
+  --payload '{"dag":"customer_etl"}' /dev/stdout
 
 # Teardown total
-terraform destroy
+cd infra/prod && terraform destroy
 ```
 
 **Seguridad (checklist):**
-- [ ] Buckets con `public_access_block` y cifrado (ya en el TF).
-- [ ] SG de EC2: solo puerto 22 desde tu IP; UIs por túnel.
-- [ ] IAM least-privilege: la Lambda de start/stop **solo** actúa sobre instancias con el tag
-      (condición ya puesta); endurecé los `*` de Glue/EMR a ARNs concretos.
-- [ ] MWAA `PRIVATE_ONLY` + SSM/bastión en entornos sensibles.
-- [ ] Secrets de conexiones en **AWS Secrets Manager** (MWAA lo integra), no en texto plano.
-- [ ] `.env`, `terraform.tfvars` y `*.zip` de Lambdas en `.gitignore`.
+- [ ] Buckets con `public_access_block`, cifrado y política solo-TLS (ya en el TF del data lake).
+- [ ] SG de EC2: solo puerto 22 desde tu IP; UIs por túnel; API de Airflow nunca expuesta.
+- [ ] IAM least-privilege: `startstop` **solo** actúa sobre instancias con el tag; `trigger-airflow`
+      **solo** puede `ssm:SendCommand` sobre esta instancia (condiciones ya puestas).
+- [ ] Spark usa `s3a://` con el rol IAM (instance profile), sin access keys en disco.
+- [ ] Secretos en **SSM Parameter Store / Secrets Manager**, no en texto plano.
+- [ ] `.env`, `terraform.tfvars`, `*.zip` de Lambdas y `alertmanager.yml` en `.gitignore`.
 
 **Palancas de ahorro (orden de impacto):**
-1. **Arquitectura B + §7 (EventBridge/Lambda)** en vez de MWAA → de ~$175 a ~$8–15/mes.
-2. **Auto start/stop de la EC2** (§5.4) → de ~$300 a ~$70 (u ~$17 con dev-lite).
-3. **EMR Serverless sin `initial_capacity` + auto_stop** (ya aplicado): cero costo en reposo.
-4. **Graviton (ARM64)** en EMR (ya aplicado): ~20% más barato.
-5. **1 NAT + S3 gateway endpoint gratis** (ya aplicado).
-6. **S3 lifecycle a IA/Glacier + Parquet particionado** (ya aplicado): menos datos escaneados.
+1. **Auto start/stop de la EC2** → de ~$140 a ~$34/mes. Es la palanca principal.
+2. **S3 lifecycle a IA/Glacier** (ya aplicado): baja el costo de almacenamiento del lake.
+3. **Snapshots DLM con retención acotada** (7 días): backups sin acumular costo.
+4. **`docker-compose.dev.yml`** en una instancia chica (~$17/mes) para desarrollo.
 
-### Resumen: qué reemplaza a qué
+### Resumen: qué corre y dónde
 
-| Local (compose) | Arquitectura A (EC2) | Arquitectura B (Serverless) |
+| Subsistema | Dónde corre | Storage durable |
 |---|---|---|
-| HDFS | (dentro del contenedor) | S3 + Glue Catalog |
-| Spark master/worker | contenedores en EC2 | EMR Serverless (pago/seg) |
-| Airflow (5 svcs) + Postgres | contenedores en EC2 | MWAA **o** EventBridge+Lambda |
-| Jupyter | contenedor en EC2 | EMR Studio (opcional) |
-| Encendido | EC2 24/7 (o apagable) | **cero en reposo** |
-| Costo típico | ~$70–300/mes | ~$8–175/mes |
+| HDFS namenode/datanode | contenedores en EC2 | — (trabajo); respaldo en snapshots EBS |
+| Spark master/worker + `spark-submit` | contenedores en EC2 | lee/escribe `s3a://` |
+| Airflow (5 svcs) + Postgres | contenedores en EC2 | Postgres en `/data` (EBS) + snapshots |
+| Jupyter | contenedor en EC2 | `./notebooks` (git) + S3 |
+| Disparo de DAGs | Lambda trigger-airflow (SSM) + EventBridge | — |
+| Encendido | EC2 con auto start/stop | — |
 
 ---
 
@@ -1217,8 +1091,8 @@ AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
 ```
 
 > Para forzar una corrida inmediata (además del schedule), el paso de deploy puede terminar con
-> un `airflow dags trigger <dag>` vía SSM, o usar la Lambda `trigger-airflow` de la
-> [guía de arquitectura](03-arquitectura.md).
+> un `airflow dags trigger <dag>` vía SSM, o usar la Lambda `trigger-airflow` de la sección de
+> orquestación.
 
 ### 10.1 Modo rápido (dev): deploy manual sin esperar CI
 
@@ -1500,7 +1374,7 @@ alertas + **logs centralizados**. Cada bloque indica su ruta en la 1ª línea; c
 | Airflow / Spark | ✅ | StatsD + PrometheusServlet |
 | Logs centralizados | ✅ agregado | **Loki + Promtail** (era el gran faltante) |
 | Alertas → notificación | ✅ | Alertmanager (antes las reglas no notificaban) |
-| HDFS métricas ricas | ⚠️ parcial | `/jmx` devuelve JSON no parseable → scrape quitado; recursos vía cAdvisor; métricas ricas con jmx_exporter (§12.8) |
+| HDFS métricas ricas | ⚠️ parcial | `/jmx` devuelve JSON no parseable → scrape quitado; recursos vía cAdvisor; métricas ricas con jmx_exporter (ver "Acceso, verificación y HDFS") |
 | Panel "Spark workers" | ✅ corregido | usa `up{job="spark-master"}` (robusto) en vez de una métrica de nombre incierto |
 
 ### 12.2 Estructura de archivos (`monitoring/`)
@@ -1683,7 +1557,7 @@ scrape_configs:
   - job_name: spark-worker
     metrics_path: /metrics/prometheus
     static_configs: [{ targets: ["spark-worker:8081"] }]
-  # HDFS NO se scrapea: /jmx devuelve JSON no parseable. Ver §12.8 (jmx_exporter).
+  # HDFS NO se scrapea: /jmx devuelve JSON no parseable. Ver la nota de jmx_exporter más abajo.
 ```
 
 ```yaml
@@ -1971,19 +1845,26 @@ resource "aws_ssm_parameter" "secret" {
 }
 ```
 
-**IAM — permitir a la EC2 leer los parámetros (agregar a `infra/prod/iam.tf`):**
+**IAM — permitir a la EC2 leer los parámetros (agregar a `infra/prod/iam.tf`, junto al rol de la EC2):**
 
 ```hcl
-# dentro de data.aws_iam_policy_document "ec2"
-statement {
-  sid       = "SsmReadParams"
-  actions   = ["ssm:GetParameter", "ssm:GetParametersByPath"]
-  resources = ["arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.name_prefix}/*"]
+# infra/prod/iam.tf   (política propia del rol de la EC2 para leer secretos)
+data "aws_iam_policy_document" "ec2_secrets" {
+  statement {
+    sid       = "SsmReadParams"
+    actions   = ["ssm:GetParameter", "ssm:GetParametersByPath"]
+    resources = ["arn:aws:ssm:${local.region}:${local.account_id}:parameter/${var.name_prefix}/*"]
+  }
+  statement {
+    sid       = "KmsDecrypt"
+    actions   = ["kms:Decrypt"]
+    resources = ["*"] # o la ARN de la KMS key de SSM
+  }
 }
-statement {
-  sid       = "KmsDecrypt"
-  actions   = ["kms:Decrypt"]
-  resources = ["*"] # o la ARN de la KMS key de SSM
+resource "aws_iam_role_policy" "ec2_secrets" {
+  name   = "ec2-secrets"
+  role   = aws_iam_role.ec2.id
+  policy = data.aws_iam_policy_document.ec2_secrets.json
 }
 ```
 
@@ -2054,9 +1935,11 @@ resource "aws_secretsmanager_secret_version" "airflow_jwt" {
 # }
 ```
 
-IAM (agregar al rol de la EC2, junto a los permisos de SSM):
+IAM — agregá este `statement` **dentro de** `data.aws_iam_policy_document.ec2_secrets` (el bloque de
+arriba), junto a los de SSM/KMS:
 
 ```hcl
+# infra/prod/iam.tf   (statement adicional en data.aws_iam_policy_document "ec2_secrets")
 statement {
   sid       = "SecretsRead"
   actions   = ["secretsmanager:GetSecretValue"]
@@ -2091,7 +1974,11 @@ AIRFLOW_JWT_SECRET=$(aws secretsmanager get-secret-value \
 ### 13.2 restart + límites + logging en los servicios del stack
 
 Los servicios core (`hdfs-*`, `spark-*`, `jupyter`, `airflow-db`) no traen `restart` ni límites.
-Agregalos en el override de prod:
+Agregalos en el override de prod. **`restart: unless-stopped` es lo que hace que, al **prender** la
+EC2 (auto start/stop), el stack vuelva solo** sin intervención (Docker arranca en boot por
+`systemctl enable docker` del `user_data`, y reinicia los contenedores que estaban corriendo).
+
+Los límites están calibrados para **`m6i.xlarge` (16 GB)**: suman con holgura y dejan margen al SO.
 
 ```yaml
 # docker-compose.prod.yml
@@ -2102,13 +1989,22 @@ x-hard: &hard
     options: { max-size: "10m", max-file: "3" }
 
 services:
-  hdfs-namenode: { <<: *hard, deploy: { resources: { limits: { memory: 2g } } } }
-  hdfs-datanode: { <<: *hard, deploy: { resources: { limits: { memory: 2g } } } }
-  spark-master:  { <<: *hard, deploy: { resources: { limits: { memory: 2g } } } }
-  spark-worker:  { <<: *hard, deploy: { resources: { limits: { memory: 6g } } } }
-  jupyter:       { <<: *hard, deploy: { resources: { limits: { memory: 2g } } } }
-  airflow-db:    { <<: *hard }
+  hdfs-namenode: { <<: *hard, deploy: { resources: { limits: { memory: 1536m } } } }
+  hdfs-datanode: { <<: *hard, deploy: { resources: { limits: { memory: 1536m } } } }
+  spark-master:  { <<: *hard, deploy: { resources: { limits: { memory: 1g } } } }
+  spark-worker:
+    <<: *hard
+    # El worker OFRECE 3G/2 cores a los executors (sobra para ~50 MB; evita que agarre toda la RAM).
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--memory", "3G", "--cores", "2"]
+    deploy: { resources: { limits: { memory: 4g } } }
+  jupyter:       { <<: *hard, deploy: { resources: { limits: { memory: 1536m } } } }
+  airflow-db:    { <<: *hard, deploy: { resources: { limits: { memory: 512m } } } }
 ```
+
+> **¿Por qué el worker no pierde rendimiento con menos memoria?** Para 50 MB, un executor con 3 GB
+> y 2 cores procesa el dato entero en memoria sin *spill* a disco — que es lo que sí frenaría. Los
+> 6 GB anteriores eran margen ocioso, no velocidad. El límite del contenedor (4 GB) deja aire al
+> heap del worker por encima de lo que ofrece.
 
 ### 13.3 Spark ↔ S3 con el rol IAM (s3a)
 
@@ -2151,7 +2047,40 @@ monitoring/alertmanager/alertmanager.yml   # tiene el smtp password
 Creá también un `.env.example` (sin valores reales) y un `README.md` raíz que enlace estas guías
 y liste los tres modos de arranque (dev-lite, prod local, prod AWS).
 
-### 13.6 Checklist final (production-ready)
+### 13.6 Spark History Server (UI de jobs terminados)
+
+Spark master/worker solo muestran jobs **en vivo**; al terminar, la UI del driver desaparece. El
+**History Server** reconstruye la UI de cada job desde los *event logs* — clave para depurar un ETL
+que ya corrió. La imagen ya existe (`Dockerfile.history`) y los logs se escriben en `./spark-events`.
+
+Habilitá el *event log* en `spark-defaults.conf` (el mismo que usa s3a) y descomentá el servicio:
+
+```properties
+# spark-conf/spark-defaults.conf  (agregar a lo de s3a)
+spark.eventLog.enabled  true
+spark.eventLog.dir      file:/tmp/spark-events
+```
+
+```yaml
+# docker-compose.prod.yml  (servicio History Server)
+  spark-history-server:
+    build: { context: ., dockerfile: Dockerfile.history }
+    image: pyspark_stack-spark-history:4.0.3
+    container_name: spark-history
+    <<: *hard
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.history.HistoryServer"]
+    environment:
+      - SPARK_HISTORY_OPTS=-Dspark.history.fs.logDirectory=file:/tmp/spark-events
+    ports: ["18080:18080"]
+    volumes:
+      - ./spark-events:/tmp/spark-events
+    networks: [hadoopnet]
+```
+
+UI por túnel: `ssh -L 18080:localhost:18080 …` → `http://localhost:18080`.
+
+### 13.7 Checklist final (production-ready)
 
 - [ ] `.env` con secretos generados (`openssl rand`), fuera de git.
 - [ ] Jupyter con `JUPYTER_TOKEN`; Grafana sin password default.
@@ -2168,15 +2097,14 @@ y liste los tres modos de arranque (dev-lite, prod local, prod AWS).
 ## 14. Archivos compose completos
 
 Los dos archivos listos para copiar. El de producción ya incorpora todo lo explicado por tema en
-§12 (monitoreo) y §13 (hardening): persistencia en `/data`, `restart`, límites, logging, s3a,
-métricas y logs. Las variables `${...}` las provee el `.env` que genera `load-secrets.sh` desde
-SSM (§13.1).
+las secciones de monitoreo y hardening: persistencia en `/data`, `restart`, límites, logging, s3a,
+métricas y logs. Las variables `${...}` las provee el `.env` que genera `load-secrets.sh` desde SSM.
 
 ### 14.1 docker-compose.prod.yml (producción, completo)
 
 ```yaml
 # docker-compose.prod.yml — override de producción (se fusiona con docker-compose.yml).
-#   ./scripts/load-secrets.sh   # genera .env desde SSM (§13.1)
+#   ./scripts/load-secrets.sh   # genera .env desde SSM
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 x-hard: &hard
   restart: unless-stopped
@@ -2191,40 +2119,43 @@ x-airflow-metrics: &airflow-metrics
   AIRFLOW__METRICS__STATSD_PREFIX: airflow
 
 services:
-  # ---- Persistencia en /data (EBS) + restart/límites/logging ----
+  # ---- Persistencia en /data (EBS) + restart/límites/logging (calibrado a m6i.xlarge 16 GB) ----
   airflow-db:
     <<: *hard
+    deploy: { resources: { limits: { memory: 512m } } }
     volumes:
       - /data/postgres:/var/lib/postgresql/data
 
   hdfs-namenode:
     <<: *hard
-    deploy: { resources: { limits: { memory: 2g } } }
+    deploy: { resources: { limits: { memory: 1536m } } }
     volumes:
       - /data/hdfs-nn:/hadoop/dfs/name
   hdfs-datanode:
     <<: *hard
-    deploy: { resources: { limits: { memory: 2g } } }
+    deploy: { resources: { limits: { memory: 1536m } } }
     volumes:
       - /data/hdfs-dn:/hadoop/dfs/data
 
   # ---- Spark: métricas Prometheus + s3a con rol IAM ----
   spark-master:
     <<: *hard
-    deploy: { resources: { limits: { memory: 2g } } }
+    deploy: { resources: { limits: { memory: 1g } } }
     volumes:
       - ./monitoring/spark/metrics.properties:/opt/spark/conf/metrics.properties:ro
       - ./spark-conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
   spark-worker:
     <<: *hard
-    deploy: { resources: { limits: { memory: 6g } } }
+    # OFRECE 3G/2 cores a los executors: sobra para ~50 MB y evita que tome toda la RAM del host.
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--memory", "3G", "--cores", "2"]
+    deploy: { resources: { limits: { memory: 4g } } }
     volumes:
       - ./monitoring/spark/metrics.properties:/opt/spark/conf/metrics.properties:ro
       - ./spark-conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
 
   jupyter:
     <<: *hard
-    deploy: { resources: { limits: { memory: 2g } } }
+    deploy: { resources: { limits: { memory: 1536m } } }
     environment:
       - JUPYTER_TOKEN=${JUPYTER_TOKEN}
     volumes:
@@ -2236,7 +2167,7 @@ services:
   airflow-dag-processor: { environment: { <<: *airflow-metrics } }
   airflow-triggerer:     { environment: { <<: *airflow-metrics } }
 
-  # ==================== MONITOREO (detalle en §12) ====================
+  # ==================== MONITOREO (detalle en la sección de monitoreo) ====================
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: prometheus
