@@ -40,10 +40,10 @@ Jupyter (PySpark 4)                  →  notebooks
 Requisitos: Docker + Docker Compose. Recomendado 16 GB+ de RAM para el stack completo.
 
 ```bash
-# 1) (opcional) secretos locales
+# 1) secretos locales (además activa el perfil "dev" → Jupyter, ver .env.example)
 cp .env.example .env
 
-# 2) Stack completo
+# 2) Stack completo (con COMPOSE_PROFILES=dev del .env, incluye Jupyter)
 docker compose up -d --build
 ```
 
@@ -53,6 +53,12 @@ docker compose up -d --build
 | Jupyter | http://localhost:8888 |
 | Spark master | http://localhost:8081 |
 | HDFS | http://localhost:9870 |
+
+> **Jupyter es dev-only.** Vive en el perfil `dev` de Compose: es una herramienta para
+> explorar/depurar antes de promover el código a un DAG. En producción no arranca (el ETL corre
+> por Airflow y los notebooks por papermill, sin necesitar este server). Copiar `.env.example`
+> deja `COMPOSE_PROFILES=dev`, así que `docker compose up` lo incluye; sin esa variable, levantalo
+> puntualmente con `docker compose --profile dev up -d jupyter`.
 
 ### Máquina chica (~8 GB)
 

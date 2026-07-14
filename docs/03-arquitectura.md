@@ -15,44 +15,48 @@ EMR ni Glue.
 
 ## 1. Diagrama
 
-```
-                                  ┌───────────────────────────────────────────┐
-   Desarrollador                  │  AWS  (region us-east-1)                   │
-      │  ssh -i key (22)          │                                           │
-      │  + túneles -L             │   ┌─────────── EventBridge Scheduler ───┐  │
-      ▼                           │   │  cron ETL      │  start/stop EC2     │  │
- ┌─────────┐  túnel SSH           │   └───────┬────────┴─────────┬──────────┘  │
- │ Grafana │◄───────────┐         │           ▼                  ▼             │
- │ Airflow │            │         │      ┌─────────┐        ┌──────────┐       │
- │ Jupyter │            │         │      │ Lambda  │        │ Lambda   │       │
- │ Spark   │            │         │      │ trigger │        │ startstop│       │
- └─────────┘            │         │      │ airflow │        └────┬─────┘       │
-                        │         │      └────┬────┘             │ start/stop  │
-                        │         │  SSM SendCommand             │ (tag=true)  │
-                        │         │           │                  ▼             │
-   ┌────────────────────┴─────────┼───────────▼──────────────────────────┐    │
-   │  EC2  m6i.xlarge  (Elastic IP)    docker compose                     │    │
-   │  ┌──────────────────────────────────────────────────────────────┐   │    │
-   │  │ Airflow (api·scheduler·dag-proc·triggerer·init) + Postgres     │   │    │
-   │  │ Spark master + worker      HDFS namenode + datanode   Jupyter  │   │    │
-   │  ├──────────────────────────────────────────────────────────────┤   │    │
-   │  │ MONITOREO: Prometheus ─► Alertmanager ─► email                 │   │    │
-   │  │   Grafana  node-exporter  cAdvisor  statsd-exporter            │   │    │
-   │  │   LOGS: Promtail ─► Loki ─► Grafana                            │   │    │
-   │  └──────────────────────────────────────────────────────────────┘   │    │
-   │        │ s3a:// (rol IAM, sin keys)        │ /data (EBS gp3)         │    │
-   └────────┼───────────────────────────────────┴────────────────────────┘    │
-            ▼                                                                   │
-   ┌──────────────────┐        ┌──────────────────┐     ┌─────────────────┐    │
-   │ S3 data lake     │        │ S3 artifacts     │     │ S3 + DynamoDB   │     │
-   │ raw/curated/     │───────►│ scripts / logs   │     │ (tfstate+lock)  │     │
-   │ analytics        │ evento │                  │     └─────────────────┘     │
-   └────────┬─────────┘        └──────────────────┘                            │
-            │ ObjectCreated (raw/) ─► Lambda trigger airflow                    │
-            └───────────────────────────────────────────────────────────────  │
-                                                                                │
-   Security Group: SOLO 22 desde tu IP · UIs por túnel SSH · SSM sin puertos    │
-   └────────────────────────────────────────────────────────────────────────  ┘
+```text
+   DESARROLLADOR (laptop)
+        │  ssh -i key (puerto 22)  +  túneles -L
+        ▼
+   UIs — solo por túnel SSH, nunca públicas:
+        Airflow · Grafana · Spark · Jupyter
+
+
+ ═══════════════════════════  AWS · us-east-1  ═══════════════════════════
+
+   DISPARADORES (serverless) — dos caminos, ambos terminan disparando la EC2:
+
+     cron ETL (06:00 UTC) ───────────────►  Lambda trigger-airflow
+                                                │  SSM SendCommand
+                                                ▼  → "airflow dags trigger"
+
+     start/stop (11:00 ↑ / 22:00 ↓, L-V) ─►  Lambda startstop
+                                                │  ec2 start/stop
+                                                ▼  (solo instancias tag=true)
+
+   ┌─ EC2 · m6i.xlarge · Elastic IP · docker compose ──────────────────────
+   │
+   │   STACK                           MONITOREO
+   │   · Airflow (5) + Postgres        · Prometheus → Alertmanager → email
+   │   · Spark master + worker         · Grafana (dashboards)
+   │   · HDFS namenode + datanode      · node-exporter · cAdvisor · statsd
+   │   · Jupyter                       · Promtail → Loki → Grafana (logs)
+   └───────────────────────────────────────────────────────────────────────
+        │  s3a:// (rol IAM, sin keys)              [ /data = EBS gp3, local ]
+        ▼
+   ┌─ S3 DATA LAKE ─────────────
+   │   raw/   curated/   analytics/
+   └────────────────────────────
+        │
+        │  archivo nuevo en raw/  →  evento S3 "ObjectCreated"
+        └───────────────────────►  Lambda trigger-airflow   (ciclo event-driven)
+
+   Otros buckets:  S3 artifacts (scripts / logs)   ·   S3 + DynamoDB (tfstate + lock)
+
+   ─────────────────────────────────────────────────────────────────────────────
+   SEGURIDAD:  el Security Group abre SOLO el puerto 22 desde tu IP ·
+               todas las UIs van por túnel SSH · SSM opera sin abrir puertos
 ```
 
 ### Versión Mermaid (se renderiza en GitHub / VS Code)
@@ -161,6 +165,9 @@ Archivo llega a s3://datalake/raw/  →  S3 ObjectCreated
       docker exec airflow-scheduler airflow dags trigger <dag> --conf '{bucket,key}'
   → DAG: SparkSubmit → Spark lee s3a://…/raw → transforma → escribe s3a://…/curated
 ```
+> Requiere la EC2 **encendida**: si está apagada por el auto start/stop (§3.5), el `SendCommand` no
+> ejecuta y el evento se pierde en silencio. Dispará dentro de la ventana de encendido (o encendé
+> primero); la alerta `DailyEtlMissing` (§3.4) avisa si el ETL dejó de correr.
 
 ### 3.3 ETL programado (cron)
 ```
@@ -171,7 +178,7 @@ EventBridge Scheduler (06:00 UTC)  →  Lambda trigger-airflow  →  SSM  →  A
 ```
 MÉTRICAS: node-exporter (host) · cAdvisor (contenedores) · statsd-exporter (Airflow) · Spark /metrics
   → Prometheus (scrape 15s)  → evalúa alerts.yml
-  → Alertmanager  → email (críticas: TargetDown, disco lleno; warning: memoria, tasks fallidas)
+  → Alertmanager  → email (INFRA: TargetDown, disco lleno, memoria · NEGOCIO: DAG falló, ETL diario no corrió [dead-man switch])
 LOGS:     Promtail (todos los contenedores)  →  Loki
 Grafana ← Prometheus (métricas) + Loki (logs)   ·   dashboard "Overview" auto-provisionado
 ```
@@ -289,10 +296,18 @@ un cluster multi-nodo rinde mejor que una sola máquina — ver los motivos en l
 
 | Descartado | Motivo |
 |---|---|
-| **MWAA** | Airflow self-managed en EC2 = sin piso fijo (~$135/mes) ni límite de versión |
-| **EMR / EMR Serverless** | Spark self-managed en EC2 (ya tenías el cluster) |
+| **MWAA** | Airflow managed no escala a cero (~$350+/mes fijos): caro a esta escala |
+| **EMR (clásico)** | overkill para ~50 MB: fleet de EC2 + recargo ~25%, pensado para TB multi-nodo |
+| **EMR Serverless** | Spark self-managed en la misma EC2 ya paga; EMR Serverless conviene si el uso es bajo/esporádico (ver nota) |
 | **Glue Data Catalog** | El código usa `createOrReplaceTempView` (vistas temporales) — no hay tablas persistentes que catalogar |
 | **CloudWatch dashboards** | Monitoreo con Prometheus + Grafana (más portable y rico) |
+
+> **No es un descarte dogmático — es un tradeoff con punto de cruce.** Lo managed *serverless*
+> (EMR Serverless, Glue Python Shell, Lambda, Athena, Step Functions) es más barato y con menos ops en
+> **uso bajo/esporádico**; el self-managed gana cuando **consolidás varias cargas** en la máquina ya
+> paga (cada tarea extra es gratis) y valorás **control, portabilidad (cero lock-in) y aprendizaje**.
+> La comparación de costos, servicio por servicio y con punto de cruce, está en la
+> [guía de producción §2](02-produccion-aws.md#2-costo).
 
 ---
 
@@ -304,6 +319,47 @@ producción — no son pendientes. La lista de componentes de arriba los cubre t
 
 La única evolución que queda fuera del alcance actual, y solo si el proyecto lo pide:
 
-- **Lakehouse (Iceberg / Delta Lake).** Migrar de vistas temporales a tablas versionadas
-  (`saveAsTable`). Reintroduciría un catálogo de datos tipo Glue, descartado a propósito por las
-  razones de la sección anterior.
+- **Lakehouse (Iceberg / Delta Lake).** Migrar de escrituras Parquet "sueltas" a **tablas
+  versionadas**. Es la única evolución con peso; se detalla abajo.
+
+### 7.1 Lakehouse (Iceberg / Delta Lake)
+
+**Qué cambia.** Hoy el ETL escribe `df.write.mode("overwrite").parquet(...)` (una carpeta por fecha,
+sin atomicidad). Un lakehouse lo reemplaza por una **tabla versionada** que suma **ACID**,
+**time-travel** (rollback a versiones anteriores), **MERGE/upsert** (cargas incrementales en vez de
+reprocesar todo) y **schema evolution**.
+
+**Qué implica implementarlo (3 piezas):** (1) habilitar Delta/Iceberg en Spark vía `--packages` +
+configs; (2) cambiar la escritura a formato de tabla; (3) decidir el catálogo. El ejemplo mínimo,
+**path-based (sin catálogo, sin Glue)**, sobre el `sales_etl`:
+
+```bash
+# 1) habilitar Delta en el spark-submit (Spark 4.0 → Scala 2.13; validá versión Delta compatible)
+spark-submit --packages io.delta:delta-spark_2.13:4.0.0 \
+  --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+  --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog  sales_etl_job.py
+```
+
+```python
+# 2) escritura versionada (reemplaza al .parquet por fecha)
+df_output.write.format("delta").mode("overwrite").save("s3a://…/curated/sales")
+
+# 3) lo que habilita: time-travel, upsert incremental, evolución de esquema
+spark.read.format("delta").option("versionAsOf", 3).load("s3a://…/curated/sales")     # rollback
+from delta.tables import DeltaTable
+DeltaTable.forPath(spark, "s3a://…/curated/sales").alias("t") \
+  .merge(nuevos.alias("s"), "t.sale_id = s.sale_id") \
+  .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()                          # upsert
+```
+
+**La decisión del catálogo (por qué el §6 dice "reintroduciría Glue"):**
+
+| Modo | Qué da | ¿Catálogo/Glue? |
+|---|---|---|
+| **Delta path-based** (ejemplo de arriba) | ACID + time-travel + MERGE + schema evolution | **No** — acceso por ruta; mantiene el principio "sin Glue" |
+| **`saveAsTable("curated.sales")`** | + llamar la tabla por nombre, descubrible por Athena/otros motores | **Sí** — Glue, **o** self-hosted (Hive Metastore, o **Iceberg JDBC catalog sobre el Postgres ya existente**, o REST) |
+
+**Recomendación a esta escala:** *Delta path-based* es el sweet spot — da el 80% del beneficio (ACID,
+time-travel, upsert) con **cero dependencia managed nueva**. El `saveAsTable` + catálogo recién paga
+cuando **varios motores** (Athena + Spark + BI) leen lo mismo y hace falta descubrir tablas por nombre;
+y ni siquiera ahí obliga a Glue (un metastore propio alcanza).

@@ -122,6 +122,11 @@ services:
       dockerfile: Dockerfile.jupyter
     image: pyspark_stack-jupyter:4.0.3
     container_name: jupyter-notebook
+    # Jupyter es herramienta de DESARROLLO (explorar/depurar antes de promover a DAG).
+    # En prod el ETL corre por Airflow y los .ipynb por papermill (headless, sin este server),
+    # así que aquí queda bajo el perfil "dev": solo arranca si COMPOSE_PROFILES=dev (ver .env.example)
+    # o con `docker compose --profile dev up`. Un `docker compose up` "pelado" (prod) NO lo levanta.
+    profiles: ["dev"]
     ports:
       - "8888:8888"
       - "4055:4040"
