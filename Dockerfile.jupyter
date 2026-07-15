@@ -38,7 +38,7 @@ ENV PYSPARK_DRIVER_PYTHON=python3.12
 
 # Token controlado por la env var JUPYTER_TOKEN (forma shell para que se expanda):
 #  - sin definir/vacia -> sin token (entorno local de practica, igual que antes);
-#  - definida (override de prod, ver docs/02 §13.2) -> token obligatorio.
+#  - definida (override de prod, ver docs/02 §14.1, docker-compose.prod.yml) -> token obligatorio.
 CMD python3.12 -m jupyterlab \
     --ip=0.0.0.0 --port=8888 --no-browser --allow-root \
     --ServerApp.token="${JUPYTER_TOKEN:-}" --ServerApp.password= --ServerApp.root_dir=/opt/notebooks

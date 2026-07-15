@@ -1,7 +1,7 @@
 # Guía profesional — Anatomía del `docker-compose.yml`
 
 > Cómo está construido el stack (HDFS + Spark + Jupyter + Airflow 3) bloque por bloque,
-> **el porqué de cada decisión**, y una **refactorización** lista para producción.
+> el porqué de cada decisión y una refactorización lista para producción.
 
 Índice:
 1. [Visión general del stack](#1-visión-general-del-stack)
@@ -18,19 +18,18 @@
 
 ## 1. Visión general del stack
 
-El compose levanta **4 subsistemas** en una sola red de Docker (`hadoopnet`):
+El compose levanta 4 subsistemas en una sola red de Docker (`hadoopnet`):
 
 | Subsistema | Servicios | Rol |
 |---|---|---|
-| **Almacenamiento** | `hdfs-namenode`, `hdfs-datanode` | Sistema de archivos distribuido (HDFS) |
-| **Cómputo** | `spark-master`, `spark-worker` | Cluster Spark 4.0.3 standalone |
-| **Interactivo** | `jupyter` | Driver PySpark para trabajo exploratorio |
-| **Orquestación** | `airflow-*` (5) + `airflow-db` | Airflow 3 + Postgres 16 |
+| Almacenamiento | `hdfs-namenode`, `hdfs-datanode` | Sistema de archivos distribuido (HDFS) |
+| Cómputo | `spark-master`, `spark-worker` | Cluster Spark 4.0.3 standalone |
+| Interactivo | `jupyter` | Driver PySpark para trabajo exploratorio |
+| Orquestación | `airflow-*` (5) + `airflow-db` | Airflow 3 + Postgres 16 |
 
-**Regla de oro que hace que todo funcione:** dentro de una red de Compose, el **nombre del
-servicio ES el hostname DNS**. Por eso `spark://spark-master:7077` o
-`hdfs://hdfs-namenode:9000` resuelven solos. Nunca uses `localhost` para hablar entre
-contenedores — `localhost` dentro de un contenedor es *ese* contenedor, no el host ni otro servicio.
+Regla base: dentro de una red de Compose, el nombre del servicio es el hostname DNS. Por eso
+`spark://spark-master:7077` o `hdfs://hdfs-namenode:9000` resuelven solos. No uses `localhost`
+entre contenedores: dentro de un contenedor, `localhost` es ese mismo contenedor.
 
 ```
                          red: hadoopnet
@@ -62,59 +61,59 @@ x-airflow-common: &airflow-common
   networks: [hadoopnet]
 ```
 
-**Qué es y por qué:**
+Qué es y por qué:
 
-- **`x-airflow-common:`** — cualquier clave con prefijo `x-` es una *extension field*: Compose la
+- `x-airflow-common:` — cualquier clave con prefijo `x-` es una *extension field*: Compose la
   ignora como servicio. Sirve solo como plantilla reutilizable.
-- **`&airflow-common`** — define un **ancla YAML**. Es "guardar este bloque en una variable".
-- **`<<: *airflow-common`** (más abajo, en cada servicio) — es el *merge*: "pegá aquí todo el
-  bloque anclado". Airflow 3 partió el monolito en **5 procesos** que comparten imagen, env y
-  volúmenes; sin este patrón habría 5 copias idénticas de ~40 líneas cada una → un imán de bugs.
+- `&airflow-common` — define un ancla YAML: "guardar este bloque en una variable".
+- `<<: *airflow-common` (en cada servicio) — el *merge*: "pegá aquí todo el bloque anclado".
+  Airflow 3 partió el monolito en 5 procesos que comparten imagen, env y volúmenes; sin este
+  patrón habría 5 copias idénticas de ~40 líneas.
 
-**Por qué `image:` + `build:` juntos (líneas 9-12):**
+Por qué `image:` + `build:` juntos:
 
 ```yaml
-  image: pyspark_stack-airflow:3.2.2   # nombre FIJO de la imagen resultante
+  image: pyspark_stack-airflow:3.2.2   # tag fijo: los 5 servicios airflow-* reutilizan esta imagen
   build:
     context: .
     dockerfile: Dockerfile.airflow
 ```
 
-Con ambos, Compose construye la imagen **una vez** y le asigna ese tag; los 5 servicios
-`airflow-*` la **reutilizan**. Sin el `image:` explícito, cada servicio podría reconstruir o
-Compose podría agarrar una capa vieja de caché. Evita 5 imágenes duplicadas de ~7 GB.
+Con ambos, Compose construye la imagen una vez y le asigna ese tag; los 5 servicios `airflow-*`
+la reutilizan. Sin el `image:` explícito, cada servicio podría reconstruir la suya: 5 imágenes
+duplicadas de ~7 GB.
 
-**Variables de entorno clave (y el porqué de cada una):**
+Variables de entorno clave:
 
 | Variable | Por qué |
 |---|---|
 | `AIRFLOW__CORE__EXECUTOR: LocalExecutor` | Tareas corren en el mismo proceso del scheduler. Simple; sin Celery/Redis. Correcto para dev y cargas moderadas. |
-| `AIRFLOW__CORE__AUTH_MANAGER: ...FabAuthManager` | En Airflow 3 el RBAC/usuarios se movió al provider **FAB**. Sin esto, `airflow users create` no existe. |
+| `AIRFLOW__CORE__AUTH_MANAGER: ...FabAuthManager` | En Airflow 3 el RBAC/usuarios se movió al provider FAB. Sin esto, `airflow users create` no existe. |
 | `AIRFLOW__DATABASE__SQL_ALCHEMY_CONN` | La conexión a la BD se mudó de `[core]` a `[database]` en Airflow 3. Apunta a `airflow-db` por hostname. |
 | `AIRFLOW__CORE__LOAD_EXAMPLES: 'False'` | No ensuciar la UI con DAGs de ejemplo. |
-| `AIRFLOW__CORE__EXECUTION_API_SERVER_URL` | **Nuevo en Airflow 3**: scheduler y tasks hablan con el api-server por la *Task Execution API*. Debe apuntar a `http://airflow-apiserver:8080/...`, **nunca localhost**. |
+| `AIRFLOW__CORE__EXECUTION_API_SERVER_URL` | Nuevo en Airflow 3: scheduler y tasks hablan con el api-server por la Task Execution API. Debe apuntar a `http://airflow-apiserver:8080/...`, nunca a localhost. |
 | `AIRFLOW__API_AUTH__JWT_SECRET` | Reemplaza al viejo `WEBSERVER__SECRET_KEY`. Firma los JWT que autentican las tasks. |
 | `AIRFLOW_UID: 50000` | UID del usuario `airflow` dentro de la imagen; alinea permisos de los volúmenes montados. |
 
-**Volúmenes compartidos (líneas 26-30):**
+Volúmenes compartidos:
 
 ```yaml
   volumes:
-    - ./dags:/opt/airflow/dags                 # tus DAGs, hot-reload
+    - ./dags:/opt/airflow/dags
     - ./spark-apps:/opt/spark-apps             # los .py de Spark, compartidos con el cluster
-    - /var/run/docker.sock:/var/run/docker.sock   # ⚠️ permite lanzar contenedores (DockerOperator)
-    - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml  # HDFS client config
+    - /var/run/docker.sock:/var/run/docker.sock   # permite lanzar contenedores (DockerOperator)
+    - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml  # config de cliente HDFS
 ```
 
-> ⚠️ **Montar `docker.sock` = dar root del host al contenedor.** Es cómodo (DockerOperator)
-> pero es la mayor superficie de ataque del stack. En la refactorización lo marcamos como
-> opcional. Si no usás DockerOperator, quitalo.
+> Montar `docker.sock` equivale a dar root del host al contenedor. Es la mayor superficie de
+> ataque del stack. Si no usás DockerOperator, quitalo (§8.4).
 
 ---
 
 ## 3. Capa de almacenamiento: HDFS
 
 ```yaml
+# (fragmento simplificado; volúmenes completos en el compose)
   hdfs-namenode:
     image: chandravenkat/hadoop-namenode@sha256:51ad92...   # el "índice" (metadatos)
     environment:
@@ -132,25 +131,25 @@ Compose podría agarrar una capa vieja de caché. Evita 5 imágenes duplicadas d
     volumes: [hdfs-dn-data:/hadoop/dfs/data]
 ```
 
-**El porqué:**
+El porqué:
 
-- **Namenode vs datanode:** el namenode guarda *metadatos* (qué bloque vive dónde); el datanode
-  guarda los *datos*. Por eso el datanode declara `depends_on: hdfs-namenode`.
-- **`CORE_CONF_fs_defaultFS` en ambos:** las imágenes `bde2020`-style traducen env vars
+- Namenode vs datanode: el namenode guarda metadatos (qué bloque vive dónde); el datanode guarda
+  los datos. Por eso el datanode declara `depends_on: hdfs-namenode`.
+- `CORE_CONF_fs_defaultFS` en ambos: las imágenes estilo `bde2020` traducen env vars
   `CORE_CONF_*` / `HDFS_CONF_*` a entradas de `core-site.xml` / `hdfs-site.xml` en el arranque.
-  Ambos apuntan al mismo namenode por hostname.
-- **`dfs_replication=1`:** con un único datanode, replicar no aporta y genera warnings de bloques
+- `dfs_replication=1`: con un único datanode, replicar no aporta y genera warnings de bloques
   under-replicated. En prod real subís esto y agregás datanodes.
-- **Imágenes fijadas por `@sha256:...`:** pin inmutable. Garantiza reproducibilidad exacta
-  (mismo binario siempre), a diferencia de un tag mutable como `:latest`.
-- **Volúmenes nombrados (`hdfs-nn-data`, `hdfs-dn-data`):** los datos **sobreviven** a
-  `docker compose down`. Solo `down -v` los borra.
+- Imágenes fijadas por `@sha256:...`: pin inmutable, reproducibilidad exacta frente a un tag
+  mutable como `:latest`.
+- Volúmenes nombrados (`hdfs-nn-data`, `hdfs-dn-data`): los datos sobreviven a
+  `docker compose down`; solo `down -v` los borra.
 
 ---
 
 ## 4. Motor de cómputo: Spark standalone
 
 ```yaml
+# (fragmento simplificado; volúmenes completos en el compose: ./spark-apps y ./spark-events)
   spark-master:
     build: { context: ., dockerfile: Dockerfile.spark }
     image: pyspark_stack-spark:4.0.3
@@ -166,25 +165,24 @@ Compose podría agarrar una capa vieja de caché. Evita 5 imágenes duplicadas d
     command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
 ```
 
-**La decisión no obvia (líneas 66-68 del compose):** la imagen oficial `apache/spark` está
-pensada para `spark-submit` / Kubernetes, no para levantar un cluster standalone persistente.
-Los scripts habituales `sbin/start-master.sh` / `start-worker.sh` **daemonizan** (arrancan el
-proceso en segundo plano y el script termina). En Docker eso mata el contenedor: **el PID 1
-terminó → contenedor `Exited(0)`**.
+La decisión no obvia: la imagen oficial `apache/spark` está pensada para `spark-submit` /
+Kubernetes, no para un cluster standalone persistente. Los scripts `sbin/start-master.sh` /
+`start-worker.sh` daemonizan: el proceso queda en segundo plano y el script termina. En Docker
+eso mata el contenedor (PID 1 terminado → `Exited(0)`).
 
-**Solución:** arrancar la clase Java directamente en *foreground* con `spark-class`. Así el
-proceso Master/Worker es el PID 1 y vive mientras viva el contenedor.
+Solución: arrancar la clase Java en foreground con `spark-class`. Así el proceso Master/Worker
+es el PID 1 y vive mientras viva el contenedor.
 
-- **`--host spark-master`:** el master anuncia su hostname para que el worker (y los drivers) lo
+- `--host spark-master`: el master anuncia su hostname para que el worker y los drivers lo
   encuentren. Debe coincidir con el nombre del servicio.
-- **`ports: 8081:8080`:** la UI del master corre en `8080` *dentro* del contenedor, pero se
-  publica en `8081` afuera porque `8080` ya lo usa el api-server de Airflow.
-- **`Dockerfile.spark` instala Python 3.12** (la base trae 3.10) y fuerza
-  `PYSPARK_PYTHON=python3.12`. Motivo: los *executors* deben correr el **mismo minor de Python**
-  que el *driver* (Airflow/Jupyter, 3.12) o Spark lanza `[PYTHON_VERSION_MISMATCH]`.
+- `ports: 8081:8080`: la UI del master corre en `8080` dentro del contenedor; se publica en
+  `8081` porque `8080` ya lo usa el api-server de Airflow.
+- `Dockerfile.spark` instala Python 3.12 (la base trae 3.10) y fuerza
+  `PYSPARK_PYTHON=python3.12`: los executors deben correr el mismo minor de Python que el
+  driver (Airflow/Jupyter, 3.12) o Spark lanza `[PYTHON_VERSION_MISMATCH]`.
 
-> `spark-history-server` (líneas 101-117) está **comentado**. Lee los logs de `./spark-events`
-> para inspeccionar jobs terminados. Lo dejamos como opcional en la refactorización.
+> `spark-history-server` está comentado en el compose. Lee los logs de `./spark-events` para
+> inspeccionar jobs terminados; queda como opcional (§8.5).
 
 ---
 
@@ -194,33 +192,44 @@ proceso Master/Worker es el PID 1 y vive mientras viva el contenedor.
   jupyter:
     build: { context: ., dockerfile: Dockerfile.jupyter }
     image: pyspark_stack-jupyter:4.0.3
+    profiles: ["dev"]        # solo arranca bajo el perfil dev (ver abajo)
     ports: ["8888:8888", "4055:4040"]
     depends_on: [spark-master]
+    volumes:
+      - ./notebooks:/opt/notebooks
+      - ./spark-apps:/opt/spark-apps
+      - ./spark-events:/tmp/spark-events
     environment:
       - SPARK_MASTER=spark://spark-master:7077
-      - PYSPARK_PYTHON=python3
-      - PYSPARK_DRIVER_PYTHON=python3
+      # python3.12 explícito: 'python3' en esta base es 3.10 → [PYTHON_VERSION_MISMATCH] (§4)
+      - PYSPARK_PYTHON=python3.12
+      - PYSPARK_DRIVER_PYTHON=python3.12
 ```
 
-**El porqué:**
+El porqué:
 
-- **`Dockerfile.jupyter` sobre `apache/spark:4.0.3`** en vez de la clásica
-  `jupyter/pyspark-notebook`: esta última **solo llega hasta Spark 3.5**. Para tener el **mismo
-  Spark 4.0.3** que el cluster (evitar incompatibilidades de protocolo), se construye desde la
-  imagen oficial de Spark y se le agrega JupyterLab + Python 3.12.
-- **`4055:4040`:** el *Spark UI del driver* (la app del notebook) vive en `4040` interno; se
-  publica en `4055` para no chocar con otros 4040.
-- **`SPARK_MASTER=spark://spark-master:7077`:** el notebook actúa como *driver* y se conecta al
-  master standalone.
+- `profiles: ["dev"]`: Jupyter es herramienta de desarrollo. Un `docker compose up` pelado no lo
+  levanta: hace falta `COMPOSE_PROFILES=dev` en el `.env` (así viene en `.env.example`) o
+  `docker compose --profile dev up`. En prod el ETL corre por Airflow y los `.ipynb` por
+  papermill, sin este server.
+- `Dockerfile.jupyter` construye sobre `apache/spark:4.0.3` en vez de la clásica
+  `jupyter/pyspark-notebook`, que solo llega a Spark 3.5. Así el driver corre el mismo Spark
+  4.0.3 que el cluster; solo se agrega JupyterLab + Python 3.12.
+- `4055:4040`: la Spark UI del driver (la app del notebook) vive en `4040` interno; se publica
+  en `4055` para no chocar con otros 4040.
+- `SPARK_MASTER=spark://spark-master:7077`: el notebook actúa como driver contra el master
+  standalone.
 
 ---
 
 ## 6. Orquestación: Airflow 3
 
-Airflow 3 separó el viejo monolito (`webserver` + `scheduler`) en **procesos independientes**.
+Airflow 3 separó el viejo monolito (`webserver` + `scheduler`) en procesos independientes.
 Todos heredan de `*airflow-common`:
 
 ```yaml
+# (fragmento simplificado; en el compose real cada servicio long-running también declara
+#  depends_on: airflow-db con condition: service_healthy)
   airflow-init:          # one-shot: migra esquema + crea admin, luego termina
     <<: *airflow-common
     depends_on: { airflow-db: { condition: service_healthy } }
@@ -246,38 +255,41 @@ Todos heredan de `*airflow-common`:
     command: triggerer
 ```
 
-**El porqué de cada proceso:**
+El rol de cada proceso:
 
 | Servicio | Rol | Nota Airflow 3 |
 |---|---|---|
-| `airflow-init` | Migra el esquema y crea el admin, **luego sale** | `db migrate` reemplaza a `db upgrade`; `fab-db migrate` crea las tablas de auth (`ab_user`, `ab_role`…) |
+| `airflow-init` | Migra el esquema y crea el admin, luego sale | `db migrate` reemplaza a `db upgrade`; `fab-db migrate` crea las tablas de auth (`ab_user`, `ab_role`…) |
 | `airflow-apiserver` | Sirve UI + API REST | Reemplaza a `webserver`; es quien firma/valida los JWT |
-| `airflow-scheduler` | Programa y despacha tasks | Ya **no** parsea DAGs |
-| `airflow-dag-processor` | Parsea los `.py` de `dags/` | **Proceso nuevo y separado** en A3 |
+| `airflow-scheduler` | Programa y despacha tasks | Ya no parsea DAGs |
+| `airflow-dag-processor` | Parsea los `.py` de `dags/` | Proceso nuevo y separado en A3 |
 | `airflow-triggerer` | Corre `deferrable operators` (I/O async) | Estándar en A3 |
 
-**Dependencias de arranque (`depends_on` con condiciones):**
+Dependencias de arranque (`depends_on` con condiciones):
 
-- `airflow-db: condition: service_healthy` → esperar a que Postgres pase su **healthcheck**
+- `airflow-db: condition: service_healthy` → esperar a que Postgres pase su healthcheck
   (`pg_isready`), no solo a que el contenedor exista.
-- `airflow-init: condition: service_completed_successfully` → los procesos long-running esperan a
-  que la **migración termine con éxito** antes de arrancar. Evita el clásico "tabla no existe".
+- `airflow-init: condition: service_completed_successfully` → los procesos long-running esperan
+  a que la migración termine con éxito. Evita el clásico "tabla no existe".
 
-**Postgres 16 (`airflow-db`):**
+Postgres 16 (`airflow-db`):
 
 ```yaml
   airflow-db:
     image: postgres:16
-    environment: [POSTGRES_USER=airflow, POSTGRES_PASSWORD=airflow, POSTGRES_DB=airflow]
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
     volumes: [postgres_data:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
       interval: 5s
       timeout: 5s
       retries: 10
 ```
 
-El **healthcheck** es lo que habilita el `condition: service_healthy` de arriba: sin él, Compose
+El healthcheck es lo que habilita el `condition: service_healthy` de arriba: sin él, Compose
 solo sabe "el contenedor arrancó", no "la BD acepta conexiones".
 
 ---
@@ -294,28 +306,33 @@ networks:
   hadoopnet:       # una sola red bridge; DNS por nombre de servicio
 ```
 
-- **Volúmenes nombrados** = datos persistentes gestionados por Docker (viven en
-  `/var/lib/docker/volumes`). Sobreviven a `down`, se borran con `down -v`.
-- **Bind mounts** (`./dags`, `./spark-apps`) = carpetas del host mapeadas dentro; ideales para
-  código que editás en caliente.
-- **Una sola red** simplifica el DNS. En prod podrías segmentar (data / orchestration) para
-  aislar tráfico.
+- Volúmenes nombrados: gestionados por Docker (viven en `/var/lib/docker/volumes`); su ciclo de
+  vida ya se explicó en §3.
+- Bind mounts (`./dags`, `./spark-apps`): carpetas del host mapeadas dentro; ideales para código
+  que editás en caliente.
+- Una sola red simplifica el DNS. En prod podrías segmentar (data / orchestration) para aislar
+  tráfico.
 
-**Orden efectivo de arranque** (resuelto por `depends_on`):
+Orden efectivo de arranque (resuelto por `depends_on`):
 
 ```
 airflow-db (healthy)
     └─► airflow-init (completa migración)
             └─► apiserver, scheduler, dag-processor, triggerer
 hdfs-namenode ─► hdfs-datanode
-spark-master  ─► spark-worker ─► jupyter
+spark-master  ─► spark-worker
+spark-master  ─► jupyter   (solo bajo el perfil dev; no espera al worker)
 ```
+
+`jupyter` depende solo de `spark-master` (no del worker) y únicamente arranca con el perfil
+`dev` activo (§5). Que el master esté arriba no garantiza que haya workers registrados: un
+notebook lanzado demasiado pronto queda esperando executors.
 
 ---
 
 ## 8. Refactorización profesional
 
-Los problemas del compose actual (aceptables en dev, **inaceptables en prod**):
+Los problemas del compose actual, aceptables en dev pero no en producción:
 
 | # | Problema | Riesgo |
 |---|---|---|
@@ -324,7 +341,7 @@ Los problemas del compose actual (aceptables en dev, **inaceptables en prod**):
 | 3 | Sin healthchecks salvo Postgres | `depends_on` no sabe si el servicio *funciona* |
 | 4 | Sin límites de recursos | Un Spark job puede comerse toda la RAM del host |
 | 5 | `docker.sock` montado siempre | Superficie de ataque = root del host |
-| 6 | Sin versión pineada del schema de compose | Comportamiento no reproducible |
+| 6 | Clave `version:` en el compose — obsoleta en la Compose Specification (Compose v2 la ignora con un warning). Ya resuelto: se eliminó; el compose actual no la lleva | Warning ruidoso y falsa sensación de "pin" que no controla nada |
 | 7 | Jupyter sin token | Cualquiera en la red entra |
 
 ### 8.1. Secretos en un `.env` (ya soportado por el compose)
@@ -333,11 +350,12 @@ El compose base ya lee los secretos por interpolación (ver 8.3); solo falta dar
 fuertes. Copiá la plantilla del repo y reemplazá los defaults:
 
 ```bash
-cp .env.example .env   # .env ya está en .gitignore — NO commitear
+cp .env.example .env   # .env ya está en .gitignore; no commitear
 ```
 
 ```dotenv
 # .env  — valores de producción
+COMPOSE_PROFILES=dev   # "dev" levanta Jupyter; en prod dejalo vacío o quitá la línea
 POSTGRES_USER=airflow
 POSTGRES_PASSWORD=cambia-esto-por-algo-fuerte
 POSTGRES_DB=airflow
@@ -356,9 +374,9 @@ openssl rand -hex 32   # para AIRFLOW_JWT_SECRET
 
 ### 8.2. `docker-compose.override.yml` para producción
 
-En vez de tocar el compose base, usá un **override** que Compose fusiona automáticamente. Esto
-mantiene el dev intacto y añade el endurecimiento de prod. Guardalo como
-`docker-compose.prod.yml` y levantá con:
+En vez de tocar el compose base, usá un override que Compose fusiona automáticamente: el dev
+queda intacto y se añade el endurecimiento de prod. Guardalo como `docker-compose.prod.yml` y
+levantá con:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
@@ -407,7 +425,10 @@ services:
     <<: [*restart-policy, *default-logging]
     deploy:
       resources:
-        limits: { memory: 4g }        # el worker ejecuta; ofrece 3G/2 cores a los executors (mismo valor que producción)
+        limits: { memory: 4g }        # tope duro del contenedor (cgroup)
+    # Este snippet no pasa --memory/--cores al Worker: por defecto ofrece toda la RAM del
+    # contenedor menos 1 GB y todos los cores del host. Los 3G/2 cores se fijan en el
+    # override de producción (docs/02).
 
   jupyter:
     <<: [*restart-policy, *default-logging]
@@ -462,11 +483,11 @@ Y el `airflow-init` usando las vars:
 ```
 
 > Los defaults (`:-airflow`, `:-change-me-in-prod`, `:-admin`) existen para que el arranque local
-> sea cero-fricción. En producción **siempre** deben quedar pisados por el `.env` (checklist §9).
+> sea cero-fricción. En producción siempre deben quedar pisados por el `.env` (checklist §9).
 
 ### 8.4. Quitar `docker.sock` si no lo usás
 
-Si tus DAGs **no** usan `DockerOperator`, eliminá esta línea del `x-airflow-common`:
+Si tus DAGs no usan `DockerOperator`, eliminá esta línea del `x-airflow-common`:
 
 ```yaml
     - /var/run/docker.sock:/var/run/docker.sock   # ← BORRAR si no hay DockerOperator
@@ -477,10 +498,10 @@ expone solo las APIs necesarias en vez del socket crudo.
 
 ### 8.5. Añadir el history-server (opcional, ya casi listo)
 
-Descomentá el bloque de `spark-history-server` (líneas 101-117) y arrancalo; leerá
+Descomentá el bloque de `spark-history-server` en el compose y arrancalo; leerá
 `./spark-events` para darte la UI de jobs terminados en `:18080`. Recordá también poner
 `spark.eventLog.enabled true` en `spark-events/spark-defaults.conf` (hoy está en `false`
-porque sin History Server los event logs quedaban huérfanos) — el detalle está en la
+porque sin History Server los event logs quedaban huérfanos); el detalle está en la
 guía de producción §13.6.
 
 ---
@@ -500,6 +521,6 @@ Antes de considerar el stack "listo":
 - [ ] Imágenes pineadas por tag inmutable o `@sha256`.
 - [ ] Volúmenes con backup (Postgres + HDFS namenode).
 
-> **Siguiente paso:** ver `02-produccion-aws.md` — guía única de producción (un solo camino: EC2
+> Siguiente paso: ver `02-produccion-aws.md` — guía única de producción (un solo camino: EC2
 > self-managed + S3 + Lambda/EventBridge), Terraform, estado remoto en S3+DynamoDB, monitoreo,
 > CI/CD y automatización de costo con auto start/stop. La arquitectura está en `03-arquitectura.md`.

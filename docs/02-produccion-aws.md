@@ -1,14 +1,14 @@
 # Guía experta — Producción en AWS (Terraform, EC2 self-managed + automatización)
 
-> Guía única de producción para el stack (HDFS/Spark/Jupyter/Airflow). Implementa **una sola
-> arquitectura** —la de [`docs/03-arquitectura.md`](03-arquitectura.md)— con Terraform copy-paste,
-> estado remoto y **automatización con EventBridge + Lambda** para bajar el costo al mínimo.
+> Guía única de producción para el stack (HDFS/Spark/Jupyter/Airflow). Implementa una sola
+> arquitectura —la de [`docs/03-arquitectura.md`](03-arquitectura.md)— con Terraform copy-paste,
+> estado remoto y automatización con EventBridge + Lambda para bajar el costo al mínimo.
 >
-> **La arquitectura (un solo camino):** el stack completo corre *self-managed* en **una EC2** con
-> Docker. Alrededor, servicios AWS lo complementan: **S3** como data lake (`s3a://` con rol IAM),
-> **Lambda + EventBridge** para disparar los DAGs (por cron o por evento) y para el *auto
-> start/stop* de la EC2, **Prometheus + Grafana + Alertmanager + Loki** para observabilidad, y
-> **CI/CD con GitHub Actions (OIDC)**. **No usa MWAA, EMR ni Glue** (ver el porqué en la guía de arquitectura).
+> La arquitectura, en un solo camino: el stack completo corre *self-managed* en una EC2 con
+> Docker. Alrededor, servicios AWS lo complementan: S3 como data lake (`s3a://` con rol IAM),
+> Lambda + EventBridge para disparar los DAGs (por cron o por evento) y para el auto
+> start/stop de la EC2, Prometheus + Grafana + Alertmanager + Loki para observabilidad, y
+> CI/CD con GitHub Actions (OIDC). No usa MWAA, EMR ni Glue (el porqué está en la guía de arquitectura).
 
 Índice:
 1. [Panorama de la arquitectura](#1-panorama-de-la-arquitectura)
@@ -31,6 +31,7 @@
    - 7.3 [Disparo por evento (archivo nuevo en S3)](#73-disparo-por-evento-archivo-nuevo-en-s3)
 8. [Operación, seguridad y ahorro](#8-operación-seguridad-y-ahorro)
 9. [Notebooks: dónde viven y cómo se ejecutan](#9-notebooks-dónde-viven-y-cómo-se-ejecutan)
+   - 9.0 [Patrones de tarea para ETL batch (¿PySpark o Python puro?)](#90-patrones-de-tarea-para-etl-batch-pyspark-o-python-puro)
    - 9.1 [Habilitar papermill](#91-habilitar-papermill)
    - 9.2 [Parametrizar el notebook](#92-parametrizar-el-notebook)
    - 9.3 [DAG que ejecuta el notebook](#93-dag-que-ejecuta-el-notebook--dagsrun_notebook_dagpy)
@@ -61,11 +62,11 @@
 
 Un solo host EC2 corre todo el stack en Docker; AWS *serverless* lo rodea para storage durable
 (S3), disparo de DAGs (Lambda + EventBridge) y ahorro (auto start/stop). El detalle conceptual y
-los diagramas están en [`docs/03-arquitectura.md`](03-arquitectura.md); esta guía es el **cómo**
+los diagramas están en [`docs/03-arquitectura.md`](03-arquitectura.md); esta guía es el cómo
 (Terraform copy-paste).
 
-**Regla mental:** almacenar es barato y constante; **computar es lo que cuesta, y solo cuando
-corrés**. Por eso la EC2 se apaga fuera de horario (auto start/stop) y el data lake vive en S3.
+Regla mental: almacenar es barato y constante; computar es lo que cuesta, y solo cuando corrés.
+Por eso la EC2 se apaga fuera de horario (auto start/stop) y el data lake vive en S3.
 
 ```
                     ┌───────────── EC2 m6i.xlarge (Elastic IP) ──────────────┐
@@ -86,46 +87,48 @@ corrés**. Por eso la EC2 se apaga fuera de horario (auto start/stop) y el data 
 
 ## 2. Costo
 
-> Precios **aproximados** us-east-1 (on-demand), sujetos a cambio — validá en
-> [calculator.aws](https://calculator.aws). Escenario: ~1 h de Spark/día, ~50 GB.
+> Precios aproximados us-east-1 (on-demand), sujetos a cambio — validá en
+> [calculator.aws](https://calculator.aws). Escenario: ~1 h de Spark/día procesando ~50 MB
+> por corrida, con ~50 GB acumulados en el data lake.
 
 | Item | US$/mes |
 |---|---|
 | EC2 `m6i.xlarge` (4 vCPU/16 GB) con **auto start/stop** (8h×22d) | ~34 |
 | EBS gp3 (root 40 + data 200) + snapshots DLM | ~22 |
 | S3 data lake (~50 GB) + requests | ~1.5 |
+| IPv4 pública (EIP; AWS la cobra desde feb-2024, asociada o no) | ~3.6 |
 | Lambda + EventBridge + SSM | ~0 (free tier) |
-| **Total** | **~58/mes** |
+| **Total** | **~61/mes** |
 
-`m6i.xlarge` alcanza porque el cuello no es el dato (~50 MB es trivial) sino la RAM de las JVMs +
+`m6i.xlarge` alcanza porque el cuello no es el dato (los ~50 MB por corrida son triviales) sino la RAM de las JVMs +
 Airflow + monitoreo. Sin auto start/stop (EC2 24/7) serían ~$140/mes: el `start/stop` automático es la
 palanca de ahorro principal. El monitoreo corre dentro de la misma EC2 (costo $0 adicional). Para
 una máquina de desarrollo chica (~8 GB) existe el `docker-compose.dev.yml` del final, solo Spark+Jupyter.
 
 ### Self-managed vs managed: ¿cuándo cada uno?
 
-Este diseño es self-managed **a propósito**, pero no porque lo managed sea siempre caro: depende del
+Este diseño es self-managed a propósito, pero no porque lo managed sea siempre caro: depende del
 uso. Comparación aproximada (us-east-1, datos chicos, ~20 tareas/día):
 
 | Opción | Cómo cobra | ~US$/mes a esta escala | Ops | Cuándo gana |
 |---|---|---|---|---|
-| **Self-managed EC2** (este stack) | tiempo encendido (flat) | ~34 compute (~58 total) | Vos | consolidar varias cargas en la máquina ya paga; control y portabilidad (cero lock-in) |
+| **Self-managed EC2** (este stack) | tiempo encendido (flat) | ~34 compute (~61 total) | Vos | consolidar varias cargas en la máquina ya paga; control y portabilidad (cero lock-in) |
 | **EMR Serverless** | vCPU-seg + GB-seg, escala a cero | ~9 (+ S3) | AWS | Spark chico/esporádico con mínima ops |
 | **Glue Spark** | DPU-hora (mín 2 DPU + 1 min por corrida) | ~44 | AWS | pocos jobs/día |
 | **EMR on EC2** (clásico) | fleet EC2 + ~25% recargo | ~120–160 | Vos (cluster) | TB sostenidos, multi-nodo |
 | **MWAA** (solo orquestación) | entorno siempre encendido | ~350+ | AWS | evitar a esta escala |
 
-**Cómo leerlo:**
-- El **costo por-corrida** duele solo en **Glue Spark** (pisos de 2 DPU + 1 min) y en clusters EMR
-  clásicos (arranque). **Step Functions, Lambda, Athena, EventBridge** son centavos aunque los
+Cómo leerlo:
+- El costo por-corrida duele solo en Glue Spark (pisos de 2 DPU + 1 min) y en clusters EMR
+  clásicos (arranque). Step Functions, Lambda, Athena y EventBridge son centavos aunque los
   dispares miles de veces.
-- El EC2 flat cuesta **lo mismo con 1 o 20 tareas** → cada tarea extra es gratis. Contra **Glue/MWAA**
-  conviene a partir de ~10-20 tareas/día; contra **EMR Serverless** (sin pisos) el self-managed **no
-  gana por costo**, gana por **control, portabilidad, aprendizaje y consolidación** (HDFS real +
+- El EC2 flat cuesta lo mismo con 1 o 20 tareas: cada tarea extra es gratis. Contra Glue/MWAA
+  conviene a partir de ~10-20 tareas/día; contra EMR Serverless (sin pisos) el self-managed no
+  gana por costo — gana por control, portabilidad, aprendizaje y consolidación (HDFS real +
   Airflow/Grafana siempre disponibles en una sola caja ya paga).
-- **Regla:** uso bajo/esporádico + mínima ops → **serverless** (EMR Serverless / Lambda / Glue Python
-  Shell + Step Functions + Athena); uso real y sostenido + querer controlar/aprender → **self-managed**
-  (este stack).
+- Regla: uso bajo/esporádico + mínima ops → serverless (EMR Serverless / Lambda / Glue Python
+  Shell + Step Functions + Athena); uso real y sostenido + querer controlar/aprender →
+  self-managed (este stack).
 
 ---
 
@@ -145,17 +148,19 @@ infra/
 └── prod/                # toda la infra del stack (un solo estado)
     ├── lambda/startstop.py
     ├── lambda/trigger_airflow.py
-    └── *.tf              # network, iam, ec2, s3, orchestration, autostop, cicd, secrets
+    └── *.tf              # backend, providers, variables, locals, outputs,
+                          # network, iam, ec2, s3, backups, automation,
+                          # orchestration, cicd, secrets
 ```
 
 ### Dos formas de crear la infra: Terraform y consola
 
-Cada recurso de esta guía trae su **Terraform (copy-paste)** y, debajo, un desplegable
-**«🖱️ A mano en la consola AWS»** con los pasos equivalentes. La consola sirve para entender qué
+Cada recurso de esta guía trae su Terraform (copy-paste) y, debajo, un desplegable
+«🖱️ A mano en la consola AWS» con los pasos equivalentes. La consola sirve para entender qué
 crea cada bloque, o para un despliegue puntual sin IaC; **Terraform es la fuente de verdad**:
 reproducible, versionado y con `terraform destroy` limpio. No mezcles los dos caminos para el
-**mismo** recurso — si algo ya lo creaste a mano y querés pasarlo a Terraform, primero
-`terraform import` (si no, el `apply` duplica o falla por nombre ocupado).
+mismo recurso — si algo ya lo creaste a mano y querés pasarlo a Terraform, primero
+`terraform import`; si no, el `apply` duplica o falla por nombre ocupado.
 
 ---
 
@@ -175,7 +180,7 @@ terraform {
 provider "aws" { region = "us-east-1" }
 
 locals {
-  state_bucket = "pyspark-stack-tfstate-abanto-2026"   # ← único global, cambiá el sufijo
+  state_bucket = "pyspark-stack-tfstate-tu-sufijo-2026"   # ← único global, cambiá "tu-sufijo"
   lock_table   = "pyspark-stack-tf-lock"
 }
 
@@ -235,7 +240,7 @@ cd infra/bootstrap && terraform init && terraform apply && cd ../..
 # infra/prod/backend.tf
 terraform {
   backend "s3" {
-    bucket         = "pyspark-stack-tfstate-abanto-2026"
+    bucket         = "pyspark-stack-tfstate-tu-sufijo-2026"   # el mismo del bootstrap
     key            = "pyspark-stack-prod/terraform.tfstate"
     region         = "us-east-1"
     dynamodb_table = "pyspark-stack-tf-lock"
@@ -276,8 +281,7 @@ data lake S3 y el disparo automático de los DAGs.
 
 ```hcl
 # infra/prod/variables.tf
-# Prefijo único de nombres. Cambiá SOLO esto para renombrar todo el proyecto (buckets, roles,
-# lambdas, tags…). Todos los recursos lo interpolan como "${var.name_prefix}-...".
+# Prefijo único: todos los recursos lo interpolan como "${var.name_prefix}-...".
 variable "name_prefix" {
   type    = string
   default = "pyspark-stack"
@@ -288,10 +292,8 @@ variable "aws_region" {
 }
 variable "instance_type" {
   type = string
-  # m6i.xlarge = 4 vCPU / 16 GB: corre el stack completo + monitoreo para datos chicos (~50 MB).
-  # IMPORTANTE: familia m6i (NO t3). m6i tiene CPU dedicada y constante; t3 es burstable y al
-  # apagar/prender agota "CPU credits" → caída de rendimiento visible. m6i garantiza el mismo
-  # rendimiento en cada arranque. dev-lite (solo Spark+Jupyter): "t3.large".
+  # m6i.xlarge (4 vCPU/16 GB) corre el stack completo + monitoreo. Familia m6i, no t3:
+  # los t3 burstable degradan tras el auto start/stop (§5.4). dev-lite: "t3.large".
   default = "m6i.xlarge"
 }
 variable "root_volume_gb" {
@@ -321,12 +323,10 @@ variable "stop_cron" {
 }
 ```
 
-Identidad de la cuenta (foundational: la reutilizan s3/iam/cicd/secrets, por eso va acá con las
-variables y no más abajo):
+Identidad de la cuenta — la reutilizan s3/iam/cicd/secrets, por eso va acá con las variables:
 
 ```hcl
 # infra/prod/locals.tf
-# `var.name_prefix` se define arriba en variables.tf y lo usan TODOS los recursos.
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 locals {
@@ -454,11 +454,13 @@ resource "aws_instance" "pyspark" {
   user_data                   = templatefile("${path.module}/user_data.sh.tftpl", {})
   user_data_replace_on_change = true
 
-  # IMDSv2 obligatorio: sin esto, un SSRF en Airflow/Jupyter/Grafana podría leer
-  # 169.254.169.254 y robar las credenciales del instance profile (S3 + secretos SSM).
+  # IMDSv2 obligatorio: un SSRF en Airflow/Jupyter/Grafana no puede robar las credenciales
+  # del instance profile. hop_limit = 2: los contenedores llegan al IMDS cruzando el bridge
+  # de Docker (+1 hop); con el default (1) el token no llega y s3a con rol IAM falla.
   metadata_options {
-    http_tokens   = "required"
-    http_endpoint = "enabled"
+    http_tokens                 = "required"
+    http_endpoint               = "enabled"
+    http_put_response_hop_limit = 2
   }
 
   # Name = "<prefix>-node" (el workflow de CI busca la instancia por este tag);
@@ -469,9 +471,8 @@ resource "aws_instance" "pyspark" {
   }
 }
 
-# Elastic IP: sin ella, cada stop/start del auto start/stop cambiaría la IP pública
-# (rompiendo túneles SSH guardados y el output public_ip). La EIP es gratis mientras
-# esté asociada a una instancia encendida.
+# EIP: sin ella, cada stop/start cambiaría la IP pública (túneles SSH, output public_ip).
+# Costo: AWS cobra toda IPv4 pública (~$3.6/mes, ver tabla de §2), asociada o no.
 resource "aws_eip" "pyspark" {
   domain = "vpc"
   tags   = { Name = "${var.name_prefix}-eip" }
@@ -519,9 +520,8 @@ if [ -n "$DATA_DEV" ]; then
   mkdir -p /data && mount "$DATA_DEV" /data
   echo "$DATA_DEV /data xfs defaults,nofail 0 2" >> /etc/fstab
   chown -R ec2-user:ec2-user /data
-  # Subdirectorios que docker-compose.prod.yml monta como bind mounts. Prometheus (uid 65534),
-  # Grafana (472) y Loki (10001) corren como usuarios sin privilegios: sin este chown quedan
-  # en crash-loop con "permission denied" al escribir. Postgres y HDFS arrancan como root (ok).
+  # Bind mounts del compose de prod. Prometheus (65534), Grafana (472) y Loki (10001) corren
+  # sin privilegios: sin este chown quedan en crash-loop por "permission denied".
   mkdir -p /data/postgres /data/hdfs-nn /data/hdfs-dn /data/prometheus /data/grafana /data/loki
   chown 65534:65534 /data/prometheus
   chown 472:472     /data/grafana
@@ -540,7 +540,9 @@ echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-pyspark.conf && sysctl --syste
    Encrypted**, device `/dev/xvdf`.
 4. *Advanced details*:
    - **IAM instance profile** → `pyspark-stack-ec2-role`.
-   - **Metadata version** → **V2 only (token required)** (IMDSv2 obligatorio).
+   - **Metadata version** → **V2 only (token required)** (IMDSv2 obligatorio) y **Metadata
+     response hop limit** → **2** (sin esto los contenedores no alcanzan el IMDS y `s3a://`
+     falla por credenciales).
    - **User data** → pegá el script de arriba tal cual.
 5. *Tags*: `Name=pyspark-stack-node` y **`AutoStartStop=true`** (la Lambda de §5.4 filtra por
    este tag; el workflow de CI busca por `Name`).
@@ -551,10 +553,10 @@ echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-pyspark.conf && sysctl --syste
 
 ### 5.4 Automatización: EventBridge + Lambda
 
-**El porqué:** en vez de apagar la EC2 a mano, una **Lambda** la prende/apaga y **EventBridge
-Scheduler** la dispara por cron. Con Lambda (en lugar de que Scheduler llame a EC2 directo)
-podés **personalizar la lógica**: no apagar si hay un DAG corriendo, avisar por SNS/Slack, o
-prender solo si hay trabajo en cola. Convierte los ~$140/mes fijos en ~$34 (u ~$17 con dev-lite).
+En vez de apagar la EC2 a mano, una Lambda la prende/apaga y EventBridge Scheduler la dispara
+por cron. Con Lambda (en lugar de que Scheduler llame a EC2 directo) podés personalizar la
+lógica: no apagar si hay un DAG corriendo, avisar por SNS/Slack, o prender solo si hay trabajo
+en cola. Convierte los ~$140/mes fijos en ~$34 (u ~$17 con dev-lite).
 
 **Código de la Lambda — `infra/prod/lambda/startstop.py`:**
 
@@ -594,14 +596,12 @@ def handler(event, context):
 **Terraform de la automatización — `infra/prod/automation.tf`:**
 
 ```hcl
-# ---- Empaquetar el código de la Lambda en un zip ----
 data "archive_file" "startstop" {
   type        = "zip"
   source_file = "${path.module}/lambda/startstop.py"
   output_path = "${path.module}/lambda/startstop.zip"
 }
 
-# ---- Rol de ejecución de la Lambda ----
 data "aws_iam_policy_document" "lambda_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -616,7 +616,6 @@ resource "aws_iam_role" "lambda" {
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
 }
 
-# Permisos: describir/prender/apagar EC2 + logs a CloudWatch.
 data "aws_iam_policy_document" "lambda" {
   statement {
     actions   = ["ec2:DescribeInstances"]
@@ -625,7 +624,7 @@ data "aws_iam_policy_document" "lambda" {
   statement {
     actions   = ["ec2:StartInstances", "ec2:StopInstances"]
     resources = ["*"]
-    # Endurecido: solo instancias con el tag correcto.
+    # least-privilege: solo instancias con el tag correcto
     condition {
       test     = "StringEquals"
       variable = "aws:ResourceTag/AutoStartStop"
@@ -643,7 +642,6 @@ resource "aws_iam_role_policy" "lambda" {
   policy = data.aws_iam_policy_document.lambda.json
 }
 
-# ---- La función Lambda ----
 resource "aws_lambda_function" "startstop" {
   function_name    = "${var.name_prefix}-startstop"
   filename         = data.archive_file.startstop.output_path
@@ -657,7 +655,7 @@ resource "aws_lambda_function" "startstop" {
   }
 }
 
-# ---- Rol que EventBridge Scheduler usa para invocar la Lambda ----
+# Rol que EventBridge Scheduler asume para invocar la Lambda.
 data "aws_iam_policy_document" "scheduler_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -683,7 +681,6 @@ resource "aws_iam_role_policy" "scheduler" {
   })
 }
 
-# ---- Schedules: prender y apagar por cron ----
 resource "aws_scheduler_schedule" "start" {
   name                         = "${var.name_prefix}-start"
   schedule_expression          = var.start_cron
@@ -712,8 +709,9 @@ resource "aws_scheduler_schedule" "stop" {
 <summary>🖱️ A mano en la consola AWS — Lambda startstop + schedules</summary>
 
 1. **Lambda → Create function**: *Author from scratch*, nombre `pyspark-stack-startstop`,
-   runtime **Python 3.12** → pegá el código de `startstop.py` en el editor (`lambda_function.py`;
-   el handler default `lambda_function.handler` sirve tal cual).
+   runtime **Python 3.12** → pegá el código de `startstop.py` en el editor (`lambda_function.py`)
+   y en *Runtime settings → Edit* cambiá el handler a **`lambda_function.handler`** (el default
+   de la consola es `lambda_function.lambda_handler`, pero el código define `def handler`).
 2. *Configuration → General configuration*: timeout **30 s**. *Environment variables*:
    `TAG_KEY=AutoStartStop`, `TAG_VALUE=true`.
 3. *Configuration → Permissions* → clic en el rol de ejecución → **Add permissions → Create
@@ -727,27 +725,25 @@ resource "aws_scheduler_schedule" "stop" {
 
 </details>
 
-> **EventBridge Scheduler vs Rules:** usamos **Scheduler** (más nuevo) porque soporta cron con
-> timezone nativo y un solo target limpio. Podría llamar a EC2 directo (universal target) sin
-> Lambda, pero metemos la Lambda a propósito para poder **personalizar** (no apagar con jobs
-> activos, notificar, etc.).
+> EventBridge Scheduler vs Rules: usamos Scheduler porque soporta cron con timezone nativo y un
+> solo target limpio. Podría llamar a EC2 directo (universal target) sin Lambda, pero la Lambda
+> permite personalizar: no apagar con jobs activos, notificar, etc.
 
-**Apagar/prender NO degrada el rendimiento** (cuatro garantías de diseño):
+Apagar/prender no degrada el rendimiento — cuatro garantías de diseño:
 
-1. **Familia `m6i` (no `t3`)** — CPU dedicada y constante. Los `t3` son *burstable*: acumulan/gastan
-   "CPU credits" y tras un arranque podés arrancar con pocos créditos → throttling visible. `m6i`
-   entrega el 100% de sus vCPU desde el primer segundo, en cada boot.
-2. **EBS `gp3` (no `gp2`)** — IOPS y throughput **provisionados y constantes** (3000 IOPS / 125 MB/s
-   base). `gp2` usa un "burst balance" que se agota; `gp3` no tiene ese pozo que vaciar, así que el
-   disco rinde igual antes y después de cada ciclo.
+1. **Familia `m6i` (no `t3`)** — CPU dedicada y constante. Los `t3` son *burstable*: gastan
+   "CPU credits" y tras un arranque podés quedar con pocos → throttling visible. `m6i` entrega
+   el 100% de sus vCPU desde el primer segundo, en cada boot.
+2. **EBS `gp3` (no `gp2`)** — IOPS y throughput provisionados y constantes (3000 IOPS / 125 MB/s
+   base). `gp2` usa un "burst balance" que se agota; `gp3` rinde igual antes y después de cada ciclo.
 3. **Los datos persisten** — al *stop* la instancia conserva sus volúmenes EBS (root + `/data`).
-   HDFS, Postgres y las métricas siguen ahí; no se recalcula ni se recarga nada al prender.
-4. **El stack vuelve solo** — Docker arranca en boot y `restart: unless-stopped` (ver hardening) vuelve
-   a levantar los contenedores. No hay pasos manuales.
+   HDFS, Postgres y las métricas siguen ahí; nada se recalcula al prender.
+4. **El stack vuelve solo** — Docker arranca en boot y `restart: unless-stopped` relevanta los
+   contenedores. Esa política la agrega el override de prod (§13.2); con el compose base solo,
+   únicamente los `airflow-*` (con `restart: always`) volverían tras un ciclo stop/start.
 
-> Lo único más lento es la **primera** corrida tras el arranque (~1-2 min): las JVMs de Spark/HDFS
-> hacen *warmup* (JIT, block report del datanode). No es una caída de rendimiento sostenida, es el
-> costo único de encender; para datos de ~50 MB es de segundos.
+> Lo único más lento es la primera corrida tras el arranque (~1-2 min): warmup de las JVMs de
+> Spark/HDFS (JIT, block report). Es el costo único de encender, no una degradación sostenida.
 
 ### 5.5 Desplegar, subir código y túnel SSH
 
@@ -763,7 +759,7 @@ output "tunnel_command" {
 
 Antes del `apply`, definí las dos variables sin default (`my_ip_cidr`, `ssh_public_key`) en un
 `terraform.tfvars` — así el `apply` no las pide interactivamente y queda repetible. El archivo no se
-commitea (`infra/**/*.tfvars` está en el `.gitignore`):
+commitea (`*.tfvars` está en el `.gitignore`, con la excepción `!*.tfvars.example`):
 
 ```hcl
 # infra/prod/terraform.tfvars
@@ -775,10 +771,11 @@ ssh_public_key = "ssh-ed25519 AAAA...tu_clave... pyspark_stack" # cat ~/.ssh/pys
 cd infra/prod
 terraform init && terraform apply    # red + IAM + EC2 + EBS + auto start/stop (lo definido hasta acá)
 
-# Subir el proyecto (excluí infra/ y basura)
+# Subir el proyecto. --exclude '.env': el .env local (dev) no debe pisar el de prod,
+# que lo genera load-secrets.sh en la EC2 desde SSM (§13.1).
 IP=$(terraform output -raw public_ip)
 cd ../..
-rsync -avz --exclude '.git' --exclude 'infra' --exclude '__pycache__' \
+rsync -avz --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
   -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@$IP:/home/ec2-user/pyspark_stack/
 
 # Levantar (completo o dev-lite según la instancia)
@@ -789,16 +786,16 @@ ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
 ssh -i ~/.ssh/pyspark_stack -L 8082:localhost:8082 -L 8888:localhost:8888 ec2-user@$IP
 ```
 
-UIs (con el túnel abierto): Airflow `localhost:8082`, Jupyter `localhost:8888`,
-Spark `localhost:8081`, HDFS `localhost:9870`.
+UIs (con el túnel abierto): Airflow `localhost:8082`, Spark `localhost:8081`,
+HDFS `localhost:9870`. Jupyter `localhost:8888` solo si activaste el perfil `dev`
+(`COMPOSE_PROFILES=dev` o `--profile dev`): un `up` pelado no lo levanta (§13.2).
 
-> **Esto es el núcleo, no el final — la infra se arma incrementalmente.** El `apply` de acá crea solo
-> lo definido hasta la §5. Las secciones **6-7** (data lake S3, orquestación), **11** (CI/CD) y **13**
-> (secretos) **agregan más `.tf` a `infra/prod/`**: cada vez que sumás archivos, volvés a correr
-> `terraform apply` (Terraform calcula el diff y crea lo nuevo). Del mismo modo, el `docker compose up`
-> de arriba es el **arranque base** (útil para validar que el host levanta); la **puesta en producción
-> real** —con monitoreo, hardening y secretos desde SSM— usa el override de prod y se arma en las §12-14:
-> `./scripts/load-secrets.sh && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`.
+> Esto es el núcleo, no el final: la infra se arma incrementalmente. El `apply` de acá crea solo
+> lo definido hasta la §5. Las secciones 6-7 (data lake S3, orquestación), 11 (CI/CD) y 13
+> (secretos) agregan más `.tf` a `infra/prod/`; cada vez que sumás archivos, volvés a correr
+> `terraform apply`. Del mismo modo, el `docker compose up` de arriba es el arranque base; la
+> puesta en producción real —monitoreo, hardening y secretos desde SSM— usa el override de prod
+> (§12-14): `./scripts/load-secrets.sh && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`.
 
 ---
 
@@ -826,9 +823,18 @@ resource "aws_s3_bucket" "datalake" {
 }
 resource "aws_s3_bucket" "artifacts" { bucket = local.artifacts }
 
+# for_each necesita keys conocidas en tiempo de plan: un toset de ids fallaría en el PRIMER
+# apply con "Invalid for_each argument"; un map con keys estáticas y values computados funciona.
+locals {
+  buckets = {
+    datalake  = aws_s3_bucket.datalake.id
+    artifacts = aws_s3_bucket.artifacts.id
+  }
+}
+
 # Privados + cifrados + solo-TLS + versionado, para ambos buckets.
 resource "aws_s3_bucket_public_access_block" "all" {
-  for_each                = toset([aws_s3_bucket.datalake.id, aws_s3_bucket.artifacts.id])
+  for_each                = local.buckets
   bucket                  = each.value
   block_public_acls       = true
   block_public_policy     = true
@@ -836,7 +842,7 @@ resource "aws_s3_bucket_public_access_block" "all" {
   restrict_public_buckets = true
 }
 resource "aws_s3_bucket_server_side_encryption_configuration" "all" {
-  for_each = toset([aws_s3_bucket.datalake.id, aws_s3_bucket.artifacts.id])
+  for_each = local.buckets
   bucket   = each.value
   rule {
     apply_server_side_encryption_by_default {
@@ -845,12 +851,12 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "all" {
   }
 }
 resource "aws_s3_bucket_versioning" "all" {
-  for_each = toset([aws_s3_bucket.datalake.id, aws_s3_bucket.artifacts.id])
+  for_each = local.buckets
   bucket   = each.value
   versioning_configuration { status = "Enabled" }
 }
 resource "aws_s3_bucket_policy" "tls_only" {
-  for_each = toset([aws_s3_bucket.datalake.id, aws_s3_bucket.artifacts.id])
+  for_each = local.buckets
   bucket   = each.value
   policy = jsonencode({
     Version = "2012-10-17"
@@ -862,7 +868,7 @@ resource "aws_s3_bucket_policy" "tls_only" {
   })
 }
 
-# Data lake: transición a clases baratas para bajar costo de almacenamiento.
+# Lifecycle: transición a clases baratas para bajar el costo de almacenamiento.
 resource "aws_s3_bucket_lifecycle_configuration" "datalake" {
   bucket = aws_s3_bucket.datalake.id
   rule {
@@ -1057,10 +1063,10 @@ def handler(event, context):
     return {"dag": dag, "conf": conf, "commandId": resp["Command"]["CommandId"]}
 ```
 
-> **Ojo con el auto start/stop:** si la EC2 está apagada cuando llega el evento/cron, el `SendCommand`
-> no ejecuta (no hay agente SSM online) y el DAG no se dispara. Para ETLs event-driven fuera de horario,
-> encendé la EC2 antes (encadenando la Lambda `startstop`) o programá el cron dentro de la ventana de
-> encendido. `send_command` no falla de forma obvia en ese caso — el `DailyEtlMissing` de §12.4 lo cubre.
+> Interacción con el auto start/stop: si la EC2 está apagada cuando llega el evento/cron, el
+> `SendCommand` no ejecuta (no hay agente SSM online) y el DAG no se dispara — y `send_command`
+> no falla de forma obvia. Programá el cron dentro de la ventana de encendido o encadená antes
+> la Lambda `startstop`; la alerta `DailyEtlMissing` de §12.4 cubre el caso silencioso.
 
 ```hcl
 # infra/prod/orchestration.tf
@@ -1126,7 +1132,9 @@ resource "aws_lambda_function" "trigger_airflow" {
 <summary>🖱️ A mano en la consola AWS — Lambda trigger-airflow</summary>
 
 1. **Lambda → Create function**: nombre `pyspark-stack-trigger-airflow`, runtime **Python 3.12**
-   → pegá `trigger_airflow.py` en el editor. *Configuration → General*: timeout **60 s**.
+   → pegá `trigger_airflow.py` en el editor y cambiá el handler a **`lambda_function.handler`**
+   (*Runtime settings → Edit*; el código define `def handler`, no `lambda_handler`).
+   *Configuration → General*: timeout **60 s**.
 2. *Environment variables*: `INSTANCE_ID=<i-xxxxxxxx>` (tu instancia) y
    `DEFAULT_DAG=customer_etl_dag`.
 3. Al rol de ejecución (*Permissions*) agregale una inline policy JSON con los statements del
@@ -1165,9 +1173,8 @@ resource "aws_iam_role_policy" "sched_etl" {
 }
 resource "aws_scheduler_schedule" "daily_etl" {
   name = "${var.name_prefix}-daily-etl"
-  # 12:00 UTC (09:00 ART), L-V: DENTRO de la ventana de encendido del auto start/stop
-  # (start 11:00 / stop 22:00 UTC, §5.4). Un cron fuera de la ventana (p. ej. 06:00 UTC)
-  # dispararía con la EC2 apagada y el SendCommand se perdería en silencio (ver §7.1).
+  # 12:00 UTC, L-V: dentro de la ventana de encendido (start 11:00 / stop 22:00 UTC, §5.4).
+  # Fuera de la ventana, el SendCommand se perdería en silencio (§7.1).
   schedule_expression          = "cron(0 12 ? * MON-FRI *)"
   schedule_expression_timezone = "UTC"
   flexible_time_window { mode = "OFF" }
@@ -1228,22 +1235,19 @@ resource "aws_s3_bucket_notification" "on_upload" {
 
 </details>
 
-> **Ojo:** el `customer_etl_dag` actual del repo es el flujo local (landing → HDFS) y **no lee
-> `dag_run.conf`** — dispararlo por evento S3 lo corre, pero ignora el archivo que llegó. Para el
+> El `customer_etl_dag` actual del repo es el flujo local (landing → HDFS) y no lee
+> `dag_run.conf`: dispararlo por evento S3 lo corre, pero ignora el archivo que llegó. Para el
 > camino event-driven real, el DAG de producción debe leer `{{ dag_run.conf['bucket'] }}` /
-> `{{ dag_run.conf['key'] }}` y pasarlos al job como `application_args` (patrón del §9.0).
->
-> El DAG recibe `bucket`/`key` en `dag_run.conf` y Spark lee justo ese objeto de `s3a://`. Para
-> pipelines con dependencias complejas entre tasks, el DAG de Airflow ya las modela (no hace falta
-> nada extra) — es la ventaja de mantener Airflow self-managed en vez de disparar jobs sueltos.
+> `{{ dag_run.conf['key'] }}` y pasarlos al job como `application_args` (patrón de §9.0); Spark
+> lee entonces justo ese objeto de `s3a://`.
 
 ---
 
 ## 8. Operación, seguridad y ahorro
 
-**Validación (smoke tests) — de abajo hacia arriba.** Un experto no da por hecho que el `apply`
-"funcionó": valida capa por capa y **para en la primera que falle** (no tiene sentido probar un DAG
-si el agente SSM no está `Online`). El orden es infra → host/red → stack → negocio → monitoreo.
+**Validación (smoke tests) — de abajo hacia arriba.** No des por hecho que el `apply` funcionó:
+validá capa por capa y pará en la primera que falle (no tiene sentido probar un DAG si el agente
+SSM no está `Online`). El orden es infra → host/red → stack → negocio → monitoreo.
 
 ```bash
 # ── 0. PRE-APPLY (local, antes de tocar AWS) ─────────────────────────────
@@ -1276,7 +1280,10 @@ S="ssh -i ~/.ssh/pyspark_stack ec2-user@$IP"
 $S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags list-import-errors'  # vacío = OK
 $S 'cd pyspark_stack && docker compose exec -T hdfs-namenode hdfs dfsadmin -report | grep "Live datanodes"'
 curl -s localhost:8081 | grep -o ALIVE | head -1          # Spark: worker vivo
-aws s3 cp README.md "s3://pyspark-stack-datalake-$ACCT/raw/smoke.txt"  # s3a/rol IAM escribe (sin keys)
+aws s3 cp README.md "s3://pyspark-stack-datalake-$ACCT/raw/smoke.txt"  # corre LOCAL con TUS creds: valida el bucket, NO el rol IAM
+# El rol IAM de verdad se prueba DESDE la EC2 (usa el instance profile, no tus keys):
+$S 'aws s3 cp /etc/hostname "s3://pyspark-stack-datalake-'"$ACCT"'/raw/smoke-iam.txt"'
+# (s3a desde los CONTENEDORES lo valida el DAG del paso 4 — requiere hop limit 2, ver §5.3)
 
 # ── 4. NEGOCIO end-to-end (orquestación) ─────────────────────────────────
 aws lambda invoke --function-name pyspark-stack-trigger-airflow \
@@ -1294,7 +1301,7 @@ curl -sf localhost:9093/-/healthy    && echo "Alertmanager OK"
 curl -sf localhost:3100/ready        && echo "Loki OK"
 ```
 
-> Estos smoke tests son la base de un **check de CI post-deploy**: el workflow de Deploy (§11) puede
+> Estos smoke tests son la base de un check de CI post-deploy: el workflow de Deploy (§11) puede
 > correr los de la capa 1-2 tras cada push para confirmar que la EC2 quedó sana.
 
 **Operación (cheat-sheet):**
@@ -1335,7 +1342,7 @@ cd infra/prod && terraform destroy
 | HDFS namenode/datanode | contenedores en EC2 | — (trabajo); respaldo en snapshots EBS |
 | Spark master/worker + `spark-submit` | contenedores en EC2 | lee/escribe `s3a://` |
 | Airflow (5 svcs) + Postgres | contenedores en EC2 | Postgres en `/data` (EBS) + snapshots |
-| Jupyter | contenedor en EC2 | `./notebooks` (git) + S3 |
+| Jupyter (solo con perfil `dev`; en prod no arranca) | contenedor en EC2 | `./notebooks` (git) + S3 |
 | Disparo de DAGs | Lambda trigger-airflow (SSM) + EventBridge | — |
 | Encendido | EC2 con auto start/stop | — |
 
@@ -1350,14 +1357,13 @@ Dos usos distintos del mismo `.ipynb`:
 | **Explorar / desarrollar** | Interactivo en JupyterLab | `./notebooks` (montado en `/opt/notebooks`) |
 | **Ejecutar programado** (parte de un pipeline) | **papermill** disparado por un DAG | el mismo `./notebooks`, output a `./spark-apps/notebook-output` |
 
-**Regla:** los notebooks se guardan en **`./notebooks`** (versionados en git). Para ejecutarlos
-de forma automática (no a mano en Jupyter), se usa **papermill**, que inyecta parámetros y corre
-el notebook de punta a punta desde un DAG de Airflow.
+Regla: los notebooks se guardan en `./notebooks` (versionados en git). Para ejecutarlos de forma
+automática se usa papermill, que inyecta parámetros y corre el notebook de punta a punta desde un
+DAG de Airflow.
 
 ### 9.0 Patrones de tarea para ETL batch (¿PySpark o Python puro?)
 
-Airflow es **solo el orquestador**: cada task elige su motor. La regla que sigue un ingeniero de datos
-para no sobre-usar Spark:
+Airflow es solo el orquestador: cada task elige su motor. La regla para no sobre-usar Spark:
 
 | Tarea | Motor | Operador | Cuándo |
 |---|---|---|---|
@@ -1399,26 +1405,19 @@ SparkSubmitOperator(
 Es más limpio que envolver `spark-submit` en un `BashOperator` (maneja conexión, args y código de
 salida). El `BashOperator`→`spark-submit` de los DAGs actuales funciona; esto es su evolución.
 
-**Leer archivos, y cómo se unen los tres almacenamientos (dónde guardar y cumplir):**
-- **Fuente y destino durable = S3.** Capas: `raw/` (crudo, como llegó) → `curated/` (limpio, Parquet)
-  → `analytics/` (agregados listos para consumo/BI). Sobrevive al apagado de la EC2. Spark usa
-  `s3a://`, pandas usa `s3://` — ambos con el rol IAM, sin keys.
-- **Disco local (EBS) = scratch AUTOMÁTICO de Spark.** El *shuffle* y el *spill* (cuando el dato no
-  entra en RAM) van a `spark.local.dir` en el disco local, **no a HDFS**. Esto pasa solo, sin que
-  toques nada, y es lo que de verdad usa Spark para trabajar.
-- **HDFS = staging EXPLÍCITO opcional, no data lake.** Solo se usa si vos escribís `hdfs://` a
-  propósito — típicamente para materializar un dataset intermedio que **comparten varios jobs Spark**
-  en un pipeline multi-paso, evitando el ida-y-vuelta a S3. Si tu ETL es leer `s3a://raw` → procesar →
-  escribir `s3a://curated`, **HDFS no se toca nunca**.
+**Cómo se unen los tres almacenamientos:**
+- **Fuente y destino durable = S3.** Capas: `raw/` (crudo) → `curated/` (limpio, Parquet) →
+  `analytics/` (agregados para consumo/BI). Sobrevive al apagado de la EC2. Spark usa `s3a://`,
+  pandas usa `s3://` — ambos con el rol IAM, sin keys.
+- **Disco local (EBS) = scratch automático de Spark.** El *shuffle* y el *spill* van a
+  `spark.local.dir` en el disco local, no a HDFS. Pasa solo, sin configurar nada.
+- **HDFS = staging explícito opcional, no data lake.** Solo se usa si escribís `hdfs://` a
+  propósito — típicamente para materializar un intermedio que comparten varios jobs Spark de un
+  pipeline multi-paso, evitando el ida-y-vuelta a S3. Si tu ETL es un solo job
+  `s3a://raw → s3a://curated`, HDFS no se toca nunca.
 - **Patrón:** leé de `s3a://…/raw/` → Spark procesa (spillea a disco local solo) → escribí a
-  `s3a://…/curated/`. Los DAGs de ejemplo que leen `hdfs://` son para pruebas locales; en producción
-  las rutas apuntan a `s3a://`.
-
-> **Cómo encaja HDFS en este diseño:** HDFS gana su lugar cuando un pipeline tiene **varios jobs Spark
-> encadenados** y el intermedio se reusa: materializarlo en `hdfs://` (local al cluster) evita el
-> ida-y-vuelta a S3 entre pasos. El dato durable siempre termina en S3; HDFS es el *scratch compartido*
-> entre jobs. (Si tu pipeline fuera un solo job `s3a://raw → s3a://curated`, HDFS no haría falta — pero
-> con multi-paso PySpark sí cumple.)
+  `s3a://…/curated/`. Los DAGs de ejemplo que leen `hdfs://` son para pruebas locales; en
+  producción las rutas apuntan a `s3a://`.
 
 **Pipeline unificado — Python puro + PySpark + HDFS + S3, todo junto:**
 
@@ -1472,16 +1471,21 @@ Qué usa cada pieza, y por qué corre en producción:
 | 3 agregar | **PySpark** (cluster) | lee **HDFS** → escribe **S3 `curated/`** | reusa el intermedio sin round-trip a S3 |
 | 4 publicar | **Python puro** (`@task`) | lee **S3 `curated/`** | resumen/notificación liviana |
 
-Así **Airflow** orquesta, **Spark** (tu máquina) hace lo pesado, **HDFS** es el scratch compartido entre
-los jobs pesados, **S3** guarda lo durable, y **Python puro** cubre lo liviano — cada componente que
-levantás tiene un trabajo real en el pipeline.
+Así Airflow orquesta, Spark hace lo pesado, HDFS es el scratch compartido entre los jobs pesados,
+S3 guarda lo durable y Python puro cubre lo liviano — cada componente que levantás tiene un
+trabajo real en el pipeline.
 
 ### 9.1 Habilitar papermill
 
-Agregá el provider a `requirements.txt` (se instala en la imagen de Airflow):
+Agregá el provider a `requirements.txt` (se instala en la imagen de Airflow), junto con las
+dependencias de las tasks Python puro de §9.0 — sin ellas, DAGs como `ventas_diario` fallan en
+la imagen actual:
 
 ```text
 apache-airflow-providers-papermill==3.9.1
+pandas    # tasks Python puro (§9.0)
+s3fs      # pandas ↔ s3:// con el rol IAM
+pyarrow   # parquet para pandas
 ```
 
 Y montá `./notebooks` en el contenedor donde corren las tasks (con LocalExecutor es el
@@ -1533,7 +1537,7 @@ evidencia/auditoría de cada corrida).
 
 ## 10. Flujo local → servidor → los DAGs corren solos
 
-El objetivo: **editás local, hacés `git push`, y los DAGs aparecen y corren en la EC2** sin pasos
+El objetivo: editás local, hacés `git push`, y los DAGs aparecen y corren en la EC2 sin pasos
 manuales.
 
 ```
@@ -1545,21 +1549,23 @@ GitHub Actions (CI valida → Deploy)
    ▼
 SSM SendCommand  →  EC2: aws s3 sync  →  ./dags ./spark-apps ./notebooks
    ▼
-Airflow dag-processor detecta los DAGs nuevos (escaneo ~30s)
+Airflow dag-processor detecta los DAGs nuevos (~30s con el refresh del override)
    │  (no quedan en pausa)  →  corren por su schedule
    ▼
 Spark ejecuta · escribe a s3a://datalake/curated
 ```
 
-**Por qué “corren solos”:** el `dag-processor` de Airflow 3 re-escanea `./dags` periódicamente
-(segundos a pocos minutos según `AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL`; para forzar al
-instante: `docker exec airflow-dag-processor airflow dags reserialize`), así que un archivo nuevo
-aparece sin reiniciar nada. Y con esta variable los DAGs **no quedan en pausa** al aparecer, por
-lo que arrancan según su `schedule`:
+Por qué "corren solos": el `dag-processor` de Airflow 3 re-escanea `./dags` periódicamente según
+`AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL` (para forzar al instante:
+`docker exec airflow-dag-processor airflow dags reserialize`), así que un archivo nuevo aparece
+sin reiniciar nada. Y con la primera variable los DAGs no quedan en pausa al aparecer, por lo que
+arrancan según su `schedule`:
 
 ```yaml
 # docker-compose.prod.yml  (env de los servicios airflow)
 AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+# El default de detección de archivos nuevos es 5 min; con 30s el deploy se ve al toque:
+AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
 ```
 
 > Para forzar una corrida inmediata (además del schedule), el paso de deploy puede terminar con
@@ -1577,13 +1583,15 @@ set -euo pipefail
 IP=$(cd infra/prod && terraform output -raw public_ip)
 KEY=~/.ssh/pyspark_stack
 
+# Orígenes SIN barra final: con "dags/ ..." rsync volcaría el CONTENIDO mezclado en
+# pyspark_stack/ y el --delete borraría el resto del proyecto en la EC2 (compose, .env, monitoring/).
 rsync -avz --delete \
   --exclude '__pycache__' \
   -e "ssh -i $KEY" \
-  dags/ spark-apps/ notebooks/ \
+  dags spark-apps notebooks \
   ec2-user@"$IP":/home/ec2-user/pyspark_stack/
 
-echo "✔ deploy hecho — Airflow detectará los DAGs en ~30s"
+echo "deploy hecho — Airflow detecta los DAGs en ~30s (refresh del override de prod, §10)"
 ```
 
 ---
@@ -1829,9 +1837,9 @@ jobs:
             --query 'StandardOutputContent' --output text
 ```
 
-> Dos detalles del pull: (1) `monitoring/alertmanager/alertmanager.yml` se **excluye** del sync
+> Dos detalles del pull: (1) `monitoring/alertmanager/alertmanager.yml` se excluye del sync
 > porque no está en git (contiene el SMTP password, §12.4) y el `--delete` lo borraría de la EC2,
-> donde se crea a mano. (2) Los DAGs/scripts se recargan solos, pero un cambio en los **compose**
+> donde se crea a mano. (2) Los DAGs/scripts se recargan solos, pero un cambio en los compose
 > o en `monitoring/` recién aplica al siguiente
 > `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` en la EC2.
 
@@ -1843,8 +1851,8 @@ jobs:
 4. `git push` a `main` → el workflow **Deploy** sube el código y la EC2 lo baja; Airflow corre
    los DAGs. Los PRs disparan **CI** (lint + terraform validate).
 
-> **Seguridad:** el rol solo lo puede asumir tu repo (condición `sub = repo:org/repo:*`), no hay
-> claves de larga vida, y el deploy usa **SSM** (no expone SSH en CI). El `terraform apply` queda
+> Seguridad: el rol solo lo puede asumir tu repo (condición `sub = repo:org/repo:*`), no hay
+> claves de larga vida, y el deploy usa SSM (no expone SSH en CI). El `terraform apply` queda
 > fuera de CI (manual/local) para no dar permisos amplios a Actions.
 
 ---
@@ -1866,17 +1874,17 @@ alertas + **logs centralizados**. Cada bloque indica su ruta en la 1ª línea; c
 | Alertas | `Alertmanager` → email | 9093 |
 | Dashboards | `Grafana` | 3000 |
 
-**Auditoría de completitud** (qué está y qué se corrigió):
+Auditoría de completitud (qué está y qué se corrigió):
 
 | Área | Estado | Nota |
 |---|---|---|
-| Host / contenedores | ✅ | node-exporter + cAdvisor |
-| Airflow / Spark | ✅ | StatsD + PrometheusServlet |
-| Logs centralizados | ✅ agregado | **Loki + Promtail** (era el gran faltante) |
-| Alertas → notificación | ✅ | Alertmanager (antes las reglas no notificaban) |
-| HDFS métricas ricas | ⚠️ parcial | `/jmx` devuelve JSON no parseable → scrape quitado; recursos vía cAdvisor; métricas ricas con jmx_exporter (ver "Acceso, verificación y HDFS") |
-| Panel "Spark workers" | ✅ corregido | usa `up{job="spark-master"}` (robusto) en vez de una métrica de nombre incierto |
-| UI del driver (4040) | ⚠️ no se scrapea | es efímera (vive solo mientras corre el job); para el post-mortem está el History Server (§13.6) |
+| Host / contenedores | OK | node-exporter + cAdvisor |
+| Airflow / Spark | OK | StatsD + PrometheusServlet |
+| Logs centralizados | OK (agregado) | Loki + Promtail (era el gran faltante) |
+| Alertas → notificación | OK | Alertmanager (antes las reglas no notificaban) |
+| HDFS métricas ricas | Parcial | `/jmx` expone JSON, formato que Prometheus no ingiere → scrape quitado; recursos vía cAdvisor; métricas ricas con jmx_exporter (§12.8) |
+| Panel "Spark workers" | Corregido | usa `up{job="spark-master"}` (robusto) en vez de una métrica de nombre incierto |
+| UI del driver (4040) | No se scrapea | es efímera (vive mientras corre el job); para el post-mortem está el History Server (§13.6) |
 
 ### 12.2 Estructura de archivos (`monitoring/`)
 
@@ -2058,7 +2066,8 @@ scrape_configs:
   - job_name: spark-worker
     metrics_path: /metrics/prometheus
     static_configs: [{ targets: ["spark-worker:8081"] }]
-  # HDFS NO se scrapea: /jmx devuelve JSON no parseable. Ver la nota de jmx_exporter más abajo.
+  # HDFS NO se scrapea: /jmx expone JSON y Prometheus solo ingiere su formato de texto.
+  # Ver la nota de jmx_exporter más abajo.
 ```
 
 ```yaml
@@ -2097,7 +2106,11 @@ groups:
           summary: "Falló un DAG run ({{ $labels.dag_id }})"
           description: "El pipeline {{ $labels.dag_id }} terminó en error en los últimos 15m."
       - alert: DailyEtlMissing   # dead-man switch: el ETL diario dejó de correr en silencio
-        expr: increase(airflow_dagrun_duration_success_count{dag_id="customer_etl_dag"}[26h]) == 0
+        # or absent(...): si la serie desaparece (p. ej. statsd-exporter reiniciado), increase()
+        # devuelve vacío —no 0— y sin él la alerta nunca dispararía.
+        expr: >-
+          increase(airflow_dagrun_duration_success_count{dag_id="customer_etl_dag"}[26h]) == 0
+          or absent(airflow_dagrun_duration_success_count{dag_id="customer_etl_dag"})
         for: 10m
         labels: { severity: critical }
         annotations:
@@ -2107,17 +2120,17 @@ groups:
 
 > Las métricas `airflow_dagrun_duration_{success,failed}_count` salen del `statsd_mapping.yml` (§12.5);
 > verificá los nombres exactos en `localhost:9090/api/v1/targets` la primera vez. `DailyEtlMissing` es la
-> más valiosa para un ingeniero de datos: avisa cuando el pipeline **deja de correr**, no solo cuando falla.
+> más valiosa: avisa cuando el pipeline deja de correr, no solo cuando falla.
 
-> ⚠️ Alertmanager **no** expande env vars: el password va literal → este archivo **no** debe ir a git.
+> Alertmanager no expande env vars: el password va literal → este archivo **no** debe ir a git.
 
 ```yaml
 # monitoring/alertmanager/alertmanager.yml
 global:
   resolve_timeout: 5m
   smtp_smarthost: "smtp.gmail.com:587"
-  smtp_from: "abantodca@gmail.com"
-  smtp_auth_username: "abantodca@gmail.com"
+  smtp_from: "tu-email@gmail.com"
+  smtp_auth_username: "tu-email@gmail.com"
   smtp_auth_password: "REEMPLAZA_CON_APP_PASSWORD"   # https://myaccount.google.com/apppasswords
   smtp_require_tls: true
 route:
@@ -2133,7 +2146,7 @@ route:
 receivers:
   - name: email
     email_configs:
-      - to: "abantodca@gmail.com"
+      - to: "tu-email@gmail.com"
         send_resolved: true
 inhibit_rules:
   - source_matchers: ['severity="critical"']
@@ -2168,8 +2181,8 @@ applications.sink.prometheusServlet.path=/metrics/applications/prometheus
 *.source.jvm.class=org.apache.spark.metrics.source.JvmSource
 ```
 
-En el override, montá `metrics.properties` en los servicios Spark (acá sí master/worker: son las
-JVMs de los *daemons* que exponen `/metrics/...`):
+En el override, montá `metrics.properties` en los servicios Spark — acá sí master/worker: son
+las JVMs de los daemons que exponen `/metrics/...`:
 
 ```yaml
 # docker-compose.prod.yml
@@ -2309,11 +2322,12 @@ ssh -i ~/.ssh/pyspark_stack -L 3000:localhost:3000 -L 9090:localhost:9090 -L 909
 # Grafana localhost:3000 · Prometheus localhost:9090 · Alertmanager localhost:9093
 ```
 
-Verificar: en `http://localhost:9090/targets` todos deben estar **UP** (node, cadvisor, airflow,
+Verificar: en `http://localhost:9090/targets` todos deben estar UP (node, cadvisor, airflow,
 spark-master, spark-worker). Levantar: `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`.
 
-**HDFS con jmx_exporter (enhancement):** el `/jmx` del namenode es JSON no parseable. Para
-métricas ricas, corré el JMX Exporter como *javaagent* en una imagen HDFS propia:
+**HDFS con jmx_exporter (opcional):** el `/jmx` del namenode expone JSON, y Prometheus solo
+ingiere su formato de texto (no JSON). Para métricas ricas, corré el JMX Exporter como
+*javaagent* en una imagen HDFS propia:
 
 ```bash
 HDFS_NAMENODE_OPTS="-javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=7071:/opt/jmx/hdfs.yml"
@@ -2328,21 +2342,20 @@ HDFS_NAMENODE_OPTS="-javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=7071:/opt/j
 
 ## 13. Hardening de producción
 
-Ajustes que un experto DevOps exige antes de considerar el stack production-ready (surgidos de
-la auditoría). Todo copy-paste.
+Ajustes exigibles antes de considerar el stack production-ready. Todo copy-paste.
 
 ### 13.1 Secretos y parámetros con AWS (Parameter Store + Secrets Manager)
 
-El compose base trae los secretos parametrizados con **defaults débiles de dev**
+El compose base trae los secretos parametrizados con defaults débiles de dev
 (`${POSTGRES_PASSWORD:-airflow}`, JWT `change-me-in-prod`, admin/admin, Jupyter sin token): sin un
 `.env` fuerte, en producción quedarían las credenciales por defecto. En vez de mantener ese `.env`
-a mano en texto plano, los valores se **generan y guardan en AWS SSM Parameter Store**
-(SecureString, cifrado con KMS); la EC2 los lee con su rol IAM y los materializa en un `.env`
-efímero (chmod 600) antes de `docker compose up`. Cero secretos en git.
+a mano en texto plano, los valores se generan y guardan en AWS SSM Parameter Store (SecureString,
+cifrado con KMS); la EC2 los lee con su rol IAM y los materializa en un `.env` efímero (chmod 600)
+antes de `docker compose up`. Cero secretos en git.
 
-> **SSM Parameter Store vs Secrets Manager:** Parameter Store SecureString es **gratis** (tier
-> estándar) y alcanza para esto. Secrets Manager (~$0.40/secreto/mes) suma rotación automática;
-> si la necesitás, cambiá `aws_ssm_parameter` por `aws_secretsmanager_secret`.
+> SSM Parameter Store vs Secrets Manager: Parameter Store SecureString es gratis (tier estándar)
+> y alcanza para esto. Secrets Manager (~$0.40/secreto/mes) suma rotación automática; si la
+> necesitás, cambiá `aws_ssm_parameter` por `aws_secretsmanager_secret`.
 
 **Terraform — `infra/prod/secrets.tf` (genera y guarda los parámetros):**
 
@@ -2356,14 +2369,18 @@ resource "random_password" "jwt" {
   special = false
 }
 resource "random_password" "admin" {
-  length = 20
+  length  = 20
+  # special = false: el compose interpola la password sin comillas en el `bash -c` de
+  # airflow-init; caracteres como ( ) & * romperían el comando en silencio (admin no creado).
+  special = false
 }
 resource "random_password" "jupyter" {
   length  = 32
   special = false
 }
 resource "random_password" "grafana" {
-  length = 20
+  length  = 20
+  special = false # se interpola en env del compose; sin especiales no hay sorpresas de quoting
 }
 
 locals {
@@ -2450,7 +2467,7 @@ JUPYTER_TOKEN=$(get jupyter_token)
 GRAFANA_ADMIN_PASSWORD=$(get grafana_admin_password)
 EOF
 chmod 600 .env
-echo "✔ .env generado desde SSM"
+echo ".env generado desde SSM"
 ```
 
 Uso en la EC2: `./scripts/load-secrets.sh && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`.
@@ -2471,10 +2488,9 @@ x-airflow-common: &airflow-common
     AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:-change-me-in-prod}'
 ```
 
-**Valores delicados / claves con rotación → AWS Secrets Manager.** Para lo más sensible (el
-**JWT secret key** de Airflow, credenciales de bases externas, API keys de terceros) usá
-**Secrets Manager**, que agrega **rotación automática** y auditoría. Parameter Store queda para el
-resto (gratis).
+**Valores delicados / claves con rotación → AWS Secrets Manager.** Para lo más sensible (el JWT
+secret de Airflow, credenciales de bases externas, API keys de terceros) usá Secrets Manager,
+que agrega rotación automática y auditoría. Parameter Store queda para el resto (gratis).
 
 ```hcl
 # infra/prod/secrets.tf — secretos delicados en Secrets Manager
@@ -2524,10 +2540,9 @@ AIRFLOW_JWT_SECRET=$(aws secretsmanager get-secret-value \
 `alertmanager.yml` en el arranque con `envsubst` tomando el valor con
 `aws secretsmanager get-secret-value ...`, así el password nunca vive en un archivo versionado.
 
-> **Airflow Connections/Variables desde SSM:** además de los secretos del stack, Airflow puede
-> leer sus *Connections* y *Variables* directo de Parameter Store con el
+> Airflow también puede leer sus *Connections* y *Variables* directo de Parameter Store con el
 > `SystemsManagerParameterStoreBackend` (provider `apache-airflow-providers-amazon`), sin
-> guardarlas en la metadata DB. Config: `AIRFLOW__SECRETS__BACKEND` +
+> guardarlas en la metadata DB: `AIRFLOW__SECRETS__BACKEND` +
 > `AIRFLOW__SECRETS__BACKEND_KWARGS` apuntando al prefijo `/pyspark-stack/`.
 
 ### 13.2 restart + límites + logging en los servicios del stack
@@ -2536,17 +2551,16 @@ Los servicios core (`hdfs-*`, `spark-*`, `airflow-db`) no traen `restart` ni lí
 Agregalos en el override de prod.
 
 > **Jupyter no arranca en prod por defecto.** En el base está bajo el perfil `dev`
-> (`profiles: ["dev"]`), así que `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`
-> **no** lo levanta salvo que el `.env` traiga `COMPOSE_PROFILES=dev` (el `.env` generado por
-> `load-secrets.sh` no lo incluye). En prod el ETL corre por Airflow y los `.ipynb` por papermill
-> (headless), que no necesitan el server de Jupyter. El bloque `jupyter:` de abajo solo aplica si
-> activás el perfil `dev` a mano (p. ej. para analizar algo puntual en la EC2).
+> (`profiles: ["dev"]`), así que el `up` de prod no lo levanta salvo que el `.env` traiga
+> `COMPOSE_PROFILES=dev` (el generado por `load-secrets.sh` no lo incluye). En prod el ETL corre
+> por Airflow y los `.ipynb` por papermill (headless). El bloque `jupyter:` de abajo solo aplica
+> si activás el perfil `dev` a mano.
 
-**`restart: unless-stopped` es lo que hace que, al prender la EC2 (auto start/stop), el stack
-vuelva solo** sin intervención: Docker arranca en boot (`systemctl enable docker` del `user_data`)
-y reinicia los contenedores que estaban corriendo.
+`restart: unless-stopped` es lo que hace que, al prender la EC2 (auto start/stop), el stack
+vuelva solo: Docker arranca en boot (`systemctl enable docker` del `user_data`) y reinicia los
+contenedores que estaban corriendo.
 
-Los límites están calibrados para **`m6i.xlarge` (16 GB)**: suman con holgura y dejan margen al SO.
+Los límites están calibrados para `m6i.xlarge` (16 GB): suman con holgura y dejan margen al SO.
 
 ```yaml
 # docker-compose.prod.yml
@@ -2559,7 +2573,9 @@ x-hard: &hard
 services:
   hdfs-namenode: { <<: *hard, deploy: { resources: { limits: { memory: 1536m } } } }
   hdfs-datanode: { <<: *hard, deploy: { resources: { limits: { memory: 1536m } } } }
-  spark-master:  { <<: *hard, deploy: { resources: { limits: { memory: 1g } } } }
+  # 1536m y no 1g: el heap default del daemon (SPARK_DAEMON_MEMORY) es 1g; un limit igual
+  # al heap no deja margen off-heap/metaspace → OOM-kill al arrancar.
+  spark-master:  { <<: *hard, deploy: { resources: { limits: { memory: 1536m } } } }
   spark-worker:
     <<: *hard
     # El worker OFRECE 3G/2 cores a los executors (sobra para ~50 MB; evita que agarre toda la RAM).
@@ -2569,10 +2585,9 @@ services:
   airflow-db:    { <<: *hard, deploy: { resources: { limits: { memory: 512m } } } }
 ```
 
-> **¿Por qué el worker no pierde rendimiento con menos memoria?** Para 50 MB, un executor con 3 GB
-> y 2 cores procesa el dato entero en memoria sin *spill* a disco — que es lo que sí frenaría. Los
-> 6 GB anteriores eran margen ocioso, no velocidad. El límite del contenedor (4 GB) deja aire al
-> heap del worker por encima de lo que ofrece.
+> ¿Por qué el worker no pierde rendimiento con menos memoria? Para 50 MB, un executor con 3 GB
+> y 2 cores procesa el dato entero en memoria sin *spill* a disco — que es lo que sí frenaría.
+> El límite del contenedor (4 GB) deja aire al heap del worker por encima de lo que ofrece.
 
 ### 13.3 Spark ↔ S3 con el rol IAM (s3a)
 
@@ -2585,10 +2600,11 @@ spark.hadoop.fs.s3a.aws.credentials.provider  software.amazon.awssdk.auth.creden
 spark.hadoop.fs.s3a.endpoint.region           us-east-1
 ```
 
-**Dónde montarlo — en los DRIVERS, no en master/worker.** `spark-defaults.conf` lo lee el
+**Dónde montarlo — lo esencial es en los drivers.** `spark-defaults.conf` lo lee el
 `spark-submit`/driver, y la config viaja del driver a los executors. En este stack los drivers
-son: el contenedor de **Airflow** que ejecuta las tasks (con LocalExecutor es el `scheduler`) y
-**Jupyter**. Montarlo solo en master/worker no configura ningún job:
+son el contenedor de Airflow que ejecuta las tasks (con LocalExecutor, el `scheduler`) y
+Jupyter. Montarlo solo en master/worker no configura ningún job; el §14.1 también lo monta ahí
+por uniformidad, pero no reemplaza el mount en los drivers:
 
 ```yaml
 # docker-compose.prod.yml (montar donde corre el DRIVER)
@@ -2614,6 +2630,7 @@ El `.gitignore` de la raíz ya cubre todo lo sensible; lo clave que debe mantene
 # .gitignore (raíz) — fragmentos clave
 .env                                       # secretos locales
 *.tfstate / *.tfstate.* / *.tfvars         # estado y variables de Terraform
+!*.tfvars.example                          # la plantilla sí se versiona
 **/lambda/*.zip                            # lambdas empaquetadas
 monitoring/alertmanager/alertmanager.yml   # tiene el smtp password
 spark-events/*                             # event logs de Spark (se conserva spark-defaults.conf)
@@ -2629,8 +2646,9 @@ Spark master/worker solo muestran jobs **en vivo**; al terminar, la UI del drive
 **History Server** reconstruye la UI de cada job desde los *event logs* — clave para depurar un ETL
 que ya corrió. La imagen ya existe (`Dockerfile.history`) y los logs se escriben en `./spark-events`.
 
-Habilitá el *event log* en `spark-conf/spark-defaults.conf` (el mismo que usa s3a) y descomentá
-el servicio:
+Habilitá el *event log* en `spark-conf/spark-defaults.conf` (el mismo que usa s3a) y agregá el
+servicio de abajo al `docker-compose.prod.yml`. No uses el bloque comentado del compose base:
+este bloque del override es su equivalente y toda la config queda en `spark-conf/`.
 
 ```properties
 # spark-conf/spark-defaults.conf  (agregar a lo de s3a)
@@ -2638,9 +2656,9 @@ spark.eventLog.enabled  true
 spark.eventLog.dir      file:/tmp/spark-events
 ```
 
-> **Quién escribe los event logs: el driver.** Por eso `airflow-scheduler` (driver de los
+> Los event logs los escribe el driver. Por eso `airflow-scheduler` (driver de los
 > `spark-submit` de los DAGs) necesita el mount `./spark-events:/tmp/spark-events` además del
-> `spark-defaults.conf` — ambos ya incluidos en el §14.1. Jupyter ya monta `./spark-events`
+> `spark-defaults.conf` — ambos ya incluidos en §14.1. Jupyter ya monta `./spark-events`
 > desde el compose base.
 
 ```yaml
@@ -2678,9 +2696,11 @@ UI por túnel: `ssh -L 18080:localhost:18080 …` → `http://localhost:18080`.
 
 ## 14. Archivos compose completos
 
-Los dos archivos listos para copiar. El de producción ya incorpora todo lo explicado por tema en
-las secciones de monitoreo y hardening: persistencia en `/data`, `restart`, límites, logging, s3a,
-métricas y logs. Las variables `${...}` las provee el `.env` que genera `load-secrets.sh` desde SSM.
+Los dos archivos listos para copiar. El de producción ya incorpora todo lo explicado en las
+secciones de monitoreo y hardening: persistencia en `/data`, `restart`, límites, logging, s3a,
+métricas y logs. Excepción: el History Server (§13.6) es opcional y NO está incluido — si lo
+querés, agregá el bloque `spark-history-server` de §13.6 al final de este archivo. Las variables
+`${...}` las provee el `.env` que genera `load-secrets.sh` desde SSM.
 
 ### 14.1 docker-compose.prod.yml (producción, completo)
 
@@ -2701,6 +2721,7 @@ x-airflow-env: &airflow-env
   AIRFLOW__METRICS__STATSD_PORT: "9125"
   AIRFLOW__METRICS__STATSD_PREFIX: airflow
   AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+  AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30" # detecta archivos DAG nuevos en ~30s (§10)
 
 services:
   # ---- Persistencia en /data (EBS) + restart/límites/logging (calibrado a m6i.xlarge 16 GB) ----
@@ -2724,7 +2745,8 @@ services:
   # ---- Spark: métricas Prometheus + s3a con rol IAM ----
   spark-master:
     <<: *hard
-    deploy: { resources: { limits: { memory: 1g } } }
+    # 1536m: margen sobre el heap default del daemon (1g) — ver §13.2
+    deploy: { resources: { limits: { memory: 1536m } } }
     volumes:
       - ./monitoring/spark/metrics.properties:/opt/spark/conf/metrics.properties:ro
       - ./spark-conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
@@ -2878,6 +2900,9 @@ services:
       - ./spark-apps:/opt/spark-apps
       - ./data:/data
     networks: [devnet]
+    environment:
+      # Heap default del daemon (1g) > limit 768m → OOM-kill al arrancar; 512m sobra para un master dev.
+      - SPARK_DAEMON_MEMORY=512m
     deploy: { resources: { limits: { memory: 768m } } }
 
   spark-worker:
