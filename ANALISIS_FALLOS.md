@@ -125,7 +125,7 @@ Recomendado: **Opción A** (menos frágil; no depende de cómo se regenere el ar
 source /mnt/c/pyspark_stack/spark-apps/customer_etl/config/env.sh "$ENV"
 ```
 
-**Causa:** `/mnt/c/pyspark_stack/...` es una ruta de WSL/Windows. En este host Linux el proyecto está en `/home/carlos/Proyects/pyspark_stack`.
+**Causa:** `/mnt/c/pyspark_stack/...` es una ruta de WSL/Windows. En este host Linux el proyecto está en `/home/carlosad/Proyects/pyspark_stack`.
 
 **Impacto:** solo afecta si el script se ejecuta **fuera** del contenedor. Airflow lo corre **dentro** (rama `[ -f /.dockerenv ]`), que usa la ruta correcta `/opt/spark-apps/...`, así que en el flujo normal no rompe — pero es una bomba de tiempo si alguien lo lanza desde el host.
 
@@ -141,7 +141,7 @@ source "$(dirname "$0")/../config/env.sh" "$ENV"
 
 ### 🟠 MEDIO 4 — `spark-history-server` deshabilitado pero `eventLog` activado  ✅ APLICADO
 
-**Dónde:** `docker-compose.yml:64-78` (servicio comentado) + `spark-events/spark-defaults.conf`.
+**Dónde:** `docker-compose.yml:101-117` (servicio comentado) + `spark-events/spark-defaults.conf`.
 
 **Causa:** `spark-defaults.conf` tiene `spark.eventLog.enabled true` con `dir file:/tmp/spark-events`, pero el History Server está comentado. Además hay dos ficheros `*.inprogress` viejos (`app-2025051*`) que indican corridas que nunca cerraron su log.
 

@@ -31,7 +31,7 @@ Jupyter (PySpark 4)                  →  notebooks
   EC2 self-managed + S3 + Lambda/EventBridge): Terraform, auto start/stop, data lake S3 (s3a),
   disparo de DAGs vía SSM, **CI/CD (GitHub Actions + OIDC)**, notebooks (papermill), **monitoreo
   (Prometheus + Grafana + Alertmanager + Loki)**, **secretos con SSM/Secrets Manager** y hardening.
-  Todo copy-paste.
+  Todo copy-paste, y **cada recurso Terraform con su equivalente manual en la consola AWS** (desplegables 🖱️).
 - **[docs/03 — Arquitectura](docs/03-arquitectura.md)** — diagramas (ASCII + Mermaid) y flujos del
   mismo camino (sin MWAA/EMR/Glue).
 

@@ -183,7 +183,7 @@ proceso Master/Worker es el PID 1 y vive mientras viva el contenedor.
   `PYSPARK_PYTHON=python3.12`. Motivo: los *executors* deben correr el **mismo minor de Python**
   que el *driver* (Airflow/Jupyter, 3.12) o Spark lanza `[PYTHON_VERSION_MISMATCH]`.
 
-> `spark-history-server` (líneas 101-115) está **comentado**. Lee los logs de `./spark-events`
+> `spark-history-server` (líneas 101-117) está **comentado**. Lee los logs de `./spark-events`
 > para inspeccionar jobs terminados. Lo dejamos como opcional en la refactorización.
 
 ---
@@ -319,7 +319,7 @@ Los problemas del compose actual (aceptables en dev, **inaceptables en prod**):
 
 | # | Problema | Riesgo |
 |---|---|---|
-| 1 | Secretos hardcodeados (`airflow`, `supersecretjwtkey`, admin/admin) | Credenciales en el repo |
+| 1 | Secretos con defaults débiles (`${POSTGRES_PASSWORD:-airflow}`, JWT `change-me-in-prod`, admin/admin) | Sin un `.env` con valores fuertes, quedan las credenciales por defecto |
 | 2 | Sin `restart` en HDFS/Spark/Jupyter | Un crash deja el servicio caído |
 | 3 | Sin healthchecks salvo Postgres | `depends_on` no sabe si el servicio *funciona* |
 | 4 | Sin límites de recursos | Un Spark job puede comerse toda la RAM del host |
@@ -327,12 +327,17 @@ Los problemas del compose actual (aceptables en dev, **inaceptables en prod**):
 | 6 | Sin versión pineada del schema de compose | Comportamiento no reproducible |
 | 7 | Jupyter sin token | Cualquiera en la red entra |
 
-### 8.1. Extraer secretos a un `.env`
+### 8.1. Secretos en un `.env` (ya soportado por el compose)
 
-Creá un archivo **`.env`** (y agregalo a `.gitignore`):
+El compose base ya lee los secretos por interpolación (ver 8.3); solo falta darle valores
+fuertes. Copiá la plantilla del repo y reemplazá los defaults:
+
+```bash
+cp .env.example .env   # .env ya está en .gitignore — NO commitear
+```
 
 ```dotenv
-# .env  — NO commitear
+# .env  — valores de producción
 POSTGRES_USER=airflow
 POSTGRES_PASSWORD=cambia-esto-por-algo-fuerte
 POSTGRES_DB=airflow
@@ -340,6 +345,7 @@ AIRFLOW_JWT_SECRET=genera-uno-con-openssl-rand-hex-32
 AIRFLOW_ADMIN_USER=admin
 AIRFLOW_ADMIN_PASSWORD=cambia-esto-tambien
 JUPYTER_TOKEN=pon-un-token-largo
+GRAFANA_ADMIN_PASSWORD=cambia-esto-tambien
 ```
 
 Generá secretos de verdad:
@@ -418,26 +424,27 @@ services:
   airflow-triggerer:   { <<: *default-logging }
 ```
 
-### 8.3. Parametrizar los secretos en el compose base
+### 8.3. Secretos parametrizados en el compose base (ya aplicado)
 
-Reemplazá los literales por interpolaciones `${VAR}`. Ejemplo del bloque Postgres y del env común:
+El compose base ya usa interpolaciones `${VAR:-default}`: sin `.env` corre con defaults de dev;
+con `.env` (o el `.env` generado desde SSM, ver la guía de producción §13.1) toma los valores
+reales. Fragmentos del compose actual:
 
 ```yaml
-# docker-compose.yml  (fragmentos refactorizados)
+# docker-compose.yml  (fragmentos, tal como está)
   airflow-db:
     image: postgres:16
     environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
 ```
 
 ```yaml
 x-airflow-common: &airflow-common
   environment: &airflow-common-env
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
-      postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@airflow-db:5432/${POSTGRES_DB}
-    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow-db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:-change-me-in-prod}'
 ```
 
 Y el `airflow-init` usando las vars:
@@ -449,10 +456,13 @@ Y el `airflow-init` usando las vars:
       bash -c "
         airflow db migrate &&
         airflow fab-db migrate &&
-        airflow users create --username ${AIRFLOW_ADMIN_USER} --firstname Admin \
+        airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin \
           --lastname User --role Admin --email admin@example.com \
-          --password ${AIRFLOW_ADMIN_PASSWORD} || true"
+          --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true"
 ```
+
+> Los defaults (`:-airflow`, `:-change-me-in-prod`, `:-admin`) existen para que el arranque local
+> sea cero-fricción. En producción **siempre** deben quedar pisados por el `.env` (checklist §9).
 
 ### 8.4. Quitar `docker.sock` si no lo usás
 
@@ -467,8 +477,11 @@ expone solo las APIs necesarias en vez del socket crudo.
 
 ### 8.5. Añadir el history-server (opcional, ya casi listo)
 
-Descomentá el bloque de `spark-history-server` (líneas 101-115) y arrancalo; leerá
-`./spark-events` para darte la UI de jobs terminados en `:18080`.
+Descomentá el bloque de `spark-history-server` (líneas 101-117) y arrancalo; leerá
+`./spark-events` para darte la UI de jobs terminados en `:18080`. Recordá también poner
+`spark.eventLog.enabled true` en `spark-events/spark-defaults.conf` (hoy está en `false`
+porque sin History Server los event logs quedaban huérfanos) — el detalle está en la
+guía de producción §13.6.
 
 ---
 

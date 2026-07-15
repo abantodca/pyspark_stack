@@ -20,8 +20,9 @@ monitoring/alertmanager/alertmanager.yml
 .ipynb_checkpoints/
 
 # --- Spark ---
+# Se ignoran los event logs, pero la config de eventLog sí se versiona:
 spark-events/*
-!spark-events/.gitkeep
+!spark-events/spark-defaults.conf
 
 # --- Salidas de notebooks ejecutados ---
 notebooks/**/output/

@@ -27,7 +27,7 @@ EMR ni Glue.
 
    DISPARADORES (serverless) — dos caminos, ambos terminan disparando la EC2:
 
-     cron ETL (06:00 UTC) ───────────────►  Lambda trigger-airflow
+     cron ETL (12:00 UTC, L-V) ──────────►  Lambda trigger-airflow
                                                 │  SSM SendCommand
                                                 ▼  → "airflow dags trigger"
 
@@ -67,7 +67,7 @@ flowchart TD
 
     subgraph AWS["☁️ AWS · us-east-1"]
         subgraph EB["EventBridge Scheduler"]
-            cronETL["cron ETL · 06:00 UTC"]
+            cronETL["cron ETL · 12:00 UTC · L-V"]
             cronSS["start 11:00 / stop 22:00 · L-V"]
         end
         lTrig["λ trigger-airflow"]
@@ -171,7 +171,8 @@ Archivo llega a s3://datalake/raw/  →  S3 ObjectCreated
 
 ### 3.3 ETL programado (cron)
 ```
-EventBridge Scheduler (06:00 UTC)  →  Lambda trigger-airflow  →  SSM  →  Airflow dags trigger
+EventBridge Scheduler (12:00 UTC, L-V — dentro de la ventana de encendido)
+  →  Lambda trigger-airflow  →  SSM  →  Airflow dags trigger
 ```
 
 ### 3.4 Monitoreo (métricas + logs)
