@@ -55,6 +55,7 @@
 14. [Archivos compose completos (copy-paste)](#14-archivos-compose-completos)
     - 14.1 [docker-compose.prod.yml (producción, completo)](#141-docker-composeprodyml-producción-completo)
     - 14.2 [docker-compose.dev.yml (dev-lite 8 GB)](#142-docker-composedevyml-dev-lite-8-gb)
+15. [Puesta en producción — runbook final](#15-puesta-en-producción--runbook-final)
 
 ---
 
@@ -269,6 +270,12 @@ provider "aws" {
 }
 ```
 
+```bash
+# comprobá
+aws s3api head-bucket --bucket pyspark-stack-tfstate-tu-sufijo-2026          # sin error = existe
+aws dynamodb describe-table --table-name pyspark-stack-tf-lock --query 'Table.TableStatus'  # "ACTIVE"
+```
+
 ---
 
 ## 5. Núcleo: EC2 con Docker
@@ -430,7 +437,8 @@ data "aws_ami" "al2023" {
   owners      = ["amazon"]
   filter {
     name   = "name"
-    values = ["al2023-ami-*-x86_64"]
+    # "2023*" excluye las variantes minimal/ecs, que no traen el agente SSM (lo usa toda la §7).
+    values = ["al2023-ami-2023*-x86_64"]
   }
   filter {
     name   = "virtualization-type"
@@ -514,7 +522,13 @@ chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
 usermod -aG docker ec2-user
 
 # Disco de datos (Nitro => /dev/nvme1n1). Solo formatea si está vacío (no borra en recreación).
-DATA_DEV=$(lsblk -dpno NAME | grep -E 'nvme1n1|xvdf' | head -n1 || true)
+# El attach del volumen llega después del primer boot: esperar hasta 2 min a que aparezca.
+DATA_DEV=""
+for i in $(seq 1 60); do
+  DATA_DEV=$(lsblk -dpno NAME | grep -E 'nvme1n1|xvdf' | head -n1 || true)
+  [ -n "$DATA_DEV" ] && break
+  sleep 2
+done
 if [ -n "$DATA_DEV" ]; then
   blkid "$DATA_DEV" || mkfs -t xfs "$DATA_DEV"
   mkdir -p /data && mount "$DATA_DEV" /data
@@ -548,6 +562,8 @@ echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-pyspark.conf && sysctl --syste
    este tag; el workflow de CI busca por `Name`).
 6. **EC2 → Elastic IPs → Allocate Elastic IP address** → *Actions → Associate* con la instancia
    (sin EIP, la IP pública cambia en cada stop/start del ahorro automático).
+7. **EC2 → Volumes**: etiquetá a mano el volumen de datos (200 GiB) con `Name=pyspark-stack-data`
+   — el wizard de Launch instance no lo etiqueta, y sin ese tag el DLM de §6.3 no respalda nada.
 
 </details>
 
@@ -574,9 +590,11 @@ def handler(event, context):
     tag_key  = os.environ.get("TAG_KEY", "AutoStartStop")
     tag_val  = os.environ.get("TAG_VALUE", "true")
 
+    # Solo estados accionables: start sobre "stopping" lanza IncorrectInstanceState.
+    states = ["stopped"] if action == "start" else ["running"]
     resp = ec2.describe_instances(Filters=[
         {"Name": f"tag:{tag_key}", "Values": [tag_val]},
-        {"Name": "instance-state-name", "Values": ["running", "stopped", "stopping"]},
+        {"Name": "instance-state-name", "Values": states},
     ])
     ids = [i["InstanceId"] for r in resp["Reservations"] for i in r["Instances"]]
     if not ids:
@@ -705,6 +723,9 @@ resource "aws_scheduler_schedule" "stop" {
 }
 ```
 
+Los crons quedan activos desde este mismo `apply`: esa misma noche la EC2 se apaga, y con el
+compose base solo los `airflow-*` vuelven solos; el resto vuelve cuando apliques el override de §13.2/§14.
+
 <details>
 <summary>🖱️ A mano en la consola AWS — Lambda startstop + schedules</summary>
 
@@ -745,6 +766,13 @@ Apagar/prender no degrada el rendimiento — cuatro garantías de diseño:
 > Lo único más lento es la primera corrida tras el arranque (~1-2 min): warmup de las JVMs de
 > Spark/HDFS (JIT, block report). Es el costo único de encender, no una degradación sostenida.
 
+```bash
+# comprobá (tras el apply de §5.5)
+aws lambda invoke --function-name pyspark-stack-startstop \
+  --cli-binary-format raw-in-base64-out --payload '{"action":"stop"}' /dev/stdout
+# debe listar tu instancia, no {"msg": "no instances tagged"} (revisá el tag AutoStartStop)
+```
+
 ### 5.5 Desplegar, subir código y túnel SSH
 
 ```hcl
@@ -771,6 +799,9 @@ ssh_public_key = "ssh-ed25519 AAAA...tu_clave... pyspark_stack" # cat ~/.ssh/pys
 cd infra/prod
 terraform init && terraform apply    # red + IAM + EC2 + EBS + auto start/stop (lo definido hasta acá)
 
+# Esperar a que la instancia pase los status checks (el primer boot + user_data tarda unos minutos)
+aws ec2 wait instance-status-ok --instance-ids "$(terraform output -raw instance_id)"
+
 # Subir el proyecto. --exclude '.env': el .env local (dev) no debe pisar el de prod,
 # que lo genera load-secrets.sh en la EC2 desde SSM (§13.1).
 IP=$(terraform output -raw public_ip)
@@ -778,12 +809,17 @@ cd ../..
 rsync -avz --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
   -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@$IP:/home/ec2-user/pyspark_stack/
 
+# Confirmar que el user_data terminó: Docker Compose instalado y /data montado.
+ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
+  'cloud-init status --wait && docker compose version && df -h /data | tail -1'
+
 # Levantar (completo o dev-lite según la instancia)
 ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
-  'cd pyspark_stack && docker compose up -d --build'          # o -f docker-compose.dev.yml
+  'cd pyspark_stack && docker compose up -d --build'   # o -f docker-compose.dev.yml (archivo de §14.2 — crearlo antes)
 
-# Túnel a las UIs (ver output tunnel_command)
-ssh -i ~/.ssh/pyspark_stack -L 8082:localhost:8082 -L 8888:localhost:8888 ec2-user@$IP
+# Túnel a las UIs (es el output tunnel_command)
+ssh -i ~/.ssh/pyspark_stack -L 8082:localhost:8082 -L 8888:localhost:8888 \
+  -L 8081:localhost:8081 -L 9870:localhost:9870 ec2-user@$IP
 ```
 
 UIs (con el túnel abierto): Airflow `localhost:8082`, Spark `localhost:8081`,
@@ -906,6 +942,12 @@ output "artifacts_bucket" { value = aws_s3_bucket.artifacts.id }
 
 </details>
 
+```bash
+# comprobá
+terraform -chdir=infra/prod apply          # crea los recursos nuevos de esta sección
+aws s3 ls | grep pyspark-stack             # datalake + artifacts (2 buckets, además del tfstate)
+```
+
 ### 6.2 IAM: permitir s3a a la EC2 (sin keys)
 
 Se agrega una política al **rol de la EC2** (`aws_iam_role.ec2`, definido antes) para que `s3a://`
@@ -949,6 +991,12 @@ En los jobs PySpark, apuntá las rutas a `s3a://` (el rol resuelve las credencia
 ```python
 df = spark.read.csv(f"s3a://{DATALAKE}/raw/customers.csv", header=True)
 df.write.mode("overwrite").parquet(f"s3a://{DATALAKE}/curated/customers")
+```
+
+```bash
+# comprobá — desde la EC2, para probar el instance profile (no tus keys locales)
+ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
+  'aws s3 cp /etc/hostname s3://pyspark-stack-datalake-<acct>/raw/smoke-iam.txt'
 ```
 
 ### 6.3 Backups: snapshots EBS automáticos (DLM)
@@ -1013,6 +1061,11 @@ resource "aws_dlm_lifecycle_policy" "data" {
 > Restore: creás un volumen desde el snapshot y lo montás en `/data` (o recreás la instancia con
 > `user_data` que ya hace `mount ... /data`). S3 ya está versionado, así que el data lake
 > tiene su propia protección.
+
+```bash
+# comprobá
+aws dlm get-lifecycle-policies --query 'Policies[].State'   # ["ENABLED"]
+```
 
 ---
 
@@ -1143,9 +1196,19 @@ resource "aws_lambda_function" "trigger_airflow" {
    `ssm:GetCommandInvocation`/`ListCommandInvocations` (los logs ya los cubre el basic execution
    role que crea la consola).
 4. Probala con *Test* → evento `{"dag": "customer_etl_dag"}` → en la EC2 debería aparecer un
-   DAG run nuevo (`airflow dags list-runs -d customer_etl_dag`).
+   DAG run nuevo (`airflow dags list-runs customer_etl_dag`).
 
 </details>
+
+```bash
+# comprobá — el agente SSM Online es prerrequisito de toda la §7
+ID=$(terraform -chdir=infra/prod output -raw instance_id)
+aws ssm describe-instance-information --query "InstanceInformationList[?InstanceId=='$ID'].PingStatus"  # ["Online"]
+aws lambda invoke --function-name pyspark-stack-trigger-airflow \
+  --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_dag"}' /dev/stdout
+# en la EC2: dag_id posicional (en Airflow 3 no existe -d)
+docker compose exec -T airflow-scheduler airflow dags list-runs customer_etl_dag
+```
 
 ### 7.2 Disparo por cron (EventBridge Scheduler)
 
@@ -1197,6 +1260,11 @@ resource "aws_scheduler_schedule" "daily_etl" {
 4. El rol de invocación lo crea la consola automáticamente → *Create schedule*.
 
 </details>
+
+```bash
+# comprobá
+aws scheduler list-schedules --query 'Schedules[].Name'   # aparece pyspark-stack-daily-etl
+```
 
 ### 7.3 Disparo por evento (archivo nuevo en S3)
 
@@ -1259,8 +1327,9 @@ terraform -chdir=infra/prod plan                          # LEÉ el diff antes d
 tfsec infra/prod  ||  checkov -d infra/prod
 
 # ── 1. INFRA AWS (después del apply) ─────────────────────────────────────
-cd infra/prod
-ID=$(terraform output -raw instance_id); IP=$(terraform output -raw public_ip)
+# -chdir en vez de cd: el cwd sigue siendo la raíz del repo (las capas siguientes lo asumen)
+ID=$(terraform -chdir=infra/prod output -raw instance_id)
+IP=$(terraform -chdir=infra/prod output -raw public_ip)
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 aws ec2 describe-instances --instance-ids "$ID" \
   --query 'Reservations[].Instances[].{estado:State.Name,imdsv2:MetadataOptions.HttpTokens}'  # running + required
@@ -1279,21 +1348,29 @@ ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP" 'cd pyspark_stack && docker compose p
 S="ssh -i ~/.ssh/pyspark_stack ec2-user@$IP"
 $S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags list-import-errors'  # vacío = OK
 $S 'cd pyspark_stack && docker compose exec -T hdfs-namenode hdfs dfsadmin -report | grep "Live datanodes"'
-curl -s localhost:8081 | grep -o ALIVE | head -1          # Spark: worker vivo
+curl -s localhost:8081 | grep -o ALIVE | head -1          # Spark: el master responde (status ALIVE)
 aws s3 cp README.md "s3://pyspark-stack-datalake-$ACCT/raw/smoke.txt"  # corre LOCAL con TUS creds: valida el bucket, NO el rol IAM
 # El rol IAM de verdad se prueba DESDE la EC2 (usa el instance profile, no tus keys):
 $S 'aws s3 cp /etc/hostname "s3://pyspark-stack-datalake-'"$ACCT"'/raw/smoke-iam.txt"'
-# (s3a desde los CONTENEDORES lo valida el DAG del paso 4 — requiere hop limit 2, ver §5.3)
+# (s3a desde los CONTENEDORES no lo valida ningún paso de esta lista: customer_etl_dag no toca S3;
+#  se prueba recién con el job de §13.3 y el runbook final de §15 — requiere hop limit 2, ver §5.3)
 
 # ── 4. NEGOCIO end-to-end (orquestación) ─────────────────────────────────
+# El compose base no setea DAGS_ARE_PAUSED_AT_CREATION → los DAGs nacen pausados y el trigger quedaría en queued:
+$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags unpause customer_etl_dag'
 aws lambda invoke --function-name pyspark-stack-trigger-airflow \
   --cli-binary-format raw-in-base64-out \
   --payload '{"dag":"customer_etl_dag"}' /dev/stdout          # disparo manual (mismo camino que EventBridge/S3)
-$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags list-runs -d customer_etl_dag'
+$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags list-runs customer_etl_dag'
 # event-driven: un archivo nuevo en raw/ debe disparar el DAG solo
-aws s3 cp datos.csv "s3://pyspark-stack-datalake-$ACCT/raw/" && sleep 20   # y repetí el list-runs
+echo "smoke" > /tmp/datos.csv
+aws s3 cp /tmp/datos.csv "s3://pyspark-stack-datalake-$ACCT/raw/"
+aws logs tail /aws/lambda/pyspark-stack-trigger-airflow --since 5m   # ¿llegó la notificación S3 → Lambda?  luego repetí el list-runs
+# Honestidad: el DAG actual ignora el conf {bucket,key} — esto valida el plumbing S3→Lambda→SSM,
+# no que se procese el archivo subido (el patrón real de DAG parametrizado es §9.0).
 
-# ── 5. MONITOREO (por túnel -L 9090 -L 3000) ─────────────────────────────
+# ── 5. MONITOREO (por túnel -L 9090 -L 3000 -L 9093 -L 3100) ─────────────
+# Esta capa recién pasa cuando exista el monitoreo (§12–§14) — en la primera pasada de la guía, saltala.
 curl -sf localhost:9090/-/healthy && echo "Prometheus OK"
 curl -s  localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"' | sort | uniq -c  # todos "up"
 curl -sf localhost:3000/api/health   && echo "Grafana OK"
@@ -1371,6 +1448,10 @@ Airflow es solo el orquestador: cada task elige su motor. La regla para no sobre
 | Datos medianos/grandes, joins/`groupBy` pesados, muchos archivos, paralelismo | **PySpark** | `SparkSubmitOperator` (o `BashOperator`→`spark-submit`) | Cuando el dato no entra cómodo en una máquina o el *shuffle* es grande. |
 | Análisis/reporte reproducible con evidencia | Notebook | `PapermillOperator` | Ver 9.1-9.3. |
 
+> Aviso: los DAGs de esta sección son **patrones** ilustrativos — no los copies a `dags/` tal cual.
+> Referencian scripts (`ventas/enriquecer.py`), datos y `<acct>` que tenés que crear/reemplazar;
+> si los copiás incompletos, ensucian `airflow dags list-import-errors` (el check de §8).
+
 **Python puro — el caso "no necesito Spark"** (`requirements.txt`: `pandas`, `s3fs`, `pyarrow`):
 
 ```python
@@ -1381,17 +1462,17 @@ from airflow.sdk import DAG, task        # Airflow 3: DAG y TaskFlow @task en ai
 
 with DAG("small_etl", schedule="@daily", start_date=datetime(2026, 1, 1), catchup=False) as dag:
     @task
-    def transform(run_date="{{ ds }}"):
+    def transform(ds=None):   # Airflow inyecta ds del context; un default "{{ ds }}" NO pasa por el templating
         base = "s3://pyspark-stack-datalake-<acct>"
         df = pd.read_csv(f"{base}/raw/ventas.csv")            # s3fs + rol IAM (sin keys)
         out = df[df["monto"] > 0].groupby("pais")["monto"].sum().reset_index()
-        out.to_parquet(f"{base}/curated/ventas_por_pais/{run_date}.parquet")
+        out.to_parquet(f"{base}/curated/ventas_por_pais/{ds}.parquet")
     transform()
 ```
 
-**PySpark — el caso "sí necesito Spark"** (operador idiomático; `requirements.txt`:
-`apache-airflow-providers-apache-spark`, y una conexión Airflow `spark_default` →
-`spark://spark-master:7077`):
+**PySpark — el caso "sí necesito Spark"** (operador idiomático; el provider
+`apache-airflow-providers-apache-spark` ya viene en el `requirements.txt` del repo, y hace falta
+una conexión Airflow `spark_default` → `spark://spark-master:7077`):
 
 ```python
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
@@ -1404,6 +1485,10 @@ SparkSubmitOperator(
 ```
 Es más limpio que envolver `spark-submit` en un `BashOperator` (maneja conexión, args y código de
 salida). El `BashOperator`→`spark-submit` de los DAGs actuales funciona; esto es su evolución.
+
+La conexión `spark_default` no existe sola: la define `AIRFLOW_CONN_SPARK_DEFAULT` en el override
+de prod (§14.1), o se crea a mano:
+`airflow connections add spark_default --conn-type spark --conn-host spark://spark-master --conn-port 7077`.
 
 **Cómo se unen los tres almacenamientos:**
 - **Fuente y destino durable = S3.** Capas: `raw/` (crudo) → `curated/` (limpio, Parquet) →
@@ -1488,6 +1573,10 @@ s3fs      # pandas ↔ s3:// con el rol IAM
 pyarrow   # parquet para pandas
 ```
 
+Subí el `requirements.txt` a la EC2 (con el rsync completo de §5.5 — `deploy.sh` no lo sincroniza)
+y rebuildeá la imagen: `docker compose build && docker compose up -d`. Comprobá que quedó:
+`docker compose exec -T airflow-scheduler airflow providers list | grep -E 'papermill|spark'`.
+
 Y montá `./notebooks` en el contenedor donde corren las tasks (con LocalExecutor es el
 `scheduler`). En `docker-compose.prod.yml`:
 
@@ -1508,6 +1597,9 @@ run_date = "2026-01-01"
 ```
 
 ### 9.3 DAG que ejecuta el notebook — `dags/run_notebook_dag.py`
+
+Prerrequisitos: creá `notebooks/analysis.ipynb` con una celda tagueada `parameters` (§9.2) y
+`mkdir -p spark-apps/notebook-output` (papermill no crea el directorio de salida).
 
 ```python
 from datetime import datetime
@@ -1531,7 +1623,8 @@ with DAG(
 ```
 
 papermill guarda una **copia ejecutada con outputs** en `notebook-output/` (queda como
-evidencia/auditoría de cada corrida).
+evidencia/auditoría de cada corrida). Comprobalo con un run manual del DAG y
+`ls spark-apps/notebook-output/`.
 
 ---
 
@@ -1568,6 +1661,9 @@ AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
 AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
 ```
 
+Ojo: las dos cosas dependen de este override (§14.1). Con el compose base, el refresh default es
+**5 min** y los DAGs nuevos nacen **pausados** (`DAGS_ARE_PAUSED_AT_CREATION` default `True`).
+
 > Para forzar una corrida inmediata (además del schedule), el paso de deploy puede terminar con
 > un `airflow dags trigger <dag>` vía SSM, o usar la Lambda `trigger-airflow` de la sección de
 > orquestación.
@@ -1593,6 +1689,16 @@ rsync -avz --delete \
 
 echo "deploy hecho — Airflow detecta los DAGs en ~30s (refresh del override de prod, §10)"
 ```
+
+```bash
+chmod +x scripts/deploy.sh && ./scripts/deploy.sh   # la primera vez, dale permiso de ejecución
+# Comprobación (o `airflow dags reserialize` para no esperar el refresh):
+ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP" \
+  'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags list | grep <dag>'
+```
+
+Ojo: config nueva (`spark-conf/`, `scripts/`, `monitoring/`, `requirements.txt`) **no** la sube
+este script — usá el rsync completo de §5.5 o el workflow de §11.
 
 ---
 
@@ -1667,6 +1773,8 @@ data "aws_iam_policy_document" "github_deploy" {
     actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
     resources = ["*"]
   }
+  # TfState/TfLock (y el ReadOnlyAccess de abajo) existen solo para correr `terraform plan` en CI;
+  # el workflow de §11.2 no lo corre — si no lo agregás, podés quitar estos permisos (least-privilege).
   statement {
     sid       = "TfState"
     actions   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
@@ -1685,7 +1793,7 @@ resource "aws_iam_role_policy" "github_deploy" {
   policy = data.aws_iam_policy_document.github_deploy.json
 }
 
-# ReadOnly para que `terraform plan` lea el estado real en CI.
+# ReadOnly para que `terraform plan` lea el estado real en CI (mismo aviso: opcional si no hay plan en CI).
 resource "aws_iam_role_policy_attachment" "github_readonly" {
   role       = aws_iam_role.github_actions.name
   policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
@@ -1739,6 +1847,7 @@ jobs:
           python-version: "3.12"
       - run: pip install ruff
       - name: Ruff (estilo/errores)
+        # advisory: no bloquea el pipeline; quitá '|| true' para hacerlo bloqueante
         run: ruff check dags/ spark-apps/ || true
       - name: Compilar DAGs (sintaxis)
         run: python -m compileall -q dags/
@@ -1776,7 +1885,7 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: us-east-1   # ajustala si cambiaste var.aws_region
   INSTANCE_TAG_NAME: pyspark-stack-node
   PROJECT_DIR: /home/ec2-user/pyspark_stack
 
@@ -1809,16 +1918,18 @@ jobs:
           aws s3 sync dags/       s3://$B/deploy/dags/       --delete --exclude '__pycache__/*'
           aws s3 sync spark-apps/ s3://$B/deploy/spark-apps/ --delete
           aws s3 sync notebooks/  s3://$B/deploy/notebooks/  --delete
-          aws s3 sync monitoring/ s3://$B/deploy/monitoring/ --delete
-          aws s3 cp docker-compose.yml      s3://$B/deploy/
-          aws s3 cp docker-compose.prod.yml s3://$B/deploy/
+          aws s3 cp docker-compose.yml s3://$B/deploy/
+          # Paths opcionales (existen recién tras §12–§14): sin el guard, el job fallaría antes de crearlos
+          if [ -d monitoring ]; then aws s3 sync monitoring/ s3://$B/deploy/monitoring/ --delete; fi
+          if [ -f docker-compose.prod.yml ]; then aws s3 cp docker-compose.prod.yml s3://$B/deploy/; fi
 
       - name: Pull en la EC2 (si está encendida) vía SSM
         run: |
           B=${{ steps.res.outputs.bucket }}
           I=${{ steps.res.outputs.instance }}
           if [ "$I" = "None" ] || [ -z "$I" ]; then
-            echo "EC2 apagada: el deploy quedó en S3; se aplicará al próximo arranque."
+            echo "EC2 apagada: el deploy quedó en S3. No se aplica solo: al encenderla, corré"
+            echo "a mano el bloque de comandos de abajo (el mismo pull), o esperá el próximo push."
             exit 0
           fi
           CMD=$(aws ssm send-command --instance-ids "$I" \
@@ -1832,9 +1943,19 @@ jobs:
               \"aws s3 cp s3://$B/deploy/docker-compose.yml docker-compose.yml\",\
               \"aws s3 cp s3://$B/deploy/docker-compose.prod.yml docker-compose.prod.yml\"\
             ]" --query 'Command.CommandId' --output text)
+          # `wait` sale con error tanto si el comando falló como si expiró, así que el `|| true`
+          # es solo para no cortar ahí; la assertion real del job es el Status de la invocación:
           aws ssm wait command-executed --command-id "$CMD" --instance-id "$I" || true
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$I" \
+            --query 'Status' --output text)
           aws ssm get-command-invocation --command-id "$CMD" --instance-id "$I" \
             --query 'StandardOutputContent' --output text
+          if [ "$STATUS" != "Success" ]; then
+            echo "Pull en la EC2 falló (Status=$STATUS). Stderr:"
+            aws ssm get-command-invocation --command-id "$CMD" --instance-id "$I" \
+              --query 'StandardErrorContent' --output text
+            exit 1
+          fi
 ```
 
 > Dos detalles del pull: (1) `monitoring/alertmanager/alertmanager.yml` se excluye del sync
@@ -1845,11 +1966,15 @@ jobs:
 
 ### 11.4 Puesta en marcha (una vez)
 
-1. `terraform apply` con `cicd.tf` → copiá `github_actions_role_arn`.
-2. GitHub → Settings → Secrets → Actions → crear **`AWS_ROLE_ARN`** con ese ARN.
-3. Ajustá `github_repo` en `cicd.tf` a tu `org/repo`.
-4. `git push` a `main` → el workflow **Deploy** sube el código y la EC2 lo baja; Airflow corre
-   los DAGs. Los PRs disparan **CI** (lint + terraform validate).
+1. Ajustá `github_repo` en `cicd.tf` a tu `org/repo` (o pasalo con `-var 'github_repo=...'`).
+2. `terraform -chdir=infra/prod init -upgrade` (incorpora el nuevo provider `tls`) y luego
+   `terraform -chdir=infra/prod apply` → copiá `github_actions_role_arn`.
+3. GitHub → Settings → Secrets → Actions → crear **`AWS_ROLE_ARN`** con ese ARN.
+4. El workflow **Deploy** quedará **verde** recién cuando completes §12–§14 y commitees
+   `monitoring/` y `docker-compose.prod.yml` (el pull en la EC2 copia esos archivos y falla si
+   no están en S3). Hacé el primer `git push` a `main` después de eso — o probá el OIDC en frío
+   con un workflow `workflow_dispatch` que solo corra `aws sts get-caller-identity`. Los PRs
+   disparan **CI** (lint + terraform validate).
 
 > Seguridad: el rol solo lo puede asumir tu repo (condición `sub = repo:org/repo:*`), no hay
 > claves de larga vida, y el deploy usa SSM (no expone SSH en CI). El `terraform apply` queda
@@ -1904,6 +2029,9 @@ monitoring/
 ### 12.3 Servicios de monitoreo (compose)
 
 Se agregan al `docker-compose.prod.yml`. Incluyen `restart`, límites de memoria y rotación de logs.
+
+> Los fragmentos de compose de §12–§13 se explican **por tema**; el archivo real a copiar es el
+> `docker-compose.prod.yml` completo de §14.1 — no los escribas a mano ni los concatenes.
 
 ```yaml
 # docker-compose.prod.yml  (bloque MONITOREO)
@@ -2318,12 +2446,16 @@ scrape_configs:
 Acceso por **túnel SSH** (nada expuesto):
 
 ```bash
-ssh -i ~/.ssh/pyspark_stack -L 3000:localhost:3000 -L 9090:localhost:9090 -L 9093:localhost:9093 ec2-user@$IP
-# Grafana localhost:3000 · Prometheus localhost:9090 · Alertmanager localhost:9093
+ssh -i ~/.ssh/pyspark_stack -L 3000:localhost:3000 -L 9090:localhost:9090 -L 9093:localhost:9093 -L 3100:localhost:3100 ec2-user@$IP
+# Grafana localhost:3000 · Prometheus localhost:9090 · Alertmanager localhost:9093 · Loki localhost:3100
 ```
 
 Verificar: en `http://localhost:9090/targets` todos deben estar UP (node, cadvisor, airflow,
-spark-master, spark-worker). Levantar: `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`.
+spark-master, spark-worker). Levantar (tras generar el `.env` con `load-secrets.sh`, §13.1 —
+sin él Grafana usa `${GRAFANA_ADMIN_PASSWORD:?}` y aborta):
+`docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`.
+Verificá también Grafana → dashboard "pyspark-stack — Overview" con datos y los datasources
+Prometheus + Loki en verde.
 
 **HDFS con jmx_exporter (opcional):** el `/jmx` del namenode expone JSON, y Prometheus solo
 ingiere su formato de texto (no JSON). Para métricas ricas, corré el JMX Exporter como
@@ -2445,13 +2577,23 @@ resource "aws_iam_role_policy" "ec2_secrets" {
 }
 ```
 
+Aplicá y comprobá que los parámetros existen antes de seguir:
+
+```bash
+terraform -chdir=infra/prod apply
+# Debe imprimir los primeros 8 caracteres del password (algo, no un error):
+aws ssm get-parameter --name /pyspark-stack/postgres_password --with-decryption \
+  --query Parameter.Value --output text | head -c 8
+```
+
 **Script que materializa el `.env` desde SSM — `scripts/load-secrets.sh` (corre en la EC2):**
+Creá antes la carpeta: `mkdir -p scripts`.
 
 ```bash
 #!/usr/bin/env bash
 # Genera un .env efímero desde SSM antes de levantar el stack.
 set -euo pipefail
-PREFIX="/pyspark-stack"
+PREFIX="/pyspark-stack"   # si cambiaste var.name_prefix, ajustá este prefijo (el script no lee variables de Terraform)
 REGION="${AWS_REGION:-us-east-1}"
 get() { aws ssm get-parameter --name "$PREFIX/$1" --with-decryption \
           --query Parameter.Value --output text --region "$REGION"; }
@@ -2469,6 +2611,8 @@ EOF
 chmod 600 .env
 echo ".env generado desde SSM"
 ```
+
+Tras crearlo: `chmod +x scripts/load-secrets.sh`.
 
 Uso en la EC2: `./scripts/load-secrets.sh && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`.
 
@@ -2528,6 +2672,9 @@ Leerlo en `load-secrets.sh` (en vez de SSM para ese valor):
 AIRFLOW_JWT_SECRET=$(aws secretsmanager get-secret-value \
   --secret-id pyspark-stack/airflow_jwt_secret --query SecretString --output text --region "$REGION")
 ```
+
+Si migrás el JWT a Secrets Manager, quitá `airflow_jwt_secret` del `for_each` de SSM y cambiá
+`load-secrets.sh` — si no, el script seguirá leyendo el valor (potencialmente viejo) de SSM.
 
 **Cuándo usar cada uno:**
 
@@ -2682,7 +2829,7 @@ UI por túnel: `ssh -L 18080:localhost:18080 …` → `http://localhost:18080`.
 
 ### 13.7 Checklist final (production-ready)
 
-- [ ] `.env` con secretos generados (`openssl rand`), fuera de git.
+- [ ] `.env` generado desde SSM con `load-secrets.sh` (`openssl rand` solo en el camino manual por consola), fuera de git.
 - [ ] Jupyter con `JUPYTER_TOKEN`; Grafana sin password default.
 - [ ] `restart: unless-stopped` + límites de memoria en todos los servicios.
 - [ ] Rotación de logs (`max-size`) en todos.
@@ -2720,6 +2867,7 @@ x-airflow-env: &airflow-env
   AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
   AIRFLOW__METRICS__STATSD_PORT: "9125"
   AIRFLOW__METRICS__STATSD_PREFIX: airflow
+  AIRFLOW_CONN_SPARK_DEFAULT: "spark://spark-master:7077" # conexión de los SparkSubmitOperator (§9); sin ella fallan con conn_id not found
   AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
   AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30" # detecta archivos DAG nuevos en ~30s (§10)
 
@@ -2942,3 +3090,58 @@ networks:
 # Presupuesto RAM (~8 GB): master 0.75 + worker 4.0 + jupyter 2.5 = ~7.25 GB (deja ~0.75 GB al host).
 # Si vas justo: worker "--memory 2G" y limit 3g.
 ```
+
+---
+
+## 15. Puesta en producción — runbook final
+
+La secuencia completa que engrana todo lo anterior, de cero a producción. Los pasos 1, 2 y 10
+corren en tu máquina; los 3 a 8 dentro de la EC2 (`ssh ... && cd pyspark_stack`). Si un paso
+falla, resolvelo antes de seguir.
+
+```bash
+# 1. Aplicar la infra completa (a esta altura: secrets.tf incluido) y verificar el parámetro SSM:
+terraform -chdir=infra/prod apply
+aws ssm get-parameter --name /pyspark-stack/postgres_password --with-decryption \
+  --query Parameter.Value --output text | head -c 8    # imprime 8 caracteres, no un error
+
+# 2. Subir TODO a la EC2 (rsync completo de §5.5 — incluye scripts/, spark-conf/, monitoring/
+#    y los compose; deploy.sh NO los sube):
+IP=$(terraform -chdir=infra/prod output -raw public_ip)
+rsync -avz --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
+  -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@$IP:/home/ec2-user/pyspark_stack/
+
+# 3. En la EC2: crear monitoring/alertmanager/alertmanager.yml (§12.4) con el app password
+#    real de Gmail — no está en git (.gitignore, §13.5).
+
+# 4. Generar el .env desde SSM y verificarlo:
+./scripts/load-secrets.sh
+wc -l .env    # 8 variables
+ls -l .env    # -rw------- (chmod 600); ningún valor default de dev adentro
+
+# 5. Validar el merge de los compose ANTES de levantar:
+docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet   # sin salida = OK
+
+# 6. Levantar el stack completo:
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+
+# 7. Re-correr los smoke tests de §8, capas 2-5 completas (ahora la capa 5 pasa: monitoreo arriba).
+
+# 8. Probar una alerta real:
+docker stop spark-worker     # a los ~3 min llega el email TargetDown
+docker start spark-worker    # y después el "resolved"
+
+# 9. Confirmar el pipeline en modo producción: el cron daily-etl (§7.2) dispara solo dentro de la
+#    ventana de encendido. En Prometheus (localhost:9090, por túnel):
+#    airflow_dagrun_duration_success_count > 0   → arma el dead-man switch DailyEtlMissing (§12.4).
+
+# 10. La prueba final — el ciclo de ahorro completo:
+aws ec2 stop-instances --instance-ids $(terraform -chdir=infra/prod output -raw instance_id)
+aws lambda invoke --function-name pyspark-stack-startstop \
+  --cli-binary-format raw-in-base64-out --payload '{"action":"start"}' /dev/stdout
+# Y confirmar que TODO vuelve solo: docker compose ps (todos Up), targets de Prometheus UP,
+# y el siguiente DAG corre por su schedule.
+```
+
+Con esto el producto está en producción: infra reproducible, secretos gestionados, deploy por
+push, monitoreo con alertas y costo optimizado.
