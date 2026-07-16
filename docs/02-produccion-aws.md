@@ -2279,8 +2279,8 @@ except ImportError:
 
 
 if EmrServerlessStartJobOperator is not None:
-    DATALAKE = Variable.get("datalake", default="pyspark-stack-datalake-REPLACE")
-    ARTIFACTS = Variable.get("artifacts", default="pyspark-stack-artifacts-REPLACE")
+    DATALAKE = Variable.get("datalake", default="pyspark-stack-datalake-<acct>")
+    ARTIFACTS = Variable.get("artifacts", default="pyspark-stack-artifacts-<acct>")
 
     default_args = {"owner": "data-eng", "retries": 1, "retry_delay": timedelta(minutes=2)}
 
@@ -2343,8 +2343,8 @@ except ImportError:
 
 
 if EmrServerlessStartJobOperator is not None:
-    ARTIFACTS = Variable.get("artifacts", default="pyspark-stack-artifacts-REPLACE")
-    DATALAKE = Variable.get("datalake", default="pyspark-stack-datalake-REPLACE")
+    ARTIFACTS = Variable.get("artifacts", default="pyspark-stack-artifacts-<acct>")
+    DATALAKE = Variable.get("datalake", default="pyspark-stack-datalake-<acct>")
 
     default_args = {"owner": "data-eng", "retries": 1, "retry_delay": timedelta(minutes=2)}
 
