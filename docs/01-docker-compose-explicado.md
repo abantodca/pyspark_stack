@@ -31,6 +31,12 @@ Regla base: dentro de una red de Compose, el nombre del servicio es el hostname 
 `spark://spark-master:7077` o `hdfs://hdfs-namenode:9000` resuelven solos. No uses `localhost`
 entre contenedores: dentro de un contenedor, `localhost` es ese mismo contenedor.
 
+> Dev vs prod: este compose es el entorno de DESARROLLO local, todo self-contained (HDFS +
+> Spark + Jupyter + Airflow en Docker). En PRODUCCIÓN la arquitectura es híbrida: Airflow sigue
+> como orquestador en una EC2 chica (`t3.large`), pero el cómputo Spark se delega a EMR
+> Serverless y el storage es S3 (`s3a://`), sin HDFS. Se desarrolla acá y se despliega allá; el
+> stack local no cambia. El detalle está en `02-produccion-aws.md` y `03-arquitectura.md`.
+
 ```
                          red: hadoopnet
   ┌───────────────┐   ┌──────────────┐   ┌──────────────────────────┐
@@ -144,6 +150,9 @@ El porqué:
 - Volúmenes nombrados (`hdfs-nn-data`, `hdfs-dn-data`): los datos sobreviven a
   `docker compose down`; solo `down -v` los borra.
 
+> En producción HDFS se reemplaza por S3 (`s3a://`); acá es el storage de trabajo para
+> desarrollar y aprender.
+
 ---
 
 ## 4. Motor de cómputo: Spark standalone
@@ -183,6 +192,9 @@ es el PID 1 y vive mientras viva el contenedor.
 
 > `spark-history-server` está comentado en el compose. Lee los logs de `./spark-events` para
 > inspeccionar jobs terminados; queda como opcional (§8.5).
+
+> En producción Spark corre en EMR Serverless (pago por uso, escala a cero); este Spark
+> standalone es para dev local.
 
 ---
 
@@ -372,15 +384,23 @@ Generá secretos de verdad:
 openssl rand -hex 32   # para AIRFLOW_JWT_SECRET
 ```
 
-### 8.2. `docker-compose.override.yml` para producción
+### 8.2. `docker-compose.override.yml` para endurecer el stack
 
 En vez de tocar el compose base, usá un override que Compose fusiona automáticamente: el dev
-queda intacto y se añade el endurecimiento de prod. Guardalo como `docker-compose.prod.yml` y
-levantá con:
+queda intacto y se añade el endurecimiento (restart, logging, healthchecks, límites). Guardalo
+como `docker-compose.prod.yml` y levantá con:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
+
+> Ojo con "prod": el snippet de abajo es un endurecimiento genérico del stack local completo
+> (útil si querés correrlo hardened en una sola caja). La producción real (AWS) es híbrida y NO
+> coincide con esto: el override de PROD de `02-produccion-aws.md` **no levanta**
+> `hdfs-namenode`/`hdfs-datanode` ni `spark-master`/`spark-worker` — esos servicios son solo
+> dev/local. En la caja de producción (EC2 `t3.large`) solo corren Airflow + Postgres +
+> monitoreo; el cómputo Spark se delega a EMR Serverless y el storage es S3. Tomá las secciones
+> `hdfs-*`/`spark-*` de este snippet como referencia para el stack local, no para la nube.
 
 ```yaml
 # docker-compose.prod.yml — capa de endurecimiento para producción
