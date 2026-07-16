@@ -1335,7 +1335,7 @@ aws emr-serverless start-job-run \
   --job-driver '{
     "sparkSubmit": {
       "entryPoint": "s3://pyspark-stack-artifacts-<acct>/emr/customer_etl.py",
-      "entryPointArguments": ["s3://pyspark-stack-datalake-<acct>"],
+      "entryPointArguments": ["pyspark-stack-datalake-<acct>", "2026-07-16"],
       "sparkSubmitParameters": "--conf spark.executor.cores=2 --conf spark.executor.memory=4g --conf spark.executor.instances=2"
     }
   }' \
@@ -1385,8 +1385,8 @@ aws emr-serverless list-applications --query 'applications[?name==`pyspark-stack
 aws s3 sync spark-apps/emr/ "s3://pyspark-stack-artifacts-$(aws sts get-caller-identity --query Account --output text)/emr/"
 ```
 
-**E) Los entrypoints PySpark (copy-paste).** Estos son los dos archivos reales que menciona el punto
-D). Son *self-contained*: no usan `.master()` (EMR Serverless inyecta master/recursos), leen y
+**E) Los entrypoints PySpark (copy-paste).** Estos son los dos entrypoints que menciona el punto
+D), para crear en `spark-apps/emr/`. Son *self-contained*: no usan `.master()` (EMR Serverless inyecta master/recursos), leen y
 escriben directo en S3 (`s3a://`), y la config de Spark viaja por-job en `sparkSubmitParameters`. Se
 suben a `s3://<artifacts>/emr/` con el `aws s3 sync` de arriba (o el CI/CD de §11.3), y desde ahí los
 lanza el `EmrServerlessStartJobOperator` de los DAGs (§10.2).
@@ -2216,7 +2216,7 @@ este script — usá el rsync completo de §5.5 o el workflow de §11.
 
 ### 10.2 Del laptop a producción — el loop completo (dev → deploy → corre solo → se apaga)
 
-El ciclo de punta a punta, con los archivos reales del repo:
+El ciclo de punta a punta, con los archivos que vas creando con esta guía (copy-paste):
 
 1. **Dev — probás el DAG local.** Los DAGs actuales (`dags/customer_etl_dag.py`,
    `dags/spark_trigger_dag.py`) corren contra el **Spark + HDFS local** del `docker-compose.yml`.
@@ -2475,7 +2475,7 @@ solo levantás el techo de concurrencia (mirá también las cuotas de EMR Server
 | 10 jobs **simultáneos** con `deferrable` + triggerer | `t3.large` — bien |
 | 10 simultáneos **sin** `deferrable` (polling clásico) | `t3.xlarge` (4/16) — por RAM |
 
-Escalar la EC2 es cambiar `instance_type` (§5.1), sin tocar el diseño; la alerta `HostMemory`/
+Escalar la EC2 es cambiar `instance_type` (§5.1), sin tocar el diseño; la alerta `HostLowMemory`/
 `HostDiskAlmostFull` (§12.4) te avisa si la caja se queda corta antes de que duela. En resumen: para
 tu carga, **la `t3.large` está bien** — el ajuste fino es usar `deferrable` y, si querés concurrencia
 real, subir el `maximum_capacity` de EMR, no agrandar la EC2.
@@ -2484,9 +2484,9 @@ real, subir el `maximum_capacity` de EMR, no agrandar la EC2.
 
 ## 11. CI/CD con GitHub Actions (OIDC, sin claves)
 
-Dos workflows **reales**, ya versionados en el repo: `.github/workflows/ci.yml` (valida en cada
-PR/push) y `.github/workflows/deploy.yml` (despliega al mergear a `main`). No son copy-paste
-ilustrativo: es la pipeline **DataOps** que corre de verdad. GitHub Actions asume un rol IAM vía
+Dos workflows **completos**, para crear en `.github/workflows/` y versionar en el repo: `ci.yml`
+(valida en cada PR/push) y `deploy.yml` (despliega al mergear a `main`). No son pseudocódigo: son la
+pipeline **DataOps** real (verificada con `ruff` + `pytest`), lista para copiar y activar. GitHub Actions asume un rol IAM vía
 **OIDC** — sin access keys guardadas en el repo.
 
 - **CI** (`ci.yml`): `ruff` (lint + format), **validación de DAGs** con

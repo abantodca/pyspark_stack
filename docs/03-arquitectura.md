@@ -117,7 +117,7 @@ flowchart TD
     lTrig -->|"SSM SendCommand"| af
     lSS -->|"start/stop · tag=true"| EC2
     af -->|"StartJobRun / EmrServerlessStartJobOperator"| emrs
-    emrs -->|"s3:// · rol de ejecución least-privilege"| dl
+    emrs -->|"s3a:// · rol de ejecución least-privilege"| dl
     exp --> prom
     prom --> am
     am --> mail
@@ -171,8 +171,8 @@ bootstrap (S3+DynamoDB) → terraform apply (S3, EC2, IAM, Lambda, EventBridge, 
 Archivo llega a s3://datalake/raw/  →  S3 ObjectCreated
   → Lambda trigger-airflow  →  SSM SendCommand  →  EC2:
       docker exec airflow-scheduler airflow dags trigger <dag> --conf '{bucket,key}'
-  → DAG: EmrServerlessStartJobOperator → EMR Serverless lee s3://…/raw → transforma
-      → escribe s3://…/curated  (EmrServerlessJobSensor espera el fin del job)
+  → DAG: EmrServerlessStartJobOperator → EMR Serverless lee s3a://…/raw → transforma
+      → escribe s3a://…/curated  (EmrServerlessJobSensor espera el fin del job)
 ```
 > Los DAGs lanzan Spark con `EmrServerlessStartJobOperator`
 > (`airflow.providers.amazon.aws.operators.emr`) + `EmrServerlessJobSensor`, no con
