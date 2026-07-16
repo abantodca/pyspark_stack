@@ -44,6 +44,7 @@
     - 10.1 [Modo rápido (dev): deploy manual sin CI](#101-modo-rápido-dev-deploy-manual-sin-esperar-ci)
     - 10.2 [Del laptop a producción — el loop completo](#102-del-laptop-a-producción--el-loop-completo-dev--deploy--corre-solo--se-apaga)
     - 10.3 [Apagado job-aware: se apaga cuando terminan los jobs](#103-apagado-job-aware-se-apaga-cuando-terminan-los-jobs-no-a-hora-fija)
+    - 10.4 [Concurrencia y sizing — muchos jobs a la vez](#104-concurrencia-y-sizing--muchos-jobs-a-la-vez)
 11. [CI/CD con GitHub Actions (OIDC, sin claves)](#11-cicd-con-github-actions-oidc-sin-claves)
     - 11.1 [Terraform: OIDC provider + rol](#111-terraform-oidc-provider--rol--infraprodcicdtf)
     - 11.2 [Workflow de CI](#112-workflow-de-ci--githubworkflowsciyml)
@@ -2296,6 +2297,10 @@ if EmrServerlessStartJobOperator is not None:
             task_id="customer_etl",
             application_id="{{ var.value.emr_app_id }}",
             execution_role_arn="{{ var.value.emr_job_role_arn }}",
+            # deferrable: mientras EMR procesa, la task NO ocupa un worker slot — el
+            # airflow-triggerer (ya en el stack) maneja la espera. Es la clave para correr
+            # muchos jobs concurrentes en una EC2 chica sin quedarte sin RAM (ver §10.4).
+            deferrable=True,
             job_driver={
                 "sparkSubmit": {
                     "entryPoint": f"s3://{ARTIFACTS}/emr/customer_etl.py",
@@ -2360,6 +2365,7 @@ if EmrServerlessStartJobOperator is not None:
             task_id="wordcount",
             application_id="{{ var.value.emr_app_id }}",
             execution_role_arn="{{ var.value.emr_job_role_arn }}",
+            deferrable=True,  # espera en el triggerer, sin ocupar worker slot (§10.4)
             job_driver={
                 "sparkSubmit": {
                     "entryPoint": f"s3://{ARTIFACTS}/emr/wordcount.py",
@@ -2430,6 +2436,49 @@ antes de apagar).
 
 > Resultado: apagado **por evento** (fin de los jobs), no por reloj — con la red de seguridad del
 > cron por si algo cuelga. Es exactamente el "se apaga solo al terminar" del loop de §10.2.
+
+### 10.4 Concurrencia y sizing — muchos jobs a la vez
+
+Regla mental clave: **la EC2 no procesa datos, solo orquesta.** El cómputo (los filtros, joins y
+`groupBy` sobre millones de filas) corre en **EMR Serverless**; la `t3.large` solo dispara los jobs
+y espera su resultado. Por eso el **volumen de datos no dimensiona la EC2** — dimensiona a EMR.
+
+Ejemplo concreto: **~10 jobs moviendo 3 millones de filas × 20 columnas cada uno**. Esos 3M×20 son
+~0.5–2 GB por job (según el ancho de las columnas; en Parquet, menos): **dato chico** para Spark. En
+EMR Serverless entra holgado, incluso con joins/`groupBy`. La `t3.large` ni se entera. Hay **dos
+perillas** distintas, una por cada capa:
+
+**1) Concurrencia en la EC2 (orquestación) → `deferrable=True` + `airflow-triggerer`.** Cada task de
+EMR **dispara el job y espera** que termine; esa espera es I/O (polling), no CPU. Con
+`deferrable=True` (ya puesto en los DAGs de §10.2), mientras EMR procesa la task **no ocupa un worker
+slot**: la maneja el `airflow-triggerer` (ya en el stack, §14.1). Un solo triggerer sostiene
+**decenas o cientos** de esperas con RAM/CPU mínima. Sin deferrable, cada job en vuelo se lleva un
+subproceso (~200–400 MB) y 10 concurrentes ajustan los 8 GB de la `t3.large`.
+
+**2) Paralelismo real en EMR → `maximum_capacity` (§6.4).** Cuántos jobs corren **a la vez de
+verdad** lo fija el tope de la aplicación EMR Serverless:
+
+```hcl
+maximum_capacity { cpu = "16 vCPU", memory = "64 GB" }   # ~2–4 jobs pesados en paralelo; el resto ENCOLA
+```
+
+Con 16 vCPU, ~2–4 jobs "pesados" corren simultáneos y los demás **encolan** (arrancan al liberarse
+capacidad). Como cada job de 3M filas es corto, aunque los 10 se serialicen terminan rápido. Si
+querés los **10 en paralelo real**, subí el tope (p. ej. `32`–`64 vCPU`): pagás igual **por uso**,
+solo levantás el techo de concurrencia (mirá también las cuotas de EMR Serverless de tu cuenta).
+
+**Cuándo la `t3.large` alcanza y cuándo saltar de tamaño:**
+
+| Escenario | EC2 recomendada |
+|---|---|
+| 10 jobs escalonados o pocos simultáneos, con `deferrable` | `t3.large` (2/8) — sobra |
+| 10 jobs **simultáneos** con `deferrable` + triggerer | `t3.large` — bien |
+| 10 simultáneos **sin** `deferrable` (polling clásico) | `t3.xlarge` (4/16) — por RAM |
+
+Escalar la EC2 es cambiar `instance_type` (§5.1), sin tocar el diseño; la alerta `HostMemory`/
+`HostDiskAlmostFull` (§12.4) te avisa si la caja se queda corta antes de que duela. En resumen: para
+tu carga, **la `t3.large` está bien** — el ajuste fino es usar `deferrable` y, si querés concurrencia
+real, subir el `maximum_capacity` de EMR, no agrandar la EC2.
 
 ---
 
