@@ -268,6 +268,7 @@ Desglose (producción con auto start/stop, 8 h × 22 días laborales):
 | S3 data lake + requests | ~$1.5 | ~$1.5 |
 | IPv4 pública (EIP; AWS la cobra desde feb-2024, asociada o no) | ~$3.6 | ~$3.6 |
 | Lambda + EventBridge + SSM | ~$0 (free tier) | ~$0 (free tier) |
+| Athena (consumo SQL/BI, opcional) | ~$0 (opcional) | ~$0 (opcional) |
 | **TOTAL** | **~$35/mes** | **~$83/mes** |
 
 Desglose itemizado de EBS: root 40 ~$4, data 30 ~$3, snapshots ~$2. La EC2 ya no dimensiona por la
@@ -306,7 +307,8 @@ fuera del alcance de este proyecto.
 | **EMR Serverless** | ✅ Adoptado | El uso es chico e infrecuente (3×/sem, ~2–5 GB): una EC2 siempre prendida solo para tener Spark vivo no se justificaba. Pago por uso + escala a cero encaja |
 | **MWAA** | ❌ No | Airflow managed no escala a cero (~$350+/mes fijos): caro a esta escala |
 | **EMR-on-EC2 (clásico)** | ❌ No | Fleet de EC2 + recargo, pensado para TB sostenidos / multi-nodo |
-| **Glue Data Catalog** | ❌ No | El código usa vistas temporales / Delta path-based — no hay tablas persistentes que catalogar |
+| **Athena** | ✅ Opcional (adoptado) | Capa de consumo SQL/BI sobre S3, pago por consulta (~$5/TB → ~$0 a esta escala). Requiere un catálogo mínimo; se resuelve con **partition projection** (una tabla DDL, sin crawlers). Se justifica si hay lectores SQL/BI o asserts de calidad en los DAGs; si el único consumidor es el próximo job Spark, no aporta |
+| **Glue Data Catalog "pesado" (crawlers)** | ❌ No | El código usa vistas temporales / Delta path-based — no hay tablas que autodescubrir. El metastore por defecto de Athena *es* Glue Data Catalog: usar Athena adopta un catálogo mínimo (una tabla declarada a mano), pero **partition projection** evita crawlers y jobs de Glue |
 | **CloudWatch dashboards** | ❌ No (como viz primaria) | Monitoreo con Prometheus + Grafana (más portable y rico); CloudWatch se usa para métricas/logs de EMR Serverless |
 | **HDFS en prod** | ❌ No | Reemplazado por S3 (`s3a://`); EMR Serverless lee/escribe S3 nativo |
 
@@ -370,10 +372,17 @@ hay tablas persistentes que catalogar; un lakehouse con `saveAsTable` cambiaría
 
 | Modo | Qué da | ¿Catálogo/Glue? |
 |---|---|---|
-| **Delta path-based** (ejemplo de arriba) | ACID + time-travel + MERGE + schema evolution | No — acceso por ruta; mantiene el principio "sin Glue" |
-| **`saveAsTable("curated.sales")`** | + llamar la tabla por nombre, descubrible por Athena/otros motores | Sí — Glue, o self-hosted (Hive Metastore, Iceberg JDBC catalog sobre el Postgres existente, o REST) |
+| **Delta path-based** (ejemplo de arriba) | ACID + time-travel + MERGE + schema evolution entre jobs Spark | No — acceso por ruta; **cero** catálogo |
+| **Athena + partition projection** | Lectura SQL/BI del `analytics/` desde motores externos, sin escribir Spark | Mínimo — una tabla DDL declarada a mano (el catálogo es Glue por defecto, pero **sin crawlers ni jobs de Glue**) |
+| **`saveAsTable("curated.sales")`** | + llamar la tabla por nombre, descubrible por Athena/otros motores, autogestión de particiones | Sí — catálogo poblado por escritura (Glue, o self-hosted: Hive Metastore, Iceberg JDBC catalog sobre el Postgres existente, o REST) |
 
-**Recomendación a esta escala:** Delta path-based es el sweet spot: da el 80% del beneficio (ACID,
-time-travel, upsert) con cero dependencia managed nueva. El `saveAsTable` + catálogo recién paga
-cuando varios motores (Athena + Spark + BI) leen lo mismo y hace falta descubrir tablas por
-nombre; y ni siquiera ahí obliga a Glue — un metastore propio alcanza.
+**Recomendación a esta escala:** Delta path-based sigue siendo el **default** para ACID/time-travel
+entre jobs: da el 80% del beneficio (ACID, time-travel, upsert) con cero dependencia managed nueva.
+Si además hace falta **lectura SQL/BI** del `analytics/`, **Athena + partition projection** es el
+camino liviano: habilita consumo SQL sin Glue pesado (una tabla declarada a mano, sin crawlers),
+manteniendo el principio de mínima dependencia managed — el "sin Glue" del §6 se reinterpreta como
+"sin crawlers ni catálogo pesado", no como "cero catálogo". Así, `analytics/` (S3) queda consumible
+por Athena → BI (QuickSight / Grafana / Metabase) sin tocar el pipeline. El `saveAsTable` + catálogo
+poblado por escritura recién paga cuando varios motores leen lo mismo y hace falta autogestionar
+particiones y descubrir tablas por nombre; y ni siquiera ahí obliga a Glue — un metastore propio
+alcanza.
