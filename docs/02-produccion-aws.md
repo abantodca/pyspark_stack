@@ -958,7 +958,8 @@ ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
 ssh -i ~/.ssh/pyspark_stack -L 8082:localhost:8082 -L 8888:localhost:8888 ec2-user@$IP
 ```
 
-UIs (con el túnel abierto): Airflow `localhost:8082`. Spark ya no corre en la EC2 (los jobs van a
+UIs (con el túnel abierto): Airflow `localhost:8082` — o, si exponés la web por HTTPS (§5.6),
+directo en `https://airflow.midominio.com` sin túnel. Spark ya no corre en la EC2 (los jobs van a
 EMR Serverless — su UI de Spark y sus logs se ven desde la consola de EMR / CloudWatch / S3, §12.8).
 Jupyter `localhost:8888` solo si activaste el perfil `dev` (`COMPOSE_PROFILES=dev` o `--profile dev`):
 un `up` pelado no lo levanta (§13.2).
@@ -1150,6 +1151,12 @@ curl -sSfI "https://$(cd infra/prod && terraform output -raw airflow_domain)/" |
 
 Entrás a `https://airflow.midominio.com` con el usuario **admin** y la password que generó SSM
 (§13.1). La restricción por IP es defensa-en-profundidad **sobre** el login de Airflow, no en lugar de.
+
+> **Consecuencia en el túnel SSH (§5.5).** Con el TLS activo ya **no tuneleás Airflow**: entrás por la
+> URL pública. El `-L 8082` del `tunnel_command` deja de aplicar para Airflow (si igual lo abrís,
+> `localhost:8082` sirve HTTPS con el cert del FQDN → warning de nombre; usá la URL pública). El túnel
+> sigue siendo para Grafana/Prometheus/Loki (`-L 9090 -L 3000 -L 9093 -L 3100`, §12.8) y para Jupyter
+> (`-L 8888`, solo perfil dev). Es decir: la web de Airflow por 443, el resto por túnel.
 
 <details>
 <summary>🖱️ Alternativa: Caddy (reverse-proxy con auto-cert) en vez de TLS nativo</summary>
