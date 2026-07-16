@@ -42,6 +42,8 @@
    - 9.3 [DAG que ejecuta el notebook](#93-dag-que-ejecuta-el-notebook--dagsrun_notebook_dagpy)
 10. [Flujo local → servidor → los DAGs corren solos](#10-flujo-local--servidor--los-dags-corren-solos)
     - 10.1 [Modo rápido (dev): deploy manual sin CI](#101-modo-rápido-dev-deploy-manual-sin-esperar-ci)
+    - 10.2 [Del laptop a producción — el loop completo](#102-del-laptop-a-producción--el-loop-completo-dev--deploy--corre-solo--se-apaga)
+    - 10.3 [Apagado job-aware: se apaga cuando terminan los jobs](#103-apagado-job-aware-se-apaga-cuando-terminan-los-jobs-no-a-hora-fija)
 11. [CI/CD con GitHub Actions (OIDC, sin claves)](#11-cicd-con-github-actions-oidc-sin-claves)
     - 11.1 [Terraform: OIDC provider + rol](#111-terraform-oidc-provider--rol--infraprodcicdtf)
     - 11.2 [Workflow de CI](#112-workflow-de-ci--githubworkflowsciyml)
@@ -61,6 +63,7 @@
     - 14.1 [docker-compose.prod.yml (producción, completo)](#141-docker-composeprodyml-producción-completo)
     - 14.2 [docker-compose.dev.yml (dev-lite 8 GB)](#142-docker-composedevyml-dev-lite-8-gb)
 15. [Puesta en producción — runbook final](#15-puesta-en-producción--runbook-final)
+16. [Athena — capa de consumo SQL/BI (opcional)](#16-athena--capa-de-consumo-sqlbi-opcional)
 
 ---
 
@@ -604,18 +607,53 @@ en cola. Convierte los ~$60/mes fijos de la EC2 `t3.large` en ~$12 (8h×22d). Co
 de la caja (EMR Serverless), esta palanca mueve **menos** la aguja que antes —lo que apagás es
 una EC2 ya chica— pero sigue valiendo la pena si no necesitás Airflow encendido 24/7.
 
-**Código de la Lambda — `infra/prod/lambda/startstop.py`:**
+**Código de la Lambda — `infra/prod/lambda/startstop.py`:** el handler `stop` no apaga a ciegas:
+antes consulta **si hay DAG runs activos en Airflow** (guardia anti-corte) y, si los hay, no apaga.
+Así el apagado es *job-aware* — con varios DAGs, solo se apaga cuando el **último** terminó (§10.3).
 
 ```python
 import os
+import time
 import boto3
 
 ec2 = boto3.client("ec2")
+ssm = boto3.client("ssm")
+
+def _dags_activos(instance_id):
+    """Cuenta los DAG runs en estado 'running' DENTRO de la EC2, vía SSM SendCommand.
+    Guardia anti-corte: si hay alguno, NO apagamos (otro DAG sigue corriendo). Ante cualquier
+    duda (comando fallido, salida no numérica) es conservador y devuelve >0 → no apagar."""
+    # Airflow 3: contamos los DAG runs 'running' consultando la metadata DB desde el scheduler.
+    # (Alternativas equivalentes: `airflow jobs check --job-type SchedulerJob` para salud del
+    #  scheduler, o `airflow dags list-runs --state running` filtrando por DAG.)
+    py = ("from airflow.models.dagrun import DagRun;"
+          "from airflow.utils.state import DagRunState;"
+          "print(len(DagRun.find(state=DagRunState.RUNNING)))")
+    cmd = f'docker exec airflow-scheduler python -c "{py}"'
+    resp = ssm.send_command(
+        InstanceIds=[instance_id],
+        DocumentName="AWS-RunShellScript",
+        Comment="startstop: chequeo de DAG runs activos",
+        Parameters={"commands": [cmd]},
+    )
+    cid = resp["Command"]["CommandId"]
+    inv = {"Status": "Pending"}
+    for _ in range(20):                       # espera hasta ~40s a que el comando termine
+        time.sleep(2)
+        inv = ssm.get_command_invocation(CommandId=cid, InstanceId=instance_id)
+        if inv["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
+            break
+    if inv["Status"] != "Success":
+        return 1                              # no pudimos verificar → conservador: no apagar
+    try:
+        return int(inv["StandardOutputContent"].strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return 1
 
 def handler(event, context):
     """Prende o apaga las EC2 marcadas con el tag AutoStartStop=true.
     event = {"action": "start"} | {"action": "stop"}
-    Personalizá aquí: chequear jobs en curso, notificar, etc."""
+    El stop es JOB-AWARE: no apaga si hay DAG runs corriendo (§10.3)."""
     action   = event.get("action", "stop")
     tag_key  = os.environ.get("TAG_KEY", "AutoStartStop")
     tag_val  = os.environ.get("TAG_VALUE", "true")
@@ -633,9 +671,13 @@ def handler(event, context):
     if action == "start":
         ec2.start_instances(InstanceIds=ids)
     else:
-        # --- PERSONALIZACIÓN: no apagar si hay algo crítico corriendo ---
-        # Ej.: consultar una métrica CloudWatch, un DAG activo, un flag en SSM Parameter Store.
-        # if _job_en_curso(): return {"msg": "job activo, no apago", "instances": ids}
+        # --- GUARDIA ANTI-CORTE: no apagar si algún DAG sigue corriendo (§10.3) ---
+        # La task trigger_stop del DAG invoca esta Lambda al terminar (trigger_rule=all_done);
+        # con varios DAGs en vuelo, solo el ÚLTIMO en terminar la deja apagar. El cron de las
+        # 22:00 (schedule stop) queda como RED DE SEGURIDAD por si un DAG cuelga y nunca dispara.
+        activos = _dags_activos(ids[0])       # un solo nodo pyspark-stack-node
+        if activos > 0:
+            return {"msg": f"{activos} DAG run(s) activos, no apago", "instances": ids}
         ec2.stop_instances(InstanceIds=ids)
 
     return {"action": action, "instances": ids}
@@ -679,6 +721,18 @@ data "aws_iam_policy_document" "lambda" {
       values   = ["true"]
     }
   }
+  # Guardia anti-corte: el handler `stop` consulta los DAG runs activos vía SSM antes de apagar.
+  statement {
+    actions = ["ssm:SendCommand"]
+    resources = [
+      "arn:aws:ec2:${local.region}:${local.account_id}:instance/${aws_instance.pyspark.id}",
+      "arn:aws:ssm:${local.region}::document/AWS-RunShellScript",
+    ]
+  }
+  statement {
+    actions   = ["ssm:GetCommandInvocation"]
+    resources = ["*"]
+  }
   statement {
     actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["arn:aws:logs:*:*:*"]
@@ -697,7 +751,7 @@ resource "aws_lambda_function" "startstop" {
   handler          = "startstop.handler"
   runtime          = "python3.12"
   role             = aws_iam_role.lambda.arn
-  timeout          = 30
+  timeout          = 120   # el guard job-aware espera al SSM SendCommand (chequeo de DAG runs)
   environment {
     variables = { TAG_KEY = "AutoStartStop", TAG_VALUE = "true" }
   }
@@ -763,11 +817,14 @@ compose base solo los `airflow-*` vuelven solos; el resto vuelve cuando apliques
    runtime **Python 3.12** → pegá el código de `startstop.py` en el editor (`lambda_function.py`)
    y en *Runtime settings → Edit* cambiá el handler a **`lambda_function.handler`** (el default
    de la consola es `lambda_function.lambda_handler`, pero el código define `def handler`).
-2. *Configuration → General configuration*: timeout **30 s**. *Environment variables*:
-   `TAG_KEY=AutoStartStop`, `TAG_VALUE=true`.
+2. *Configuration → General configuration*: timeout **120 s** (el guard job-aware espera al SSM
+   SendCommand del chequeo de DAG runs). *Environment variables*: `TAG_KEY=AutoStartStop`,
+   `TAG_VALUE=true`.
 3. *Configuration → Permissions* → clic en el rol de ejecución → **Add permissions → Create
    inline policy** → pestaña JSON → pegá los permisos del Terraform (`ec2:DescribeInstances` en
-   `*`; `ec2:StartInstances`/`StopInstances` con condición `aws:ResourceTag/AutoStartStop=true`).
+   `*`; `ec2:StartInstances`/`StopInstances` con condición `aws:ResourceTag/AutoStartStop=true`;
+   `ssm:SendCommand` sobre el ARN de tu instancia y `AWS-RunShellScript`, más
+   `ssm:GetCommandInvocation` en `*` para el chequeo de DAGs activos antes de apagar).
 4. **EventBridge → Scheduler → Create schedule** ×2, ambos con *Flexible time window* **Off**
    y timezone **UTC** (la consola crea sola el rol que invoca la Lambda):
    - `pyspark-stack-start`: cron `0 11 ? * MON-FRI *` → target la Lambda, payload
@@ -805,7 +862,9 @@ Apagar/prender no degrada el rendimiento — cuatro garantías de diseño:
 # comprobá (tras el apply de §5.5)
 aws lambda invoke --function-name pyspark-stack-startstop \
   --cli-binary-format raw-in-base64-out --payload '{"action":"stop"}' /dev/stdout
-# debe listar tu instancia, no {"msg": "no instances tagged"} (revisá el tag AutoStartStop)
+# debe listar tu instancia, no {"msg": "no instances tagged"} (revisá el tag AutoStartStop).
+# Nota: con el guard job-aware, si el chequeo SSM ve DAGs corriendo (o no puede verificar) devuelve
+# {"msg": "N DAG run(s) activos, no apago"} — es lo esperado; probá el stop sin DAGs en vuelo.
 ```
 
 ### 5.5 Desplegar, subir código y túnel SSH
@@ -1241,13 +1300,31 @@ resource "aws_iam_role_policy" "ec2_emr" {
   policy = data.aws_iam_policy_document.ec2_emr.json
 }
 
+# Apagado job-aware: la task final `trigger_stop` del DAG (§10.3) invoca la Lambda startstop
+# ({"action":"stop"}) al terminar el pipeline. Para eso el rol de la EC2 (bajo el que corre
+# Airflow) necesita invocar ESA Lambda — y solo esa (least-privilege).
+data "aws_iam_policy_document" "ec2_invoke_startstop" {
+  statement {
+    sid       = "InvokeStartStopLambda"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.startstop.arn]
+  }
+}
+resource "aws_iam_role_policy" "ec2_invoke_startstop" {
+  name   = "ec2-invoke-startstop"
+  role   = aws_iam_role.ec2.id
+  policy = data.aws_iam_policy_document.ec2_invoke_startstop.json
+}
+
 # Outputs que consumen los DAGs (los cargás como Airflow Variables o env AIRFLOW_VAR_*, §9.0/§14.1):
 output "emr_app_id"       { value = aws_emrserverless_application.spark.id }
 output "emr_job_role_arn" { value = aws_iam_role.emr_job.arn }
 ```
 
-**D) Empaquetado y submit.** Los entrypoints PySpark viven en `s3://<artifacts>/emr/` y los logs del
-job en `s3://<artifacts>/emr/logs/`. El CI/CD sincroniza `spark-apps/` a `emr/` en cada deploy (§11.3).
+**D) Empaquetado y submit.** Los entrypoints PySpark reales viven en el repo bajo `spark-apps/emr/`
+(`spark-apps/emr/customer_etl.py`, `spark-apps/emr/wordcount.py`) y en S3 bajo `s3://<artifacts>/emr/`;
+los logs del job van a `s3://<artifacts>/emr/logs/`. El CI/CD sincroniza `spark-apps/emr/` a `emr/` en
+cada deploy (§11.3) — solo los entrypoints EMR, no el resto de `spark-apps/` (que es dev local).
 Un `StartJobRun` (así lo arma por vos el operator de Airflow; equivalente CLI para probar a mano):
 
 ```bash
@@ -1291,8 +1368,10 @@ en EMR Serverless no hay caja donde montarlo. EMR escribe los logs a S3 (`emr/lo
 4. Al rol de la EC2 (`pyspark-stack-ec2-role`) agregale una inline policy con
    `emr-serverless:StartJobRun/GetJobRun/StartApplication/GetApplication` sobre el ARN de la app
    (+ `.../jobruns/*`) y `iam:PassRole` sobre el ARN del rol del job con condición
-   `iam:PassedToService = emr-serverless.amazonaws.com`.
-5. **Subí los entrypoints**: `aws s3 sync spark-apps/ s3://pyspark-stack-artifacts-<acct>/emr/`
+   `iam:PassedToService = emr-serverless.amazonaws.com`. Agregá además
+   `lambda:InvokeFunction` sobre el ARN de la Lambda `pyspark-stack-startstop`, para que la task
+   `trigger_stop` del DAG (§10.3) pueda apagar la EC2 al terminar.
+5. **Subí los entrypoints**: `aws s3 sync spark-apps/emr/ s3://pyspark-stack-artifacts-<acct>/emr/`
    (el CI/CD lo hace solo, §11.3).
 
 </details>
@@ -1302,8 +1381,128 @@ en EMR Serverless no hay caja donde montarlo. EMR escribe los logs a S3 (`emr/lo
 terraform -chdir=infra/prod apply
 aws emr-serverless list-applications --query 'applications[?name==`pyspark-stack-spark`].[id,state]'
 # subir los entrypoints y lanzar un job de prueba (ver el start-job-run de arriba)
-aws s3 sync spark-apps/ "s3://pyspark-stack-artifacts-$(aws sts get-caller-identity --query Account --output text)/emr/"
+aws s3 sync spark-apps/emr/ "s3://pyspark-stack-artifacts-$(aws sts get-caller-identity --query Account --output text)/emr/"
 ```
+
+**E) Los entrypoints PySpark (copy-paste).** Estos son los dos archivos reales que menciona el punto
+D). Son *self-contained*: no usan `.master()` (EMR Serverless inyecta master/recursos), leen y
+escriben directo en S3 (`s3a://`), y la config de Spark viaja por-job en `sparkSubmitParameters`. Se
+suben a `s3://<artifacts>/emr/` con el `aws s3 sync` de arriba (o el CI/CD de §11.3), y desde ahí los
+lanza el `EmrServerlessStartJobOperator` de los DAGs (§10.2).
+
+`spark-apps/emr/customer_etl.py` — ETL de fidelidad de clientes: lee `raw/` (CSV/JSON), calcula el
+segmento de lealtad y escribe Parquet particionado por fecha en `curated/`:
+
+```python
+"""customer_etl para EMR Serverless — S3 in/out, sin HDFS, sin master hardcodeado.
+
+Se sube a s3://<artifacts>/emr/customer_etl.py (deploy, §11.3) y lo ejecuta
+EmrServerlessStartJobOperator (dags/customer_etl_emr_dag.py, §9/§10.2).
+
+Args: 1) datalake_bucket (sin s3://)   2) run_date (YYYY-MM-DD, para particionar).
+"""
+import sys
+
+from pyspark.sql import SparkSession
+
+
+def main(datalake: str, run_date: str) -> None:
+    base = f"s3a://{datalake}"
+    raw = f"{base}/raw/customer_etl"
+    out = f"{base}/curated/customer_loyalty/dt={run_date}"
+
+    # Sin .master(): EMR Serverless inyecta master/recursos. La config de Spark viaja
+    # por-job en sparkSubmitParameters (no hay spark-defaults.conf local en prod).
+    spark = SparkSession.builder.appName("CustomerLoyaltyETL").getOrCreate()
+
+    spark.read.option("header", True).csv(f"{raw}/orders.csv").createOrReplaceTempView("orders")
+    spark.read.option("multiline", "true").json(f"{raw}/products.json").createOrReplaceTempView(
+        "products"
+    )
+    spark.read.option("header", True).csv(f"{raw}/customers.csv").createOrReplaceTempView(
+        "customers"
+    )
+
+    df = spark.sql("""
+        WITH enriched AS (
+            SELECT o.order_id, o.customer_id, o.product_id, o.quantity, o.order_date,
+                   p.category, p.unit_price, o.quantity * p.unit_price AS total_price
+            FROM orders o JOIN products p ON o.product_id = p.product_id
+        ),
+        metrics AS (
+            SELECT customer_id,
+                   COUNT(order_id) AS total_orders,
+                   SUM(total_price) AS total_spent,
+                   COUNT(DISTINCT order_date) AS days_active,
+                   COUNT(DISTINCT category) AS categories_bought
+            FROM enriched GROUP BY customer_id
+        )
+        SELECT m.customer_id, c.customer_name, c.city, c.state, c.signup_date,
+               m.total_orders, m.total_spent, m.days_active, m.categories_bought,
+               CASE
+                   WHEN m.total_orders >= 3 AND m.days_active >= 2 AND m.categories_bought >= 2
+                       THEN 'Premium'
+                   WHEN m.total_orders >= 2 AND (m.days_active >= 2 OR m.categories_bought >= 2)
+                       THEN 'Engaged'
+                   ELSE 'Casual'
+               END AS loyalty_status
+        FROM metrics m JOIN customers c ON m.customer_id = c.customer_id
+    """)
+
+    # Parquet particionado por fecha: barato de escanear por Athena (§16, partition projection).
+    df.write.mode("overwrite").parquet(out)
+    spark.stop()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Uso: customer_etl.py <datalake_bucket> [run_date]")
+        sys.exit(1)
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "latest")
+```
+
+`spark-apps/emr/wordcount.py` — el "hola mundo" de Spark en EMR, para validar la app de punta a punta
+sin depender de datos en `raw/`:
+
+```python
+"""wordcount para EMR Serverless — self-contained, sin master hardcodeado.
+
+Args: 1) output_uri (opcional): s3a://.../analytics/wordcount ; si falta, solo imprime.
+"""
+import sys
+
+from pyspark.sql import SparkSession
+
+
+def main(output_uri: str | None) -> None:
+    spark = SparkSession.builder.appName("WordCount").getOrCreate()
+    lines = [
+        "spark hadoop spark airflow",
+        "hadoop hdfs spark etl",
+        "airflow dag spark etl etl",
+    ]
+    counts = (
+        spark.sparkContext.parallelize(lines)
+        .flatMap(str.split)
+        .map(lambda w: (w, 1))
+        .reduceByKey(lambda a, b: a + b)
+        .sortBy(lambda kv: kv[1], ascending=False)
+    )
+    rows = counts.collect()
+    for word, count in rows:
+        print(f"{word}\t{count}")
+    if output_uri:
+        spark.createDataFrame(rows, ["word", "count"]).write.mode("overwrite").parquet(output_uri)
+    spark.stop()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else None)
+```
+
+> Verificá: subilos con el `aws s3 sync spark-apps/emr/ s3://<artifacts>/emr/` de §11.3 (el CI/CD lo
+> hace solo) o a mano con el `aws s3 sync` del bloque `comprobá` de arriba. Después, un `StartJobRun`
+> (el del punto D, o el que arma el operator) los ejecuta desde S3.
 
 ### 6.5 S3 VPC Gateway Endpoint
 
@@ -1757,8 +1956,9 @@ with DAG("small_etl", schedule="@daily", start_date=datetime(2026, 1, 1), catchu
 
 **PySpark — el caso "sí necesito Spark"** (ahora en **EMR Serverless**, no en la EC2). El DAG
 **dispara** el job con `EmrServerlessStartJobOperator` y **espera** su resultado con
-`EmrServerlessJobSensor`; ambos vienen en el provider `apache-airflow-providers-amazon` (ya en el
-`requirements.txt` del repo). El código PySpark se sube a `s3://<artifacts>/emr/` (§6.4/§11.3):
+`EmrServerlessJobSensor`; ambos vienen en el provider `apache-airflow-providers-amazon`, que hay que
+**agregar** a `requirements.txt` (§9.1) para que los DAGs EMR parseen. El código PySpark se sube a
+`s3://<artifacts>/emr/` (§6.4/§11.3):
 
 ```python
 from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobOperator
@@ -1871,12 +2071,15 @@ componente tiene un trabajo real y solo pagás Spark mientras el job corre.
 
 ### 9.1 Habilitar papermill
 
-Agregá el provider a `requirements.txt` (se instala en la imagen de Airflow), junto con las
+Agregá los providers a `requirements.txt` (se instala en la imagen de Airflow), junto con las
 dependencias de las tasks Python puro de §9.0 — sin ellas, DAGs como `ventas_diario` fallan en
-la imagen actual:
+la imagen actual. La línea **clave** es `apache-airflow-providers-amazon==9.29.0` (pin del
+constraints de Airflow 3.2.2 / py3.12): sin ella, los DAGs EMR (`EmrServerlessStartJobOperator`,
+§10.2) no parsean y su import protegido cae al `except`. Agregá a `requirements.txt`:
 
 ```text
-apache-airflow-providers-papermill==3.9.1
+apache-airflow-providers-amazon==9.29.0   # operadores EMR Serverless (§9.0/§10.2) — imprescindible
+apache-airflow-providers-papermill==3.9.1 # notebooks (§9.3)
 pandas    # tasks Python puro (§9.0)
 s3fs      # pandas ↔ s3:// con el rol IAM
 pyarrow   # parquet para pandas
@@ -1948,9 +2151,9 @@ laptop (edita dags/, spark-apps/, notebooks/)
    │ git push a main
    ▼
 GitHub Actions (CI valida → Deploy)
-   │ aws s3 sync  →  s3://artifacts/deploy/*  +  spark-apps/ → s3://artifacts/emr/ (entrypoints)
+   │ aws s3 sync  →  s3://artifacts/deploy/dags/  +  spark-apps/emr/ → s3://artifacts/emr/ (entrypoints)
    ▼
-SSM SendCommand  →  EC2: aws s3 sync  →  ./dags ./spark-apps ./notebooks
+SSM SendCommand  →  EC2: aws s3 sync s3://artifacts/deploy/dags/ → ./dags  (+ airflow dags reserialize)
    ▼
 Airflow dag-processor detecta los DAGs nuevos (~30s con el refresh del override)
    │  (no quedan en pausa)  →  corren por su schedule
@@ -2010,18 +2213,251 @@ ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP" \
 Ojo: config nueva (`spark-conf/`, `scripts/`, `monitoring/`, `requirements.txt`) **no** la sube
 este script — usá el rsync completo de §5.5 o el workflow de §11.
 
+### 10.2 Del laptop a producción — el loop completo (dev → deploy → corre solo → se apaga)
+
+El ciclo de punta a punta, con los archivos reales del repo:
+
+1. **Dev — probás el DAG local.** Los DAGs actuales (`dags/customer_etl_dag.py`,
+   `dags/spark_trigger_dag.py`) corren contra el **Spark + HDFS local** del `docker-compose.yml`.
+   Iterás con `./scripts/deploy.sh` (§10.1) o levantando el compose en tu máquina. Estos DAGs
+   quedan **intactos** — son el camino de desarrollo.
+
+2. **Prod — escribís la variante EMR.** Agregás el DAG de producción con
+   `EmrServerlessStartJobOperator`: `dags/customer_etl_emr_dag.py` (dag_id `customer_etl_emr`,
+   entrypoint `spark-apps/emr/customer_etl.py`) y `dags/spark_trigger_emr_dag.py` (dag_id
+   `spark_wordcount_emr`, entrypoint `spark-apps/emr/wordcount.py`). Leen las Airflow Variables
+   `emr_app_id`, `emr_job_role_arn`, `datalake` y `artifacts` (§14.1) para armar el `entryPoint`
+   (`s3://<artifacts>/emr/customer_etl.py`), los `entryPointArguments` (`[datalake, "{{ ds }}"]`)
+   y los logs (`s3://<artifacts>/emr/logs/`). Tienen `schedule=None`: se disparan por el patrón
+   **cron → Lambda `trigger-airflow`** (§7), o quedan `is_paused_upon_creation` según convenga.
+   **No corren en local** (no hay EMR): el import del provider amazon está **protegido**
+   (try/except) para que el parseo del `dag-processor` local no se rompa aunque el provider no esté
+   en la imagen de dev.
+
+3. **`git push` → CI.** `.github/workflows/ci.yml` valida en cada PR/push: `ruff` (lint + format),
+   **validación de DAGs** con `pytest tests/test_dag_integrity.py` sobre el `DagBag` (cero import
+   errors), **security scan** con gitleaks, y `terraform validate` condicional (ver §11).
+
+4. **Merge a `main` → CD.** `.github/workflows/deploy.yml` (OIDC, sin claves) despliega:
+   `aws s3 sync dags/` → `s3://<artifacts>/deploy/dags/` y `aws s3 sync spark-apps/emr/` →
+   `s3://<artifacts>/emr/`, y luego un **SSM sync-down** en la EC2 (tag `Name=pyspark-stack-node`)
+   que baja los DAGs a la caja. El `dag-processor` los toma en **~30 s** (§10) y quedan **activos**
+   (no pausados: `DAGS_ARE_PAUSED_AT_CREATION=False`).
+
+5. **Corre solo.** EventBridge **start-cron** prende la EC2 (§5.4); dentro de la ventana de
+   encendido, EventBridge **ETL-cron → Lambda `trigger-airflow`** dispara el DAG (§7.2); el job
+   pesado corre en **EMR Serverless** (`StartJobRun`), que **escala a cero** al terminar.
+
+6. **Se apaga solo al terminar.** La task final `trigger_stop` del DAG apaga la EC2 cuando el
+   pipeline termina — **no a una hora fija**. Detalle en §10.3.
+
+**Los dos DAGs de producción, completos (copy-paste).** El paso 2 de arriba los nombra; acá van
+enteros. Ambos protegen el import del provider `amazon` con `try/except`: si el provider no está
+(dev local), el DAG **no se registra** y el `dag-processor` local no rompe. Tienen `schedule=None`:
+los dispara la Lambda `trigger-airflow` (§7), no el Airflow local.
+
+`dags/customer_etl_emr_dag.py` — orquesta `customer_etl` en EMR Serverless y apaga la EC2 al
+terminar (`trigger_stop`, §10.3):
+
+```python
+"""customer_etl en producción: Airflow orquesta, EMR Serverless computa.
+
+- schedule=None: lo dispara la Lambda trigger-airflow (cron/evento S3, §7); no corre
+  en el Airflow local (no hay EMR ahí).
+- Import del provider PROTEGIDO: si el provider amazon no está (dev local), el DAG no
+  se registra y el dag-processor local no rompe.
+- trigger_stop: al terminar (éxito o fallo) apaga la EC2 vía la Lambda startstop (§10.3).
+"""
+from datetime import datetime, timedelta
+
+from airflow.sdk import DAG, Variable, task
+
+try:
+    from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobOperator
+except ImportError:
+    EmrServerlessStartJobOperator = None  # dev local sin el provider amazon
+
+
+if EmrServerlessStartJobOperator is not None:
+    DATALAKE = Variable.get("datalake", default="pyspark-stack-datalake-<acct>")
+    ARTIFACTS = Variable.get("artifacts", default="pyspark-stack-artifacts-<acct>")
+
+    default_args = {"owner": "data-eng", "retries": 1, "retry_delay": timedelta(minutes=2)}
+
+    with DAG(
+        dag_id="customer_etl_emr",
+        default_args=default_args,
+        start_date=datetime(2026, 1, 1),
+        schedule=None,  # disparado por la Lambda trigger-airflow (§7)
+        catchup=False,
+        tags=["emr", "prod", "etl"],
+    ) as dag:
+        run = EmrServerlessStartJobOperator(
+            task_id="customer_etl",
+            application_id="{{ var.value.emr_app_id }}",
+            execution_role_arn="{{ var.value.emr_job_role_arn }}",
+            job_driver={
+                "sparkSubmit": {
+                    "entryPoint": f"s3://{ARTIFACTS}/emr/customer_etl.py",
+                    "entryPointArguments": [DATALAKE, "{{ ds }}"],
+                    "sparkSubmitParameters": (
+                        "--conf spark.executor.cores=2 --conf spark.executor.memory=4g"
+                    ),
+                }
+            },
+            configuration_overrides={
+                "monitoringConfiguration": {
+                    "s3MonitoringConfiguration": {"logUri": f"s3://{ARTIFACTS}/emr/logs/"}
+                }
+            },
+        )
+
+        @task(trigger_rule="all_done")  # apaga la EC2 aunque el ETL falle
+        def trigger_stop():
+            import json
+
+            import boto3
+
+            boto3.client("lambda").invoke(
+                FunctionName="pyspark-stack-startstop",
+                InvocationType="Event",
+                Payload=json.dumps({"action": "stop"}).encode(),
+            )
+
+        run >> trigger_stop()
+```
+
+`dags/spark_trigger_emr_dag.py` — la variante demo (`wordcount`) para validar el camino
+Airflow → EMR sin datos en `raw/`:
+
+```python
+"""wordcount en producción: Airflow dispara, EMR Serverless computa (demo)."""
+from datetime import datetime, timedelta
+
+from airflow.sdk import DAG, Variable
+
+try:
+    from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobOperator
+except ImportError:
+    EmrServerlessStartJobOperator = None
+
+
+if EmrServerlessStartJobOperator is not None:
+    ARTIFACTS = Variable.get("artifacts", default="pyspark-stack-artifacts-<acct>")
+    DATALAKE = Variable.get("datalake", default="pyspark-stack-datalake-<acct>")
+
+    default_args = {"owner": "data-eng", "retries": 1, "retry_delay": timedelta(minutes=2)}
+
+    with DAG(
+        dag_id="spark_wordcount_emr",
+        default_args=default_args,
+        start_date=datetime(2026, 1, 1),
+        schedule=None,
+        catchup=False,
+        tags=["emr", "prod", "demo"],
+    ) as dag:
+        EmrServerlessStartJobOperator(
+            task_id="wordcount",
+            application_id="{{ var.value.emr_app_id }}",
+            execution_role_arn="{{ var.value.emr_job_role_arn }}",
+            job_driver={
+                "sparkSubmit": {
+                    "entryPoint": f"s3://{ARTIFACTS}/emr/wordcount.py",
+                    "entryPointArguments": [f"s3a://{DATALAKE}/analytics/wordcount"],
+                    "sparkSubmitParameters": (
+                        "--conf spark.executor.cores=1 --conf spark.executor.memory=2g"
+                    ),
+                }
+            },
+            configuration_overrides={
+                "monitoringConfiguration": {
+                    "s3MonitoringConfiguration": {"logUri": f"s3://{ARTIFACTS}/emr/logs/"}
+                }
+            },
+        )
+```
+
+> Verificá: CI valida el parseo (§11.2) — `pytest tests/` construye el `DagBag` y falla si alguno
+> no importa; con el provider instalado en el runner, ambos DAGs se registran y cumplen los
+> estándares mínimos (tags/owner/retries).
+
+### 10.3 Apagado job-aware: se apaga cuando terminan los jobs, no a hora fija
+
+El apagado no es a reloj: la caja se apaga **cuando el último job terminó**. Dos piezas se combinan.
+
+**a) Tarea final `trigger_stop` en el DAG** (ya incluida en `dags/customer_etl_emr_dag.py`). Al
+terminar el pipeline (`trigger_rule="all_done"`, así se apaga **aunque el ETL falle**), una task
+invoca la Lambda `pyspark-stack-startstop` con `{"action":"stop"}` vía boto3:
+
+```python
+from airflow.sdk import task
+import boto3, json
+@task(trigger_rule="all_done")   # se apaga aunque el ETL falle
+def trigger_stop():
+    boto3.client("lambda").invoke(
+        FunctionName="pyspark-stack-startstop",
+        InvocationType="Event",
+        Payload=json.dumps({"action": "stop"}).encode(),
+    )
+```
+
+La invocación usa el **rol IAM de la EC2** (`lambda:InvokeFunction` sobre el ARN de la Lambda, §6.4)
+— sin keys. `InvocationType="Event"` es asíncrona: la task no espera a la Lambda. Encadenala al
+final del DAG (`... >> trigger_stop()`).
+
+**b) Lambda `startstop` reforzada (guardia anti-corte).** El handler `stop` (§5.4) **no apaga a
+ciegas**: antes consulta vía **SSM `SendCommand`** si hay **DAG runs activos** (`running`) en
+Airflow, y si hay alguno **no apaga**. Así, con varios DAGs en vuelo, cada `trigger_stop` que corre
+encuentra a los demás todavía `running` y se abstiene; **solo el último en terminar** deja apagar la
+caja. Evita que un DAG corte a otro que sigue corriendo.
+
+> Timing importante: `trigger_stop` invoca la Lambda de forma **asíncrona** (`InvocationType="Event"`)
+> y retorna al instante, con lo que la task termina y el DAG run pasa a `success` en ~1–2 s. La
+> Lambda, en cambio, recién hace su primer chequeo SSM unos segundos después (ver el loop de
+> `_dags_activos` en §5.4), cuando el DAG que la disparó **ya no figura `running`** — así el guard
+> no se bloquea a sí mismo y solo ve DAGs *ajenos* que sigan corriendo.
+
+**c) El cron de stop de las 22:00 queda como RED DE SEGURIDAD** (hard safety net). El `schedule` de
+stop de §5.4 sigue existiendo: si un DAG **cuelga** y nunca dispara su `trigger_stop`, el cron apaga
+igual a la hora fija. Con el pipeline sano, la EC2 se apaga **apenas termina el último job** (mucho
+antes de las 22:00) y solo pagás las horas que realmente usaste; el cron es el respaldo para el caso
+patológico.
+
+**d) IAM (ya aplicado en la guía).** El rol de la EC2 tiene `lambda:InvokeFunction` sobre el ARN de
+`pyspark-stack-startstop` (§6.4, para que `trigger_stop` la invoque); y la Lambda `startstop` tiene
+`ssm:SendCommand` + `ssm:GetCommandInvocation` sobre la instancia (§5.4, para el chequeo de DAGs
+antes de apagar).
+
+> Resultado: apagado **por evento** (fin de los jobs), no por reloj — con la red de seguridad del
+> cron por si algo cuelga. Es exactamente el "se apaga solo al terminar" del loop de §10.2.
+
 ---
 
 ## 11. CI/CD con GitHub Actions (OIDC, sin claves)
 
-Dos workflows: **CI** (valida en cada PR) y **Deploy** (al mergear a `main`). GitHub Actions
-asume un rol IAM vía **OIDC** — sin access keys guardadas en el repo.
+Dos workflows **reales**, ya versionados en el repo: `.github/workflows/ci.yml` (valida en cada
+PR/push) y `.github/workflows/deploy.yml` (despliega al mergear a `main`). No son copy-paste
+ilustrativo: es la pipeline **DataOps** que corre de verdad. GitHub Actions asume un rol IAM vía
+**OIDC** — sin access keys guardadas en el repo.
+
+- **CI** (`ci.yml`): `ruff` (lint + format), **validación de DAGs** con
+  `pytest tests/test_dag_integrity.py` sobre el `DagBag` (cero import errors), **security scan** con
+  gitleaks, y `terraform validate` condicional (solo si tocaste `infra/`). No toca AWS — corre en
+  todo PR sin credenciales.
+- **CD** (`deploy.yml`): autentica por OIDC (`configure-aws-credentials`), hace `aws s3 sync` de
+  `dags/` → `deploy/dags/` y de `spark-apps/emr/` → `emr/`, dispara el **SSM sync-down** en la EC2 y
+  corre un **smoke test**. Va con `environment: production` para el **gate de aprobación** manual.
+
+**Variables de repo a setear** (Settings → Secrets and variables → Actions → *Variables*, no
+secrets): `AWS_DEPLOY_ROLE_ARN` (el output del rol de abajo), `AWS_REGION` y `ARTIFACTS_BUCKET`
+(`pyspark-stack-artifacts-<account-id>`).
 
 ### 11.1 Terraform: OIDC provider + rol — `infra/prod/cicd.tf`
 
 ```hcl
-# GitHub Actions asume este rol vía OIDC. Puede: subir a S3, disparar el pull en la EC2 (SSM)
-# y correr `terraform plan` (ReadOnly + state). El `apply` queda manual/local.
+# GitHub Actions (deploy.yml) asume este rol vía OIDC. Puede: subir a S3 (deploy/dags/ + emr/),
+# disparar el sync-down en la EC2 (SSM) y —opcional— leer el state para `terraform plan`. El
+# `apply` queda manual/local. El ARN se guarda como VARIABLE de repo AWS_DEPLOY_ROLE_ARN.
 
 variable "github_repo" {
   description = "Repo autorizado, formato 'org/repo'"
@@ -2065,10 +2501,20 @@ resource "aws_iam_role" "github_actions" {
 }
 
 data "aws_iam_policy_document" "github_deploy" {
+  # ListBucket sobre el bucket; escritura scopeada a los dos prefijos que toca el CD:
+  # deploy/ (DAGs que baja la EC2) y emr/ (entrypoints que EMR Serverless toma directo de S3).
   statement {
-    sid       = "S3DeployArtifacts"
-    actions   = ["s3:PutObject", "s3:DeleteObject", "s3:GetObject", "s3:ListBucket"]
-    resources = [aws_s3_bucket.artifacts.arn, "${aws_s3_bucket.artifacts.arn}/*"]
+    sid       = "S3ListArtifacts"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.artifacts.arn]
+  }
+  statement {
+    sid     = "S3DeployObjects"
+    actions = ["s3:PutObject", "s3:DeleteObject", "s3:GetObject"]
+    resources = [
+      "${aws_s3_bucket.artifacts.arn}/deploy/*",
+      "${aws_s3_bucket.artifacts.arn}/emr/*",
+    ]
   }
   statement {
     sid     = "SsmDeploy"
@@ -2122,11 +2568,12 @@ output "github_actions_role_arn" {
 2. **IAM → Roles → Create role** → *Trusted entity*: **Web identity** → elegí ese provider y
    audience `sts.amazonaws.com`; en *GitHub organization/repository/branch* restringí a tu
    `org/repo` y branch `main` (equivale a la condición `sub = repo:org/repo:ref:refs/heads/main`).
-3. Permisos: inline policy JSON con los statements del Terraform (S3 artifacts, `ssm:SendCommand`
-   a tu instancia, lectura de tfstate/lock) y, si querés `terraform plan` en CI, adjuntá también
-   la managed **`ReadOnlyAccess`**.
+3. Permisos: inline policy JSON con los statements del Terraform (`s3:PutObject`/`DeleteObject`/
+   `GetObject` sobre `deploy/*` y `emr/*` del bucket de artifacts, `s3:ListBucket` sobre el bucket,
+   `ssm:SendCommand` a tu instancia, y —opcional— lectura de tfstate/lock + `ReadOnlyAccess`).
 4. Nombre `pyspark-stack-github-actions` → copiá el **ARN del rol** y guardalo en GitHub como
-   secret **`AWS_ROLE_ARN`** (Settings → Secrets and variables → Actions).
+   **variable** (no secret) **`AWS_DEPLOY_ROLE_ARN`** (Settings → Secrets and variables → Actions →
+   *Variables*). Creá también las variables **`AWS_REGION`** y **`ARTIFACTS_BUCKET`**.
 
 </details>
 
@@ -2135,159 +2582,381 @@ output "github_actions_role_arn" {
 > tls = { source = "hashicorp/tls", version = "~> 4.0" }
 > ```
 
-Tras `terraform apply`, copiá el output `github_actions_role_arn` y guardalo como **secret**
-`AWS_ROLE_ARN` en GitHub (Settings → Secrets and variables → Actions).
+Tras `terraform apply`, copiá el output `github_actions_role_arn` y guardalo como **variable**
+`AWS_DEPLOY_ROLE_ARN` en GitHub (Settings → Secrets and variables → Actions → *Variables*), junto con
+`AWS_REGION` y `ARTIFACTS_BUCKET`.
 
 ### 11.2 Workflow de CI — `.github/workflows/ci.yml`
 
+El que corre en el repo. Tres jobs independientes: calidad de código + DAGs, security scan y
+Terraform. No usa credenciales AWS (todo local al runner).
+
 ```yaml
+# .github/workflows/ci.yml
 name: CI
+
 on:
   pull_request:
   push:
-    branches: [main]
+    branches-ignore:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint-dags:
+  lint:
+    name: Lint (ruff)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
-      - name: Ruff (estilo/errores)
-        # advisory: no bloquea el pipeline; quitá '|| true' para hacerlo bloqueante
-        run: ruff check dags/ spark-apps/ || true
-      - name: Compilar DAGs (sintaxis)
-        run: python -m compileall -q dags/
+          cache: pip
+      - name: Instalar ruff
+        run: pip install ruff==0.14.3
+      - name: Ruff check
+        run: ruff check .
+      - name: Ruff format (check)
+        run: ruff format --check .
 
-  terraform:
+  dag-validate:
+    name: Validar DAGs (Airflow 3.2.2)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
         with:
-          terraform_version: "1.9.0"
-      - run: terraform -chdir=infra/prod fmt -check -recursive
-      - name: Init (sin backend) + validate
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar Airflow 3.2.2 + providers (con constraints)
+        env:
+          CONSTRAINTS: "https://raw.githubusercontent.com/apache/airflow/constraints-3.2.2/constraints-3.12.txt"
         run: |
-          terraform -chdir=infra/prod init -backend=false -input=false
-          terraform -chdir=infra/prod validate
+          python -m pip install --upgrade pip
+          pip install "apache-airflow==3.2.2" --constraint "${CONSTRAINTS}"
+          pip install \
+            "apache-airflow-providers-amazon==9.29.0" \
+            "apache-airflow-providers-apache-spark==6.0.2" \
+            pytest
+      - name: Pytest (integridad de DAGs)
+        run: pytest tests/ -q
+
+  security:
+    name: Seguridad (gitleaks + IaC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks (secret scan)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: checkov (IaC scan de Terraform)
+        if: hashFiles('infra/**/*.tf') != ''
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra/
+          framework: terraform
+          quiet: true
+          soft_fail: false
+
+  terraform-validate:
+    name: Terraform validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: hashFiles('infra/**/*.tf') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+        working-directory: infra
+      - name: terraform init (sin backend)
+        run: terraform init -backend=false
+        working-directory: infra
+      - name: terraform validate
+        run: terraform validate
+        working-directory: infra
 ```
+
+> La validación de DAGs necesita Airflow instalado en el runner para construir el `DagBag`; el
+> `conftest.py` de `tests/` prepara el entorno (setea las env vars de Airflow **antes** de importarlo).
+> El test recorre `dags/` y afirma `dag_bag.import_errors == {}`, así un `EmrServerlessStartJobOperator`
+> mal escrito o una Variable inexistente rompen el PR antes de llegar a `main`.
+
+El job `dag-validate` corre `pytest tests/`, así que estos dos archivos de test tienen que existir en
+el repo. `tests/conftest.py` — setea las env vars de Airflow **antes** de importarlo (si no, Airflow
+crea su config con defaults y el `DagBag` no parsea limpio):
+
+```python
+"""Config global de pytest para validar los DAGs en CI (setea env vars ANTES de importar airflow)."""
+import os
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DAGS_FOLDER = REPO_ROOT / "dags"
+_AIRFLOW_HOME = tempfile.mkdtemp(prefix="airflow_ci_")
+
+os.environ.setdefault("AIRFLOW_HOME", _AIRFLOW_HOME)
+os.environ.setdefault("AIRFLOW__CORE__UNIT_TEST_MODE", "True")
+os.environ.setdefault("AIRFLOW__CORE__LOAD_EXAMPLES", "False")
+os.environ.setdefault("AIRFLOW__CORE__DAGS_FOLDER", str(DAGS_FOLDER))
+```
+
+`tests/test_dag_integrity.py` — el gate real: parseo sin import errors + estándares mínimos
+(tags/owner/retries). Los DAGs de dev local previos al CI están *grandfathered* solo para los
+estándares; la integridad estructural se les exige igual:
+
+```python
+"""Integridad de los DAGs (gate del job dag-validate): parseo + estándares mínimos."""
+from pathlib import Path
+
+import pytest
+from airflow.models import DagBag
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DAGS_FOLDER = REPO_ROOT / "dags"
+
+# DAGs de dev local previos al CI: grandfathered SOLO para estándares (tags/owner/retries).
+# La integridad estructural (import_errors, ciclos) SÍ se les exige. DAGs nuevos: no agregar acá.
+LEGACY_DAGS_GRANDFATHERED = {
+    "customer_etl_dag",
+    "spark_wordcount_trigger",
+    "spark_wordcount_trigger_hdfs",
+}
+
+
+@pytest.fixture(scope="session")
+def dagbag() -> DagBag:
+    return DagBag(dag_folder=str(DAGS_FOLDER), include_examples=False)
+
+
+def test_no_import_errors(dagbag: DagBag) -> None:
+    if dagbag.import_errors:
+        detalle = "\n".join(f"  - {f}: {e.strip().splitlines()[-1]}" for f, e in dagbag.import_errors.items())
+        pytest.fail(f"DAGs que no parsean:\n{detalle}")
+
+
+def test_dagbag_no_vacio(dagbag: DagBag) -> None:
+    assert dagbag.dags, f"No se cargó ningún DAG desde {DAGS_FOLDER}"
+
+
+@pytest.mark.parametrize("atributo", ["tags", "owner", "retries"])
+def test_estandares_minimos(dagbag: DagBag, atributo: str) -> None:
+    incumplen = []
+    for dag_id, dag in dagbag.dags.items():
+        if dag_id in LEGACY_DAGS_GRANDFATHERED:
+            continue
+        if atributo == "tags" and not getattr(dag, "tags", None):
+            incumplen.append(dag_id)
+        elif atributo == "owner" and not (getattr(dag, "owner", "") or "").strip():
+            incumplen.append(dag_id)
+        elif atributo == "retries" and "retries" not in (getattr(dag, "default_args", None) or {}):
+            incumplen.append(dag_id)
+    assert not incumplen, f"DAG(s) sin '{atributo}': {', '.join(sorted(incumplen))}"
+```
+
+Y el tooling que hace consistente el lint entre tu máquina y el CI. `ruff.toml` — un solo config de
+ruff; el legacy dev-local queda excluido y el código **nuevo** (`tests/`, `dags/` nuevos,
+`spark-apps/emr/`) sí se lintea:
+
+```toml
+target-version = "py312"
+line-length = 100
+
+# Legacy dev-local y artefactos quedan fuera; el código NUEVO (tests/, dags/ nuevos,
+# spark-apps/emr/) SÍ se lintea.
+extend-exclude = [
+    "spark-events", "**/notebook-output", "**/output", "__pycache__", ".ipynb_checkpoints",
+    "**/.terraform", "notebooks",
+    "spark-apps/scripts", "spark-apps/customer_etl", "spark-apps/sales_etl",
+    "spark-apps/project1", "spark-apps/cron", "spark-apps/wordcount.py", "spark-apps/wordcount_hdfs.py",
+    "dags/customer_etl_dag.py", "dags/spark_trigger_dag.py", "dags/spark_trigger_hdfs_dag.py",
+]
+
+[lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[lint.isort]
+known-first-party = ["dags", "tests"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+```
+
+`.pre-commit-config.yaml` — corré los mismos checks localmente antes de pushear (ruff, higiene de
+archivos, gitleaks), así el PR no rebota en CI:
+
+```yaml
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.3
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+```
+
+`Makefile` — atajos para los mismos comandos que corre el CI (`make lint`, `make test`,
+`make fmt`, `make precommit`):
+
+```makefile
+.DEFAULT_GOAL := help
+.PHONY: help lint fmt test precommit
+
+help:  ## Muestra esta ayuda
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+
+lint:  ## ruff check + format --check (no modifica)
+	ruff check .
+	ruff format --check .
+
+fmt:  ## Formatea in-place
+	ruff format .
+	ruff check --fix .
+
+test:  ## Valida que los DAGs parsean y cumplen estándares
+	pytest tests/ -q
+
+precommit:  ## Corre todos los hooks
+	pre-commit run --all-files
+```
+
+> Verificá: `make lint && make test` en local reproduce los jobs `lint` y `dag-validate` del CI
+> (ruff pasa, pytest 6/6). Con `pre-commit install`, los hooks corren en cada commit.
 
 ### 11.3 Workflow de Deploy — `.github/workflows/deploy.yml`
 
+El que corre en el repo. Solo se dispara si cambiaron `dags/` o `spark-apps/emr/` (el código que
+despliega); usa las **variables de repo** `AWS_DEPLOY_ROLE_ARN`, `AWS_REGION`, `ARTIFACTS_BUCKET`, y
+va detrás de `environment: production` (gate de aprobación).
+
 ```yaml
+# .github/workflows/deploy.yml
 name: Deploy
 on:
   push:
     branches: [main]
     paths:
       - "dags/**"
-      - "spark-apps/**"
-      - "notebooks/**"
-      - "monitoring/**"
-      - "docker-compose*.yml"
+      - "spark-apps/emr/**"
 
 permissions:
   id-token: write   # requerido para OIDC
   contents: read
 
-env:
-  AWS_REGION: us-east-1   # ajustala si cambiaste var.aws_region
-  INSTANCE_TAG_NAME: pyspark-stack-node
-  PROJECT_DIR: /home/ec2-user/pyspark_stack
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: production   # gate de aprobación manual (GitHub Environments)
     steps:
       - uses: actions/checkout@v4
 
       - name: Autenticar en AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Resolver bucket e instancia
+      - name: Sync a S3 (DAGs → deploy/dags/, entrypoints → emr/)
+        run: |
+          B=${{ vars.ARTIFACTS_BUCKET }}
+          aws s3 sync dags/           s3://$B/deploy/dags/ --delete --exclude '__pycache__/*'
+          # Entrypoints PySpark → emr/: EMR Serverless los toma directo de S3 en cada StartJobRun (§6.4).
+          aws s3 sync spark-apps/emr/ s3://$B/emr/         --delete --exclude '__pycache__/*'
+
+      - name: Resolver instancia
         id: res
         run: |
-          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-          echo "bucket=pyspark-stack-artifacts-$ACCOUNT" >> "$GITHUB_OUTPUT"
-          INSTANCE=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=${INSTANCE_TAG_NAME}" \
+          I=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=pyspark-stack-node" \
                       "Name=instance-state-name,Values=running" \
             --query 'Reservations[0].Instances[0].InstanceId' --output text)
-          echo "instance=$INSTANCE" >> "$GITHUB_OUTPUT"
+          echo "instance=$I" >> "$GITHUB_OUTPUT"
 
-      - name: Sync a S3 (fuente de verdad del deploy)
+      - name: Sync-down + smoke en la EC2 vía SSM
         run: |
-          B=${{ steps.res.outputs.bucket }}
-          aws s3 sync dags/       s3://$B/deploy/dags/       --delete --exclude '__pycache__/*'
-          aws s3 sync spark-apps/ s3://$B/deploy/spark-apps/ --delete
-          aws s3 sync notebooks/  s3://$B/deploy/notebooks/  --delete
-          aws s3 cp docker-compose.yml s3://$B/deploy/
-          # Entrypoints PySpark → emr/: EMR Serverless los toma directo de S3 en cada StartJobRun (§6.4).
-          # Así el código nuevo llega a EMR sin depender de la EC2 (que solo orquesta).
-          aws s3 sync spark-apps/ s3://$B/emr/ --delete --exclude '__pycache__/*'
-          # Paths opcionales (existen recién tras §12–§14): sin el guard, el job fallaría antes de crearlos
-          if [ -d monitoring ]; then aws s3 sync monitoring/ s3://$B/deploy/monitoring/ --delete; fi
-          if [ -f docker-compose.prod.yml ]; then aws s3 cp docker-compose.prod.yml s3://$B/deploy/; fi
-
-      - name: Pull en la EC2 (si está encendida) vía SSM
-        run: |
-          B=${{ steps.res.outputs.bucket }}
           I=${{ steps.res.outputs.instance }}
           if [ "$I" = "None" ] || [ -z "$I" ]; then
-            echo "EC2 apagada: el deploy quedó en S3. No se aplica solo: al encenderla, corré"
-            echo "a mano el bloque de comandos de abajo (el mismo pull), o esperá el próximo push."
+            echo "EC2 apagada: el deploy quedó en S3 (deploy/dags/ + emr/); se aplica al encenderla."
             exit 0
           fi
+          B=${{ vars.ARTIFACTS_BUCKET }}
           CMD=$(aws ssm send-command --instance-ids "$I" \
-            --document-name AWS-RunShellScript --comment "deploy from GitHub Actions" \
+            --document-name AWS-RunShellScript --comment "deploy sync-down + smoke" \
             --parameters commands="[\
-              \"cd ${PROJECT_DIR}\",\
+              \"cd /home/ec2-user/pyspark_stack\",\
               \"aws s3 sync s3://$B/deploy/dags/ dags/ --delete\",\
-              \"aws s3 sync s3://$B/deploy/spark-apps/ spark-apps/ --delete\",\
-              \"aws s3 sync s3://$B/deploy/notebooks/ notebooks/ --delete\",\
-              \"aws s3 sync s3://$B/deploy/monitoring/ monitoring/ --delete --exclude 'alertmanager/alertmanager.yml'\",\
-              \"aws s3 cp s3://$B/deploy/docker-compose.yml docker-compose.yml\",\
-              \"aws s3 cp s3://$B/deploy/docker-compose.prod.yml docker-compose.prod.yml\"\
+              \"docker compose exec -T airflow-dag-processor airflow dags reserialize\",\
+              \"docker compose exec -T airflow-scheduler airflow dags list-import-errors\"\
             ]" --query 'Command.CommandId' --output text)
-          # `wait` sale con error tanto si el comando falló como si expiró, así que el `|| true`
-          # es solo para no cortar ahí; la assertion real del job es el Status de la invocación:
+          # `wait` sale con error si el comando falló o expiró; la assertion real es el Status +
+          # que list-import-errors venga vacío (si imprime un .py, el deploy rompió un DAG).
           aws ssm wait command-executed --command-id "$CMD" --instance-id "$I" || true
-          STATUS=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$I" \
-            --query 'Status' --output text)
-          aws ssm get-command-invocation --command-id "$CMD" --instance-id "$I" \
-            --query 'StandardOutputContent' --output text
-          if [ "$STATUS" != "Success" ]; then
-            echo "Pull en la EC2 falló (Status=$STATUS). Stderr:"
-            aws ssm get-command-invocation --command-id "$CMD" --instance-id "$I" \
-              --query 'StandardErrorContent' --output text
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$I" --query 'Status' --output text)
+          OUT=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$I" --query 'StandardOutputContent' --output text)
+          echo "$OUT"
+          if [ "$STATUS" != "Success" ] || echo "$OUT" | grep -q '\.py'; then
+            echo "Deploy/smoke falló (Status=$STATUS o hay import errors)"
+            aws ssm get-command-invocation --command-id "$CMD" --instance-id "$I" --query 'StandardErrorContent' --output text
             exit 1
           fi
 ```
 
-> Dos detalles del pull: (1) `monitoring/alertmanager/alertmanager.yml` se excluye del sync
-> porque no está en git (contiene el SMTP password, §12.4) y el `--delete` lo borraría de la EC2,
-> donde se crea a mano. (2) Los DAGs/scripts se recargan solos, pero un cambio en los compose
-> o en `monitoring/` recién aplica al siguiente
-> `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` en la EC2.
+> Tres detalles: (1) el CD solo mueve **código** (DAGs + entrypoints EMR); cambios de
+> `monitoring/`, los compose o `requirements.txt` van por el rsync completo de §5.5 + un
+> `docker compose ... up -d` en la EC2, no por este workflow. (2) El `entryPoint` de los jobs sale
+> directo de `s3://<artifacts>/emr/` — EMR lo lee en cada `StartJobRun` sin depender de la EC2. (3)
+> El smoke test corre en la propia EC2 (`airflow dags list-import-errors`): si el deploy rompió un
+> DAG, el job de Actions falla en rojo.
 
 ### 11.4 Puesta en marcha (una vez)
 
 1. Ajustá `github_repo` en `cicd.tf` a tu `org/repo` (o pasalo con `-var 'github_repo=...'`).
 2. `terraform -chdir=infra/prod init -upgrade` (incorpora el nuevo provider `tls`) y luego
    `terraform -chdir=infra/prod apply` → copiá `github_actions_role_arn`.
-3. GitHub → Settings → Secrets → Actions → crear **`AWS_ROLE_ARN`** con ese ARN.
-4. El workflow **Deploy** quedará **verde** recién cuando completes §12–§14 y commitees
-   `monitoring/` y `docker-compose.prod.yml` (el pull en la EC2 copia esos archivos y falla si
-   no están en S3). Hacé el primer `git push` a `main` después de eso — o probá el OIDC en frío
-   con un workflow `workflow_dispatch` que solo corra `aws sts get-caller-identity`. Los PRs
-   disparan **CI** (lint + terraform validate).
+3. GitHub → Settings → Secrets and variables → Actions → *Variables* → crear **`AWS_DEPLOY_ROLE_ARN`**
+   (ese ARN), **`AWS_REGION`** y **`ARTIFACTS_BUCKET`** (`pyspark-stack-artifacts-<account-id>`).
+4. GitHub → Settings → Environments → crear **`production`** con *Required reviewers* (el gate de
+   aprobación que exige `environment: production` en `deploy.yml`).
+5. El **CD** corre bien apenas la EC2 está **encendida** con el proyecto en
+   `/home/ec2-user/pyspark_stack` (el sync-down baja los DAGs y corre el smoke); si está apagada, el
+   deploy queda en S3 y se aplica en el próximo encendido. Hacé el primer `git push` a `main` que
+   toque `dags/` o `spark-apps/emr/` — o probá el OIDC en frío con un `workflow_dispatch` que solo
+   corra `aws sts get-caller-identity`. Los PRs disparan **CI** (ruff + validación de DAGs + gitleaks
+   + terraform validate).
 
 > Seguridad: el rol solo lo puede asumir tu repo (condición `sub = repo:org/repo:*`), no hay
 > claves de larga vida, y el deploy usa SSM (no expone SSH en CI). El `terraform apply` queda
@@ -2922,6 +3591,9 @@ ACCT=$(aws sts get-caller-identity --query Account --output text --region "$REGI
 EMR_APP_ID=$(aws emr-serverless list-applications --region "$REGION" \
   --query "applications[?name=='pyspark-stack-spark'].id | [0]" --output text)
 EMR_JOB_ROLE_ARN="arn:aws:iam::${ACCT}:role/pyspark-stack-emr-serverless-job"
+# Nombres de bucket → Airflow Variables datalake/artifacts que leen los DAGs EMR (§10.2).
+DATALAKE_BUCKET="pyspark-stack-datalake-${ACCT}"
+ARTIFACTS_BUCKET="pyspark-stack-artifacts-${ACCT}"
 
 cat > .env <<EOF
 POSTGRES_USER=airflow
@@ -2934,9 +3606,11 @@ JUPYTER_TOKEN=$(get jupyter_token)
 GRAFANA_ADMIN_PASSWORD=$(get grafana_admin_password)
 EMR_APP_ID=${EMR_APP_ID}
 EMR_JOB_ROLE_ARN=${EMR_JOB_ROLE_ARN}
+DATALAKE_BUCKET=${DATALAKE_BUCKET}
+ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET}
 EOF
 chmod 600 .env
-echo ".env generado desde SSM (+ EMR app id / job role arn)"
+echo ".env generado desde SSM (+ EMR app id / job role arn + buckets datalake/artifacts)"
 ```
 
 Tras crearlo: `chmod +x scripts/load-secrets.sh`.
@@ -3158,6 +3832,10 @@ x-airflow-env: &airflow-env
   # {{ var.value.emr_job_role_arn }}, §9.0). Completá con `terraform output` tras el apply de §6.4.
   AIRFLOW_VAR_EMR_APP_ID: "${EMR_APP_ID}"
   AIRFLOW_VAR_EMR_JOB_ROLE_ARN: "${EMR_JOB_ROLE_ARN}"
+  # Buckets como Airflow Variables datalake/artifacts: los DAGs EMR reales arman con ellas el
+  # entryPoint (s3://<artifacts>/emr/customer_etl.py) y los args ([datalake, "{{ ds }}"]) (§10.2).
+  AIRFLOW_VAR_DATALAKE: "${DATALAKE_BUCKET}"
+  AIRFLOW_VAR_ARTIFACTS: "${ARTIFACTS_BUCKET}"
   AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
   AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30" # detecta archivos DAG nuevos en ~30s (§10)
 
@@ -3377,16 +4055,16 @@ IP=$(terraform -chdir=infra/prod output -raw public_ip)
 rsync -avz --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
   -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@$IP:/home/ec2-user/pyspark_stack/
 ACCT=$(aws sts get-caller-identity --query Account --output text)
-aws s3 sync spark-apps/ "s3://pyspark-stack-artifacts-$ACCT/emr/" --exclude '__pycache__/*'  # o el CI/CD (§11.3)
+aws s3 sync spark-apps/emr/ "s3://pyspark-stack-artifacts-$ACCT/emr/" --exclude '__pycache__/*'  # o el CI/CD (§11.3)
 
 # 3. En la EC2: crear monitoring/alertmanager/alertmanager.yml (§12.4) con el app password
 #    real de Gmail — no está en git (.gitignore, §13.5).
 
 # 4. Generar el .env desde SSM y verificarlo:
 ./scripts/load-secrets.sh
-wc -l .env    # 10 variables (8 secretos + EMR_APP_ID + EMR_JOB_ROLE_ARN)
+wc -l .env    # 12 variables (8 base + EMR_APP_ID + EMR_JOB_ROLE_ARN + DATALAKE_BUCKET + ARTIFACTS_BUCKET)
 ls -l .env    # -rw------- (chmod 600); ningún valor default de dev adentro
-grep -E 'EMR_APP_ID|EMR_JOB_ROLE_ARN' .env   # deben tener valor (alimentan las Airflow Variables)
+grep -E 'EMR_APP_ID|EMR_JOB_ROLE_ARN|DATALAKE_BUCKET|ARTIFACTS_BUCKET' .env   # con valor (alimentan las Airflow Variables)
 
 # 5. Validar el merge de los compose ANTES de levantar:
 docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet   # sin salida = OK
@@ -3416,3 +4094,151 @@ aws lambda invoke --function-name pyspark-stack-startstop \
 
 Con esto el producto está en producción: infra reproducible, secretos gestionados, deploy por
 push, monitoreo con alertas y costo optimizado.
+
+---
+
+## 16. Athena — capa de consumo SQL/BI (opcional)
+
+**Opcional y marginal en costo** — no cambia los totales canónicos (~$35/mes con start/stop,
+~$83/mes 24/7 de §2). Athena consulta el data lake **con SQL puro, sin prender Spark ni un cluster**:
+paga solo por dato escaneado y escala a cero. Sirve para tres cosas concretas a esta escala:
+
+- Consultar `s3://<datalake>/analytics/` (y `curated/`) con SQL ad-hoc, sin levantar un job.
+- **BI**: enchufar QuickSight / Grafana / Metabase directo al lake, sin ETL extra a una base.
+- **Asserts de calidad** dentro de un DAG (un `SELECT count(*)` post-ETL barato, §más abajo).
+
+### 16.1 Tablas sin crawler: partition projection
+
+En vez de correr un **crawler de Glue** (que escanea S3 y cuesta), se declara la tabla una vez con
+**partition projection**: Athena **infiere** las particiones desde la ruta S3 (p. ej.
+`analytics/ventas/dt=YYYY-MM-DD/`) sin catalogarlas una por una. DDL (ejecutalo una vez en el
+workgroup de abajo):
+
+```sql
+CREATE EXTERNAL TABLE pyspark_stack_analytics.ventas (
+  pais  string,
+  monto double
+)
+PARTITIONED BY (dt string)
+STORED AS PARQUET
+LOCATION 's3://pyspark-stack-datalake-<acct>/analytics/ventas/'
+TBLPROPERTIES (
+  'projection.enabled'          = 'true',
+  'projection.dt.type'          = 'date',
+  'projection.dt.format'        = 'yyyy-MM-dd',
+  'projection.dt.range'         = '2026-01-01,NOW',
+  'projection.dt.interval'      = '1',
+  'projection.dt.interval.unit' = 'DAYS',
+  'storage.location.template'   = 's3://pyspark-stack-datalake-<acct>/analytics/ventas/dt=${dt}'
+);
+```
+
+Con esto, `WHERE dt = '2026-07-16'` escanea **solo** ese prefijo — sin `MSCK REPAIR` ni crawler.
+
+### 16.2 Terraform mínimo — workgroup + resultados
+
+Reusamos el bucket de **artifacts** con el prefijo `athena-results/` (podés usar uno nuevo si
+preferís aislar). `enforce_workgroup_configuration=true` obliga a que toda consulta use este bucket
+cifrado; los resultados son descartables → expiran a los 7 días.
+
+```hcl
+# infra/prod/athena.tf
+resource "aws_athena_workgroup" "analytics" {
+  name = "${var.name_prefix}-analytics"
+  configuration {
+    enforce_workgroup_configuration    = true   # obliga a usar ESTA config (bucket + cifrado)
+    publish_cloudwatch_metrics_enabled = true
+    result_configuration {
+      output_location = "s3://${aws_s3_bucket.artifacts.id}/athena-results/"
+      encryption_configuration { encryption_option = "SSE_S3" }
+    }
+  }
+}
+
+# Los resultados de consultas son descartables → expiran a los 7 días (mismo bucket artifacts).
+resource "aws_s3_bucket_lifecycle_configuration" "athena_results" {
+  bucket = aws_s3_bucket.artifacts.id
+  rule {
+    id     = "athena-results-expire"
+    status = "Enabled"
+    filter { prefix = "athena-results/" }
+    expiration { days = 7 }
+  }
+}
+
+# Base de datos en el Glue Data Catalog (catálogo lógico; las tablas usan projection, sin crawler).
+resource "aws_glue_catalog_database" "analytics" {
+  name = "${replace(var.name_prefix, "-", "_")}_analytics"   # Glue no admite '-' en el nombre
+}
+```
+
+### 16.3 IAM — permitir que un DAG consulte (rol de la EC2)
+
+Para que un `AthenaOperator` (en un DAG, corriendo bajo el rol de la EC2) ejecute queries:
+
+```hcl
+# infra/prod/iam.tf  (Athena para el rol de la EC2)
+data "aws_iam_policy_document" "ec2_athena" {
+  statement {
+    sid     = "AthenaQuery"
+    actions = ["athena:StartQueryExecution", "athena:GetQueryExecution",
+               "athena:GetQueryResults", "athena:StopQueryExecution"]
+    resources = ["arn:aws:athena:${local.region}:${local.account_id}:workgroup/${var.name_prefix}-analytics"]
+  }
+  statement {   # el catálogo Glue no admite ARN fino para estas lecturas
+    sid       = "GlueCatalogRead"
+    actions   = ["glue:GetTable", "glue:GetDatabase", "glue:GetPartitions"]
+    resources = ["*"]
+  }
+  statement {   # leer los datos del lake que Athena escanea
+    sid       = "AthenaDataRead"
+    actions   = ["s3:GetObject", "s3:ListBucket"]
+    resources = [aws_s3_bucket.datalake.arn, "${aws_s3_bucket.datalake.arn}/*"]
+  }
+  statement {   # escribir/leer los resultados de la consulta
+    sid       = "AthenaResults"
+    actions   = ["s3:GetObject", "s3:PutObject"]
+    resources = ["${aws_s3_bucket.artifacts.arn}/athena-results/*"]
+  }
+}
+resource "aws_iam_role_policy" "ec2_athena" {
+  name   = "ec2-athena"
+  role   = aws_iam_role.ec2.id
+  policy = data.aws_iam_policy_document.ec2_athena.json
+}
+```
+
+### 16.4 Uso en un DAG — assert de calidad post-ETL
+
+Después del job EMR que escribe `analytics/ventas/`, una task barata confirma que hay datos del día
+(el provider `apache-airflow-providers-amazon` trae el operator):
+
+```python
+from airflow.providers.amazon.aws.operators.athena import AthenaOperator
+
+assert_calidad = AthenaOperator(
+    task_id="assert_calidad",
+    query="SELECT count(*) AS filas FROM ventas WHERE dt = '{{ ds }}'",
+    database="pyspark_stack_analytics",
+    output_location="s3://{{ var.value.artifacts }}/athena-results/",
+    workgroup="pyspark-stack-analytics",
+)
+# encadenala tras el job EMR:  ... >> assert_calidad
+```
+
+### 16.5 Costo y cuándo (no) usarla
+
+Athena cobra **~$5 por TB escaneado**, con un **mínimo de 10 MB por consulta**. A esta escala
+(~2 GB/día, Parquet particionado que recorta lo escaneado) el gasto es **~$0/mes** — prácticamente
+ruido frente a la EC2 y EMR. Por eso queda **fuera de los totales canónicos** de §2: es una capa
+opcional que agregás si la necesitás.
+
+| Cuándo SÍ | Cuándo NO |
+|---|---|
+| Consumo **SQL/BI** ad-hoc del lake sin prender Spark | Si el único consumidor del `analytics/` es el **próximo job Spark** (leelo con `s3a://` directo — Athena no aporta) |
+| Dashboards (QuickSight/Grafana/Metabase) sobre `curated/`/`analytics/` | Transformaciones pesadas (joins/`groupBy` grandes) → eso es **EMR Serverless**, no Athena |
+| Asserts de calidad baratos dentro de un DAG | Consultas que escanean el lake entero sin partición (costo y latencia se disparan) |
+
+> Parquet + partition projection es lo que la hace barata: columnar (lee solo las columnas del
+> `SELECT`) y particionada (escanea solo los `dt` del `WHERE`). Sobre CSV sin particionar, Athena
+> escanea todo y el costo/latencia suben.
