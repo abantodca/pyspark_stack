@@ -22,6 +22,8 @@
 >
 > **Stack final:** Airflow 3.2.2 · Python 3.12 · Spark 4.0.3 · JDK 17 (Temurin) · Postgres 16.
 
+> **Nota de arquitectura (2026-07):** Este documento registra los fallos y la puesta a punto del stack **local** de desarrollo (HDFS + Spark standalone + Airflow). Desde entonces, la arquitectura de **producción** migró a un modelo **híbrido**: Airflow sigue orquestando, pero el cómputo Spark corre en **EMR Serverless** y el storage es **S3** (sin HDFS en prod). HDFS y el Spark standalone de este análisis son hoy el entorno de **desarrollo local**. Ver [docs/02](docs/02-produccion-aws.md) y [docs/03](docs/03-arquitectura.md).
+
 ---
 
 ## 1. Qué es el proyecto

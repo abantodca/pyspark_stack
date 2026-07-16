@@ -2,6 +2,8 @@
 
 Plataforma de datos local y reproducible: Airflow 3.2 + Spark 4.0.3 + HDFS + Jupyter, orquestada con Docker Compose. Incluye guías para llevarla a producción en AWS.
 
+La idea es simple: se desarrolla local (Spark + HDFS, stack completo) y se despliega a EMR Serverless. En producción la arquitectura es híbrida: Airflow sigue como orquestador en una EC2 chica (t3.large) + EMR Serverless para el cómputo Spark, con el data lake en S3 y sin HDFS. El "Arranque rápido" de abajo es siempre el stack local completo para desarrollar.
+
 ```
 Airflow 3.2 (5 procesos) + Postgres  →  orquestación
 Spark 4.0.3 (master + worker)        →  cómputo
@@ -42,8 +44,8 @@ docker compose -f docker-compose.dev.yml up -d --build
 ## Documentación
 
 - [docs/01 — Docker Compose explicado](docs/01-docker-compose-explicado.md): anatomía del stack, bloque por bloque, y refactor de producción.
-- [docs/02 — Producción en AWS](docs/02-produccion-aws.md): un solo camino (EC2 self-managed + S3 + Lambda/EventBridge) con Terraform, CI/CD, monitoreo, secretos y hardening. Todo el código es copy-paste.
-- [docs/03 — Arquitectura](docs/03-arquitectura.md): diagramas y flujos del mismo camino.
+- [docs/02 — Producción en AWS](docs/02-produccion-aws.md): un solo camino híbrido (Airflow en EC2 t3.large + EMR Serverless + S3, sin HDFS) con Terraform, CI/CD, monitoreo, secretos y hardening. Todo el código es copy-paste. Costo aproximado: ~$35/mes con auto start/stop o ~$83/mes 24/7 (a volumen real de 2 GB/día 3×/sem, ~$31/$79).
+- [docs/03 — Arquitectura](docs/03-arquitectura.md): diagramas y flujos del mismo camino híbrido.
 - [ANALISIS_FALLOS.md](ANALISIS_FALLOS.md): registro histórico de fallos del stack y sus fixes.
 
 ## Seguridad

@@ -4,11 +4,15 @@ Referencia conceptual del único camino de producción. El *cómo* (Terraform, c
 listos para copiar) está en la [guía 02](02-produccion-aws.md); este documento es el mapa y los
 flujos.
 
-Resumen: el stack (Airflow + Spark + HDFS + Jupyter) corre self-managed en una EC2 con Docker.
-Lo complementan servicios AWS serverless: S3 como data lake (`s3a://` con rol IAM) y
-Lambda + EventBridge para disparar DAGs por horario o por evento y para el auto start/stop.
-Monitoreo con Prometheus + Grafana + Alertmanager (métricas) y Loki + Promtail (logs). CI/CD con
-GitHub Actions + OIDC y secretos en SSM/Secrets Manager. No usa MWAA, EMR ni Glue.
+Resumen: arquitectura híbrida. Airflow corre self-managed en una EC2 chica (`t3.large`) con Docker
+como orquestador (Airflow + Postgres + monitoreo), y el cómputo Spark sale de la caja: corre en
+**EMR Serverless** (pago por uso, escala a cero). Ya no hay HDFS en producción — todo el dato vive
+en S3 (`s3a://` raw/curated/analytics) y EMR Serverless lo lee y escribe nativo. Lo complementan
+servicios AWS serverless: S3 como data lake (`s3a://` con rol IAM) y Lambda + EventBridge para
+disparar DAGs por horario o por evento y para el auto start/stop. Monitoreo con Prometheus +
+Grafana + Alertmanager (métricas) y Loki + Promtail (logs). CI/CD con GitHub Actions + OIDC y
+secretos en SSM/Secrets Manager. Usa EMR Serverless para el cómputo; no usa MWAA, EMR-on-EC2
+clásico ni Glue.
 
 ---
 
@@ -34,15 +38,20 @@ GitHub Actions + OIDC y secretos en SSM/Secrets Manager. No usa MWAA, EMR ni Glu
                                                 │  ec2 start/stop
                                                 ▼  (solo instancias tag=true)
 
-   ┌─ EC2 · m6i.xlarge · Elastic IP · docker compose ──────────────────────
+   ┌─ EC2 · t3.large · Elastic IP · docker compose ────────────────────────
    │
-   │   STACK                           MONITOREO
+   │   STACK (orquestador)             MONITOREO
    │   · Airflow (5) + Postgres        · Prometheus → Alertmanager → email
-   │   · Spark master + worker         · Grafana (dashboards)
-   │   · HDFS namenode + datanode      · node-exporter · cAdvisor · statsd
-   │   · Jupyter (solo dev)            · Promtail → Loki → Grafana (logs)
+   │   · Jupyter (solo dev)            · Grafana (dashboards)
+   │                                   · node-exporter · cAdvisor · statsd
+   │                                   · Promtail → Loki → Grafana (logs)
    └───────────────────────────────────────────────────────────────────────
-        │  s3a:// (rol IAM, sin keys)              [ /data = EBS gp3, local ]
+        │  StartJobRun (EmrServerlessStartJobOperator)   [ /data = EBS gp3, local ]
+        ▼
+   ┌─ EMR SERVERLESS (Spark) ───────────────────────────────
+   │   aplicación SPARK · pago por uso · escala a cero
+   └─────────────────────────────────────────────────────────
+        │  s3a:// (rol de ejecución least-privilege)
         ▼
    ┌─ S3 DATA LAKE ─────────────
    │   raw/   curated/   analytics/
@@ -72,11 +81,9 @@ flowchart TD
         lTrig["λ trigger-airflow"]
         lSS["λ startstop"]
 
-        subgraph EC2["EC2 m6i.xlarge · Elastic IP"]
+        subgraph EC2["EC2 t3.large · Elastic IP"]
             subgraph stack["docker compose (stack)"]
                 af["Airflow (5) + Postgres"]
-                sp["Spark master + worker"]
-                hd["HDFS namenode + datanode"]
                 jup["Jupyter (solo dev)"]
             end
             subgraph mon["docker compose (monitoreo)"]
@@ -88,6 +95,8 @@ flowchart TD
                 graf["Grafana"]
             end
         end
+
+        emrs["EMR Serverless (Spark)<br/>pago por uso · escala a cero"]
 
         subgraph S3["S3"]
             dl["data lake · raw/curated/analytics"]
@@ -107,8 +116,8 @@ flowchart TD
     dl -->|"ObjectCreated raw/"| lTrig
     lTrig -->|"SSM SendCommand"| af
     lSS -->|"start/stop · tag=true"| EC2
-    af -->|"spark-submit / papermill"| sp
-    sp -->|"s3a:// · rol IAM"| dl
+    af -->|"StartJobRun / EmrServerlessStartJobOperator"| emrs
+    emrs -->|"s3:// · rol de ejecución least-privilege"| dl
     exp --> prom
     prom --> am
     am --> mail
@@ -125,9 +134,9 @@ flowchart TD
 
 | Componente | Dónde vive | Rol |
 |---|---|---|
-| Airflow (5 procesos) + Postgres | EC2 / Docker | Orquestación |
-| Spark master + worker | EC2 / Docker | Cómputo |
-| HDFS namenode + datanode | EC2 / Docker | Storage local de trabajo |
+| Airflow (5 procesos) + Postgres | EC2 / Docker | Orquestación — dispara jobs Spark con `EmrServerlessStartJobOperator` |
+| EMR Serverless (aplicación Spark) | AWS | Cómputo Spark bajo demanda |
+| Rol de ejecución EMR Serverless | AWS | Permisos S3 del job (least-privilege) |
 | Jupyter | EC2 / Docker | Notebooks interactivos — bajo `profiles: ["dev"]`: en prod no arranca por defecto |
 | Notebooks + papermill | EC2 / Docker | Ejecución programada de `.ipynb` desde DAGs (requiere instalar el provider — guía 02 §9.1) |
 | Prometheus + Alertmanager + Grafana + Loki | EC2 / Docker | Métricas, alertas y logs |
@@ -162,10 +171,13 @@ bootstrap (S3+DynamoDB) → terraform apply (S3, EC2, IAM, Lambda, EventBridge, 
 Archivo llega a s3://datalake/raw/  →  S3 ObjectCreated
   → Lambda trigger-airflow  →  SSM SendCommand  →  EC2:
       docker exec airflow-scheduler airflow dags trigger <dag> --conf '{bucket,key}'
-  → DAG: spark-submit → Spark lee s3a://…/raw → transforma → escribe s3a://…/curated
+  → DAG: EmrServerlessStartJobOperator → EMR Serverless lee s3://…/raw → transforma
+      → escribe s3://…/curated  (EmrServerlessJobSensor espera el fin del job)
 ```
-> Los DAGs actuales lanzan Spark con `BashOperator` + `spark-submit`; `SparkSubmitOperator` es el
-> patrón objetivo descrito en la guía 02.
+> Los DAGs lanzan Spark con `EmrServerlessStartJobOperator`
+> (`airflow.providers.amazon.aws.operators.emr`) + `EmrServerlessJobSensor`, no con
+> `spark-submit` local ni `BashOperator`. El Terraform de la aplicación EMR Serverless y del rol de
+> ejecución está en la guía 02.
 >
 > Requiere la EC2 encendida: si está apagada por el auto start/stop (§3.5), el `SendCommand` no
 > ejecuta y el evento se pierde en silencio. Dispará dentro de la ventana de encendido; la alerta
@@ -179,9 +191,12 @@ EventBridge Scheduler (12:00 UTC, L-V — dentro de la ventana de encendido)
 
 ### 3.4 Monitoreo (métricas + logs)
 ```
-MÉTRICAS: node-exporter (host) · cAdvisor (contenedores) · statsd-exporter (Airflow) · Spark /metrics
+MÉTRICAS: node-exporter (host) · cAdvisor (contenedores) · statsd-exporter (Airflow)
   → Prometheus (scrape 15s)  → evalúa alerts.yml
-  → Alertmanager  → email (INFRA: TargetDown, disco lleno, memoria · NEGOCIO: DAG falló, ETL diario no corrió [dead-man switch])
+  → Alertmanager  → email (INFRA: TargetDown, disco lleno, memoria · NEGOCIO: DAG falló, ETL diario no corrió [dead-man switch], job de EMR Serverless FAILED)
+EMR SERVERLESS: métricas de job/aplicación vía CloudWatch · logs del driver/executors a
+  s3://artifacts/emr/logs/ y/o CloudWatch Logs · estado del job visible vía Airflow (EmrServerlessJobSensor)
+  · opcional: datasource CloudWatch en Grafana
 LOGS:     Promtail (todos los contenedores)  →  Loki
 Grafana ← Prometheus (métricas) + Loki (logs)   ·   dashboard "Overview" auto-provisionado
 ```
@@ -218,11 +233,22 @@ Notebook en ./notebooks (celda tag 'parameters')
   expone a internet: se acceden por túnel SSH.
 - **SSM Session Manager:** acceso e invocación de comandos (la Lambda dispara `airflow dags
   trigger`) sin abrir puertos ni exponer la API de Airflow.
-- **Credenciales S3:** Spark usa `s3a://` con el rol IAM de la EC2 (instance profile). No hay
-  access keys en disco.
+- **Credenciales S3:** ninguna capa usa access keys en disco. Airflow usa el rol IAM de la EC2
+  (instance profile) para operar S3 y disparar EMR Serverless; EMR Serverless usa su **propio rol
+  de ejecución** least-privilege (`s3a://`, sin keys).
 - **IAM least-privilege:** la Lambda de start/stop solo puede tocar instancias con
-  `AutoStartStop=true`; la de trigger solo `ssm:SendCommand` sobre esa instancia.
-- **S3:** buckets privados (`public_access_block`), cifrado en reposo, política solo-TLS.
+  `AutoStartStop=true`; la de trigger solo `ssm:SendCommand` sobre esa instancia. El rol de
+  ejecución del job EMR Serverless queda acotado a los ARNs exactos del datalake y de artifacts
+  (Get/Put/Delete + List/GetBucketLocation) + CloudWatch Logs, **sin Glue**. El rol de la EC2 gana
+  `emrserverless:StartJobRun/GetJobRun/StartApplication/GetApplication` scoped al ARN de la
+  aplicación, y `iam:PassRole` del rol del job restringido por condición
+  `iam:PassedToService = emr-serverless.amazonaws.com`.
+- **S3:** buckets privados (`public_access_block`), cifrado en reposo (SSE), política solo-TLS,
+  versionado. Un **S3 VPC Gateway Endpoint** (gratis) mantiene el tráfico EC2↔S3 y EMR
+  Serverless↔S3 dentro de la red de AWS, sin salir a internet.
+- **IMDSv2 + EBS:** metadata solo por IMDSv2 (`hop_limit` 2), volúmenes EBS cifrados, acceso al
+  host solo por SSM (SG abre únicamente `:22` desde tu IP).
+- **Logs de EMR Serverless:** cifrados y con retención definida (S3 y/o CloudWatch Logs).
 - **Estado Terraform:** cifrado y versionado en S3, lock en DynamoDB.
 
 ---
@@ -230,90 +256,66 @@ Notebook en ./notebooks (celda tag 'parameters')
 ## 5. Costo y capacidad de esta arquitectura (us-east-1)
 
 > Precios aproximados on-demand, sujetos a cambio — validá en
-> [calculator.aws](https://calculator.aws). Escenario base: ~1 h de Spark/día, ~50 GB en el lake.
+> [calculator.aws](https://calculator.aws). Escenario real: 2 GB/día, 3 corridas/semana (≈13/mes).
 
 Desglose (producción con auto start/stop, 8 h × 22 días laborales):
 
-| Item | Detalle | US$/mes |
+| Ítem | auto start/stop (8h×22d) | 24/7 |
 |---|---|---|
-| EC2 `m6i.xlarge` | 4 vCPU / 16 GB, encendida solo en horario | ~34 |
-| EBS gp3 root 40 GB | disco del SO | ~4 |
-| EBS gp3 data 50 GB | `/data` = HDFS + Postgres + Prometheus/Loki (gp3 crece online) | ~4 |
-| Snapshots EBS (DLM) | 7 días de retención de `/data` | ~2 |
-| S3 data lake | ~50 GB + requests (con lifecycle a IA/Glacier) | ~1.5 |
-| Elastic IP | gratis mientras está asociada a una instancia | ~0 |
-| Lambda + EventBridge + SSM | trigger-airflow + startstop (free tier) | ~0 |
-| Monitoreo (Prom/Grafana/Loki) | corre dentro de la misma EC2 | ~0 |
-| **Total** | | **~46/mes** |
+| EC2 `t3.large` (Airflow + Postgres + monitoreo) | ~$12 | ~$60 |
+| EMR Serverless (pago por uso, ~13 corridas/mes) | ~$9 | ~$9 |
+| EBS gp3 (root 40 + data 30) + snapshots DLM | ~$9 | ~$9 |
+| S3 data lake + requests | ~$1.5 | ~$1.5 |
+| IPv4 pública (EIP; AWS la cobra desde feb-2024, asociada o no) | ~$3.6 | ~$3.6 |
+| Lambda + EventBridge + SSM | ~$0 (free tier) | ~$0 (free tier) |
+| **TOTAL** | **~$35/mes** | **~$83/mes** |
 
-El tamaño de la EC2 lo manda la RAM de las JVMs + Airflow + monitoreo, no el dato (~50 MB es
-trivial). `m6i.xlarge` (16 GB) corre el stack completo; la familia `m6i` (CPU constante) evita que
-el rendimiento caiga tras cada apagado/encendido.
+Desglose itemizado de EBS: root 40 ~$4, data 30 ~$3, snapshots ~$2. La EC2 ya no dimensiona por la
+RAM de las JVMs de Spark (salieron a EMR Serverless): `t3.large` (2 vCPU / 8 GB) corre Airflow +
+Postgres + monitoreo, que están casi idle en CPU → la familia burstable `t3` es la elección
+correcta y más barata (antes se desaconsejaba `t3` porque las JVMs de Spark degradan en burstable
+tras el start/stop; con Spark fuera de la caja ese motivo desaparece).
 
-Escenarios de encendido — lo único que mueve la aguja es cuánto está prendida la EC2:
+> **Nota.** A tu volumen exacto, EMR Serverless ronda ~$5 → total real ~$31 (start/stop) / ~$79
+> (24/7). El auto start/stop ahora mueve **menos** la aguja que antes, porque desapareció la caja
+> siempre-encendida de Spark: la diferencia entre $35 y $83 es solo la EC2 chica de Airflow.
 
-| Escenario | Cómputo EC2 | Total aprox. |
-|---|---|---|
-| **Prod con auto start/stop** (8h×22d) | ~$34 | **~$46/mes** |
-| EC2 24/7 (sin apagar) | ~$140 | ~$152/mes |
-| Dev-lite (`t3.large`, solo Spark+Jupyter, `docker-compose.dev.yml`) | ~$12 | ~$17/mes |
-
-El auto start/stop (Lambda `startstop` + EventBridge) es la palanca principal: convierte ~$140
-fijos en ~$34. El resto (almacenamiento + serverless) es marginal y casi constante. El desglose
-ítem por ítem, con su Terraform, está en la [guía de producción](02-produccion-aws.md).
+El auto start/stop (Lambda `startstop` + EventBridge) sigue siendo una palanca, pero secundaria: el
+cómputo pesado ya es pago por uso en EMR Serverless (escala a cero) y no depende de que la EC2 esté
+prendida. El desglose ítem por ítem, con su Terraform, está en la
+[guía de producción](02-produccion-aws.md).
 
 ### Capacidad de procesamiento
 
-No hay un muro duro: Spark procesa por particiones y derrama a disco lo que no cabe en RAM, así
-que el límite no es un tope fijo sino velocidad + disco. Config de referencia: `m6i.xlarge`; el
-worker ofrece 3 GB / 2 cores con el `docker-compose.prod.yml` de la guía 02 — el compose base
-arranca el worker sin esos flags y ofrece todos los recursos del host; `/data` = 50 GB gp3
-compartido con HDFS.
+La capacidad ya no es responsabilidad de la EC2: **EMR Serverless autoescala los workers por job**.
+Para 2–5 GB alcanza una configuración chica, y maneja decenas o cientos de GB sin que redimensiones
+nada — el techo de costo se pone con `maximum_capacity` en la aplicación (cold start ~1–2 min por
+job, aceptable para ETL batch 3×/semana).
 
-| Tamaño por job | Comportamiento | Veredicto |
-|---|---|---|
-| hasta ~1–2 GB | todo en memoria, sin *spill* | ⚡ rápido, ideal |
-| ~2–20 GB | ETL normal (filtros, agregaciones, joins moderados); derrama algo | ✅ bien, minutos |
-| ~20–50 GB | funciona pero lento; *shuffle* pesado, solo 2 tareas en paralelo | ⚠️ tolerable sin apuro |
-| ~50–100 GB | solo si es ETL "narrow" (sin joins/groupBy grandes) | ⚠️ al filo |
-| > 100 GB | runtimes largos, presión de disco | ❌ escalar la máquina/cluster |
-
-El límite lo marca el tipo de operación más que el tamaño: las *narrow* (map, filter, `select`)
-escurren casi ilimitado; las *wide* (join, `groupBy`, `orderBy`, window) hacen *shuffle* y topan
-en memoria/disco. Con solo 2 cores el freno es tanto de tiempo como de capacidad. Referencia: un
-job de ~50 MB usa <0.1% de esta máquina (≈1000x de margen).
-
-Si necesitás 20–50 GB con normalidad (o más), escalá la instancia; el diseño no cambia, solo la
-variable `instance_type` en la guía de producción:
-
-| Instancia | vCPU / RAM | Rango cómodo por job | Costo* |
-|---|---|---|---|
-| `m6i.xlarge` (actual) | 4 / 16 GB | hasta ~20 GB | ~$34/mes |
-| `m6i.2xlarge` | 8 / 32 GB | ~20–50 GB con soltura, pico ~100 GB | ~$68/mes |
-| `r6i.2xlarge` (memory-optimized) | 8 / 64 GB | ~50–100 GB, ideal para joins/shuffles pesados | ~$90/mes |
-| `m6i.4xlarge` | 16 / 64 GB | ~100–200 GB | ~$135/mes |
-
-*Con auto start/stop (8h×22d). Al escalar, subí también lo que ofrece el worker de Spark
-(`--memory` / `--cores`, en la guía de producción). Para datos grandes recurrentes (>200 GB), un
-cluster multi-nodo rinde mejor que una sola máquina.
+Esto reemplaza la vieja tabla de "escalá `instance_type`" (`m6i.2xlarge` / `r6i.2xlarge` /
+`m6i.4xlarge`): con el cómputo en EMR Serverless no hay una sola máquina que redimensionar. Solo
+para **TB sostenidos** un cluster dedicado (EMR-on-EC2 multi-nodo) sigue ganando, pero eso está
+fuera del alcance de este proyecto.
 
 ---
 
 ## 6. Qué NO usa (y por qué)
 
-| Descartado | Motivo |
-|---|---|
-| **MWAA** | Airflow managed no escala a cero (~$350+/mes fijos): caro a esta escala |
-| **EMR (clásico)** | overkill para ~50 MB: fleet de EC2 + recargo ~25%, pensado para TB multi-nodo |
-| **EMR Serverless** | Spark self-managed en la misma EC2 ya paga; EMR Serverless conviene si el uso es bajo/esporádico (ver nota) |
-| **Glue Data Catalog** | El código usa `createOrReplaceTempView` (vistas temporales) — no hay tablas persistentes que catalogar |
-| **CloudWatch dashboards** | Monitoreo con Prometheus + Grafana (más portable y rico) |
+| Servicio | Decisión | Motivo |
+|---|---|---|
+| **EMR Serverless** | ✅ Adoptado | El uso es chico e infrecuente (3×/sem, ~2–5 GB): una EC2 siempre prendida solo para tener Spark vivo no se justificaba. Pago por uso + escala a cero encaja |
+| **MWAA** | ❌ No | Airflow managed no escala a cero (~$350+/mes fijos): caro a esta escala |
+| **EMR-on-EC2 (clásico)** | ❌ No | Fleet de EC2 + recargo, pensado para TB sostenidos / multi-nodo |
+| **Glue Data Catalog** | ❌ No | El código usa vistas temporales / Delta path-based — no hay tablas persistentes que catalogar |
+| **CloudWatch dashboards** | ❌ No (como viz primaria) | Monitoreo con Prometheus + Grafana (más portable y rico); CloudWatch se usa para métricas/logs de EMR Serverless |
+| **HDFS en prod** | ❌ No | Reemplazado por S3 (`s3a://`); EMR Serverless lee/escribe S3 nativo |
 
 No es un descarte dogmático: es un tradeoff con punto de cruce. Lo managed serverless (EMR
-Serverless, Glue Python Shell, Lambda, Athena, Step Functions) es más barato y con menos ops en
-uso bajo o esporádico; el self-managed gana cuando se consolidan varias cargas en la máquina ya
-paga y se valora control, portabilidad sin lock-in y aprendizaje. La comparación de costos,
-servicio por servicio y con punto de cruce, está en la
+Serverless, Glue Python Shell, Lambda, Athena) es más barato y con menos ops en uso bajo o
+esporádico; el self-managed gana cuando se consolidan varias cargas en una máquina ya paga y se
+valora control, portabilidad y aprendizaje. Para **este** workload (chico e infrecuente) la
+conclusión se inclina al pago por uso: por eso Spark pasó a EMR Serverless. La comparación de
+costos, servicio por servicio y con punto de cruce, está en la
 [guía de producción §2](02-produccion-aws.md#2-costo).
 
 ---
@@ -339,11 +341,13 @@ time-travel (rollback a versiones anteriores), MERGE/upsert (cargas incrementale
 reprocesar todo) y schema evolution.
 
 **Qué implica (3 piezas):** habilitar Delta/Iceberg en Spark vía `--packages` + configs, cambiar
-la escritura a formato de tabla y decidir el catálogo. Ejemplo mínimo, path-based (sin catálogo,
-sin Glue), sobre el `sales_etl`:
+la escritura a formato de tabla y decidir el catálogo. En producción estos `--packages` + configs
+se pasan como `sparkSubmitParameters` del job de EMR Serverless (mismo Spark, misma sintaxis).
+Ejemplo mínimo, path-based (sin catálogo, sin Glue), sobre el `sales_etl`:
 
 ```bash
-# 1) habilitar Delta en el spark-submit (Spark 4.0 → Scala 2.13; validá versión Delta compatible)
+# 1) habilitar Delta (mismos flags que van en sparkSubmitParameters del job EMR Serverless;
+#    Spark → Scala 2.13; validá versión Delta compatible)
 spark-submit --packages io.delta:delta-spark_2.13:4.0.0 \
   --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
   --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog  sales_etl_job.py
