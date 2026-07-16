@@ -24,6 +24,7 @@
    - 5.3 [EC2 + EBS + user_data](#53-ec2--ebs--user_data)
    - 5.4 [**Automatización: EventBridge + Lambda (auto start/stop)**](#54-automatización-eventbridge--lambda)
    - 5.5 [Desplegar, subir código y túnel SSH](#55-desplegar-subir-código-y-túnel-ssh)
+   - 5.6 [**Exponer la web de Airflow (HTTPS nativo, solo tu IP)**](#56-exponer-la-web-de-airflow-https-nativo-solo-tu-ip)
 6. [Data lake en S3 (s3a con rol IAM) + backups](#6-data-lake-en-s3)
    - 6.1 [Buckets S3 (data lake + artifacts)](#61-buckets-s3)
    - 6.2 [IAM: permitir s3a a la EC2 (sin keys)](#62-iam-permitir-s3a-a-la-ec2-sin-keys)
@@ -65,6 +66,10 @@
     - 14.2 [docker-compose.dev.yml (dev-lite 8 GB)](#142-docker-composedevyml-dev-lite-8-gb)
 15. [Puesta en producción — runbook final](#15-puesta-en-producción--runbook-final)
 16. [Athena — capa de consumo SQL/BI (opcional)](#16-athena--capa-de-consumo-sqlbi-opcional)
+17. [Airflow, 3 sabores: ejemplo + monitoreo de cada uno](#17-airflow-3-sabores-ejemplo--monitoreo-de-cada-uno)
+    - 17.1 [Python puro (en la EC2)](#171-python-puro-en-la-ec2)
+    - 17.2 [PySpark en EMR Serverless](#172-pyspark-en-emr-serverless)
+    - 17.3 [SQL con Athena](#173-sql-con-athena)
 
 ---
 
@@ -302,8 +307,10 @@ aws dynamodb describe-table --table-name pyspark-stack-tf-lock --query 'Table.Ta
 
 ## 5. Núcleo: EC2 con Docker
 
-Una EC2 corre el `docker-compose` completo (idéntico al local). Acceso **solo por túnel SSH**;
-ninguna UI expuesta a internet. Es el corazón del stack; las dos secciones siguientes le agregan el
+Una EC2 corre el `docker-compose` completo (idéntico al local). Acceso por **túnel SSH** para todo,
+más una **excepción explícita**: la web de Airflow se publica por **HTTPS (443) restringida a tu IP**
+(§5.6), para poder seguir los DAGs desde el navegador sin túnel. Grafana/Prometheus/Loki/Jupyter
+siguen **solo por túnel**. Es el corazón del stack; las dos secciones siguientes le agregan el
 data lake S3 y el disparo automático de los DAGs.
 
 ### 5.1 Variables y red
@@ -341,12 +348,28 @@ variable "data_volume_gb" {
   default = 30
 }
 variable "my_ip_cidr" {
-  description = "Tu IP /32 (única fuente de SSH). curl -s https://checkip.amazonaws.com"
+  description = "Tu IP /32 (única fuente de SSH y de la web de Airflow). curl -s https://checkip.amazonaws.com"
   type        = string
 }
 variable "ssh_public_key" {
   description = "Contenido de ~/.ssh/pyspark_stack.pub"
   type        = string
+}
+# --- Web de Airflow por HTTPS (§5.6). Dejá airflow_domain = "" para NO exponer nada (solo túnel). ---
+variable "airflow_domain" {
+  description = "FQDN de la web de Airflow, p.ej. airflow.midominio.com. Vacío = no exponer (solo túnel SSH)."
+  type        = string
+  default     = ""
+}
+variable "dns_zone" {
+  description = "Hosted zone de Route 53 donde vive airflow_domain, p.ej. midominio.com (sin punto final)."
+  type        = string
+  default     = ""
+}
+variable "letsencrypt_email" {
+  description = "Email para el registro de Let's Encrypt (avisos de expiración del cert)."
+  type        = string
+  default     = ""
 }
 # Horarios de auto start/stop (UTC). Ajustá a tu zona.
 variable "start_cron" {
@@ -385,7 +408,7 @@ data "aws_subnets" "default" {
 
 resource "aws_security_group" "pyspark" {
   name        = "${var.name_prefix}-sg"
-  description = "SSH-only desde mi IP. UIs por tunel."
+  description = "SSH desde mi IP. Web de Airflow (443) desde mi IP si airflow_domain != ''. Resto por tunel."
   vpc_id      = data.aws_vpc.default.id
   ingress {
     description = "SSH desde mi IP"
@@ -393,6 +416,18 @@ resource "aws_security_group" "pyspark" {
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = [var.my_ip_cidr]
+  }
+  # HTTPS de Airflow SOLO si se configuró airflow_domain (§5.6), y SOLO desde tu IP.
+  # Vacío el dominio => 0 reglas 443 => nada expuesto (comportamiento original).
+  dynamic "ingress" {
+    for_each = var.airflow_domain == "" ? [] : [1]
+    content {
+      description = "HTTPS web de Airflow desde mi IP"
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = [var.my_ip_cidr]
+    }
   }
   egress {
     from_port   = 0
@@ -407,10 +442,12 @@ resource "aws_security_group" "pyspark" {
 <summary>🖱️ A mano en la consola AWS — security group</summary>
 
 1. **VPC → Security groups → Create security group**: nombre `pyspark-stack-sg`, VPC: la *default*.
-2. *Inbound rules* → **una sola regla**: Type `SSH` (TCP 22), Source **My IP** (tu `/32`).
+2. *Inbound rules* → Type `SSH` (TCP 22), Source **My IP** (tu `/32`). Si vas a exponer la web de
+   Airflow (§5.6), agregá **una segunda** regla: Type `HTTPS` (TCP 443), Source **My IP**.
 3. *Outbound rules*: dejar la default (todo permitido).
-4. Verificá que **no** haya inbound para 8082/8888 (ni ningún otro puerto de UI): todo va solo por
-   túnel SSH. La Spark UI vive en la consola de EMR Serverless, no en la EC2.
+4. Verificá que **no** haya inbound para 8082/8888/9090/3000 (ni ningún otro puerto de UI): esas van
+   solo por túnel SSH. La única UI publicable es Airflow por 443 (§5.6); la Spark UI vive en la
+   consola de EMR Serverless, no en la EC2.
 
 </details>
 
@@ -929,6 +966,210 @@ un `up` pelado no lo levanta (§13.2).
 > `terraform apply`. Del mismo modo, el `docker compose up` de arriba es el arranque base; la
 > puesta en producción real —monitoreo, hardening y secretos desde SSM— usa el override de prod
 > (§12-14): `./scripts/load-secrets.sh && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`.
+
+---
+
+### 5.6 Exponer la web de Airflow (HTTPS nativo, solo tu IP)
+
+Hasta acá **nada** estaba expuesto: veías Airflow tuneleando `-L 8082`. Práctico para operar, incómodo
+para *seguir los DAGs* desde el navegador. Esta sección publica **solo la web de Airflow** por
+**HTTPS (443) restringida a tu IP** — el resto (Grafana/Prometheus/Loki/Jupyter) sigue por túnel.
+
+Cuatro piezas, todas parametrizadas (nada hardcodeado — sale de `terraform output`):
+
+1. **DNS** — un `A record` `airflow.midominio.com → EIP` de la EC2, gestionado por Terraform.
+2. **Cert** — Let's Encrypt por **DNS-01** con `certbot/dns-route53`: usa el **rol de la EC2** para
+   crear el TXT del reto en Route 53. **No abre el puerto 80** (encaja con el SG cerrado a tu IP).
+3. **TLS nativo** — el `api-server` de Airflow sirve HTTPS él mismo (`AIRFLOW__API__SSL_CERT/KEY`).
+   Cero contenedores extra.
+4. **SG** — 443 abierto **solo a `var.my_ip_cidr`** (ya lo agregó el `dynamic "ingress"` de §5.1).
+
+> **El gotcha que hay que resolver (importante).** En Airflow 3 el `api-server` sirve en el **mismo
+> puerto 8080** la UI, la API REST **y** la *Task Execution API* (`/execution/`) que el scheduler usa
+> internamente. Al activar TLS, *todo* 8080 pasa a HTTPS, incluido ese tráfico interno. El cert es
+> para `airflow.midominio.com`, pero los contenedores se hablan por el hostname `airflow-apiserver`
+> → la verificación TLS **fallaría** y las tasks dejarían de correr. **Solución:** darle al contenedor
+> un **alias de red** igual al FQDN del cert y apuntar `EXECUTION_API_SERVER_URL` a ese nombre. Así el
+> TLS matchea también adentro y el tráfico sigue por el bridge de Docker (no sale a internet). Es la
+> razón por la que un reverse-proxy (Caddy, al final) evita este paso — pero con el SG cerrado a tu IP,
+> el TLS nativo es el camino más directo (Caddy necesitaría el puerto 80 abierto al mundo, ver abajo).
+
+**Terraform — `infra/prod/dns.tf`** (todo condicionado a `var.airflow_domain`: vacío ⇒ no crea nada):
+
+```hcl
+# infra/prod/dns.tf
+data "aws_route53_zone" "main" {
+  count = var.airflow_domain == "" ? 0 : 1
+  name  = var.dns_zone                # p.ej. "midominio.com" (la hosted zone, sin punto final)
+}
+
+# A record airflow.midominio.com -> EIP estable de la EC2 (§5.3). TTL corto por si rotás la IP.
+resource "aws_route53_record" "airflow" {
+  count   = var.airflow_domain == "" ? 0 : 1
+  zone_id = data.aws_route53_zone.main[0].zone_id
+  name    = var.airflow_domain
+  type    = "A"
+  ttl     = 300
+  records = [aws_eip.pyspark.public_ip]
+}
+
+# Deja que certbot (en la EC2, con el rol de instancia) resuelva el reto DNS-01 tocando SOLO esta
+# zona. La política va en un .json aparte y se inyecta el zone_id con templatefile (bloque de abajo).
+resource "aws_iam_role_policy" "ec2_route53_certbot" {
+  count = var.airflow_domain == "" ? 0 : 1
+  name  = "ec2-route53-certbot"
+  role  = aws_iam_role.ec2.id
+  policy = templatefile("${path.module}/policies/route53-certbot.json.tftpl", {
+    zone_id = data.aws_route53_zone.main[0].zone_id
+  })
+}
+```
+
+**Política en archivo aparte — creá `infra/prod/policies/route53-certbot.json.tftpl`** con:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "Route53ChangeRecordsInZone", "Effect": "Allow",
+      "Action": ["route53:ChangeResourceRecordSets"],
+      "Resource": ["arn:aws:route53:::hostedzone/${zone_id}"] },
+    { "Sid": "Route53ReadForDns01", "Effect": "Allow",
+      "Action": ["route53:GetChange", "route53:ListHostedZones", "route53:ListResourceRecordSets"],
+      "Resource": ["*"] }
+  ]
+}
+```
+
+> **Patrón sugerido por vos:** las políticas IAM viven en `infra/prod/policies/*.json` (o `.json.tftpl`
+> si necesitan interpolar, como el `zone_id` acá) y el `.tf` las referencia con
+> `file()`/`templatefile()`. Podés migrar las políticas inline de §6.2/§16.3 a este mismo esquema.
+
+**Terraform — outputs (agregá a `infra/prod/outputs.tf`)** — de acá saca todo el resto:
+
+```hcl
+output "airflow_domain" { value = var.airflow_domain }
+output "airflow_url" {
+  value = var.airflow_domain == "" ? "(no expuesto: solo túnel SSH)" : "https://${var.airflow_domain}"
+}
+```
+
+**Definí las variables** en `terraform.tfvars` (§5.5) — vacías = no exponer:
+
+```hcl
+airflow_domain    = "airflow.midominio.com"   # el FQDN de la web
+dns_zone          = "midominio.com"           # tu hosted zone en Route 53
+letsencrypt_email = "tu@email.com"
+```
+
+**Emitir el cert (una vez), todo con `terraform output`** — cero literales a mano:
+
+```bash
+cd infra/prod
+terraform apply                              # crea el A record + el permiso Route53 del rol EC2
+
+DOMAIN=$(terraform output -raw airflow_domain)
+IP=$(terraform output -raw public_ip)
+EMAIL="tu@email.com"                          # el mismo de var.letsencrypt_email
+
+dig +short "$DOMAIN"                          # debe devolver la EIP (el A record ya está)
+
+# Cert por DNS-01: usa el rol de la EC2 vía IMDS (sin keys) y NO abre el puerto 80.
+ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP" "
+  sudo docker run --rm -v /data/certs:/etc/letsencrypt certbot/dns-route53 certonly \
+    --dns-route53 -d '$DOMAIN' -m '$EMAIL' --agree-tos -n &&
+  sudo chmod -R g+rX /data/certs   # el api-server corre con gid 0 (grupo root): así puede leer el privkey
+"
+```
+
+El cert queda en `/data/certs/live/$DOMAIN/{fullchain.pem,privkey.pem}` (en el EBS, sobrevive al
+stop/start de la EC2).
+
+**Compose — activar el TLS nativo (delta sobre `docker-compose.prod.yml`, §14.1).** El FQDN viaja
+como `AIRFLOW_DOMAIN` (no es secreto): agregalo al `.env` con
+`echo "AIRFLOW_DOMAIN=$(terraform -chdir=infra/prod output -raw airflow_domain)" >> .env`
+(o metelo en SSM junto a los demás, §13.1). Los tres cambios:
+
+```yaml
+# 1) x-airflow-env (§14.1): forzar que el tráfico INTERNO scheduler->api-server use el FQDN del cert.
+x-airflow-env: &airflow-env
+  # ...lo que ya tenías (StatsD, Airflow Variables de EMR/buckets)...
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "https://${AIRFLOW_DOMAIN}:8080/execution/"
+
+# 2) el servicio api-server: cert + puerto 443 + alias de red = FQDN (resuelve el gotcha)
+services:
+  airflow-apiserver:
+    logging: *logrotate
+    environment:
+      <<: *airflow-env
+      AIRFLOW__API__SSL_CERT: /opt/airflow/certs/fullchain.pem
+      AIRFLOW__API__SSL_KEY:  /opt/airflow/certs/privkey.pem
+      AIRFLOW__API__BASE_URL: "https://${AIRFLOW_DOMAIN}"    # links/redirects correctos
+    ports:
+      - "443:8080"                                           # HTTPS público; el SG lo limita a tu IP
+    volumes:
+      - /data/certs/live/${AIRFLOW_DOMAIN}:/opt/airflow/certs:ro
+    networks:
+      hadoopnet:
+        aliases: ["${AIRFLOW_DOMAIN}"]                       # <- adentro, el cert matchea este nombre
+```
+
+> El `8082:8080` del compose base sigue ahí (los `ports` se **suman** en el override): útil para el
+> túnel local, pero públicamente el SG solo deja pasar 443. Si `airflow_domain` está vacío, **no**
+> agregues este bloque: dejá el api-server como estaba (8082 por túnel).
+
+**Renovación automática (una vez, en la EC2).** `certbot renew` es no-op si faltan >30 días; corre
+semanal y recarga el cert reiniciando el api-server:
+
+```bash
+echo '0 3 * * 1 root docker run --rm -v /data/certs:/etc/letsencrypt certbot/dns-route53 renew --quiet && chmod -R g+rX /data/certs && docker restart airflow-apiserver' \
+  | sudo tee /etc/cron.d/airflow-cert-renew
+```
+
+**Verificar:**
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d   # con AIRFLOW_DOMAIN en el .env
+curl -sSfI "https://$(cd infra/prod && terraform output -raw airflow_domain)/" | head -1  # 200/302 desde tu IP
+# Desde OTRA IP debe cortar (timeout): el SG solo deja 443 a var.my_ip_cidr.
+```
+
+Entrás a `https://airflow.midominio.com` con el usuario **admin** y la password que generó SSM
+(§13.1). La restricción por IP es defensa-en-profundidad **sobre** el login de Airflow, no en lugar de.
+
+<details>
+<summary>🖱️ Alternativa: Caddy (reverse-proxy con auto-cert) en vez de TLS nativo</summary>
+
+Caddy pide y **renueva** el cert solo (sin certbot ni cron) y evita el gotcha del alias — Airflow
+queda en HTTP plano en 8080 y Caddy termina el TLS. **Pero** su emisión automática (HTTP-01/TLS-ALPN)
+necesita el **puerto 80 abierto al mundo**; con el SG cerrado a tu IP, Let's Encrypt no llega y
+tendrías que compilar Caddy con el módulo `caddy-dns/route53` (build custom) para usar DNS-01. Por eso,
+con SG-a-tu-IP, el TLS nativo de arriba es más directo. Si igual preferís Caddy:
+
+```yaml
+# docker-compose.prod.yml — reemplaza el bloque TLS del api-server por este proxy
+services:
+  caddy:
+    image: caddy:2
+    restart: always
+    ports: ["80:80", "443:443"]        # abrí 80 y 443 en el SG (al mundo si usás HTTP-01)
+    volumes:
+      - ./monitoring/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /data/caddy:/data
+    networks: [hadoopnet]
+```
+
+```
+# monitoring/caddy/Caddyfile
+{$AIRFLOW_DOMAIN} {
+    reverse_proxy airflow-apiserver:8080
+}
+```
+
+Con Caddy **no** pongas `AIRFLOW__API__SSL_*`, ni el alias, ni cambies `EXECUTION_API_SERVER_URL`
+(el api-server sigue en HTTP interno). Trade-off: un contenedor más y el puerto 80 abierto (o build DNS).
+
+</details>
 
 ---
 
@@ -1549,9 +1790,11 @@ aws ec2 describe-vpc-endpoints --query 'VpcEndpoints[?ServiceName==`com.amazonaw
 
 ## 7. Orquestación: Lambda trigger-airflow (SSM) + EventBridge + event-driven
 
-Airflow corre dentro de la EC2, **sin su API expuesta a internet**. Para dispararlo desde AWS (por
-cron o cuando llega un archivo a S3) se usa una **Lambda que ejecuta `airflow dags trigger` vía SSM
-`SendCommand`** — sin abrir puertos ni exponer la UI. Es el mismo patrón para los dos disparadores.
+Airflow corre dentro de la EC2. Aunque la **web** se publique por HTTPS restringida a tu IP (§5.6),
+esa puerta **no** sirve para automatizar: Lambda no está en tu IP y no querés ensanchar el SG por ella.
+Para dispararlo desde AWS (por cron o cuando llega un archivo a S3) se usa una **Lambda que ejecuta
+`airflow dags trigger` vía SSM `SendCommand`** — sin abrir puertos ni depender de la web. Es el mismo
+patrón para los dos disparadores.
 
 ### 7.1 Lambda que dispara los DAGs vía SSM
 
@@ -1820,7 +2063,10 @@ aws dlm get-lifecycle-policies --query 'Policies[].State' # ENABLED (backups)
 
 # ── 2. RED / HOST (superficie de ataque) ─────────────────────────────────
 nc -zv "$IP" 22 && echo "SSH ok"
-curl --max-time 5 "http://$IP:8082" && echo "MAL: Airflow expuesto a internet" || echo "OK: UI cerrada"
+curl --max-time 5 "http://$IP:8082" && echo "MAL: Airflow HTTP expuesto" || echo "OK: 8082 cerrado"
+# Si exponés la web (§5.6): 443 responde SOLO desde tu IP. Probalo desde otra red (móvil) -> debe cortar.
+D=$(cd infra/prod && terraform output -raw airflow_domain 2>/dev/null)
+[ -n "$D" ] && { curl -sSfI --max-time 5 "https://$D/" >/dev/null && echo "OK: 443 abre desde tu IP" || echo "443 no responde (¿otra IP o cert pendiente?)"; }
 ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP" 'cd pyspark_stack && docker compose ps'  # todos Up/healthy
 
 # ── 3. STACK FUNCIONAL (por túnel SSH — abrí el output tunnel_command aparte) ─
@@ -1878,7 +2124,8 @@ cd infra/prod && terraform destroy
 
 **Seguridad (checklist):**
 - [ ] Buckets con `public_access_block`, cifrado y política solo-TLS (ya en el TF del data lake).
-- [ ] SG de EC2: solo puerto 22 desde tu IP; UIs por túnel; API de Airflow nunca expuesta.
+- [ ] SG de EC2: puerto 22 (y 443 si exponés la web, §5.6) **solo** desde tu IP; Grafana/Prometheus/
+      Loki/Jupyter por túnel; los triggers automáticos van por SSM, no por la web (§7).
 - [ ] IAM least-privilege: `startstop` **solo** actúa sobre instancias con el tag; `trigger-airflow`
       **solo** puede `ssm:SendCommand` sobre esta instancia (condiciones ya puestas).
 - [ ] EMR Serverless con **su propio** rol de ejecución scopeado a los buckets; la EC2 solo puede
@@ -4291,3 +4538,167 @@ opcional que agregás si la necesitás.
 > Parquet + partition projection es lo que la hace barata: columnar (lee solo las columnas del
 > `SELECT`) y particionada (escanea solo los `dt` del `WHERE`). Sobre CSV sin particionar, Athena
 > escanea todo y el costo/latencia suben.
+
+---
+
+## 17. Airflow, 3 sabores: ejemplo + monitoreo de cada uno
+
+Airflow es **solo el orquestador**; cada task elige su motor. Acá están los **tres** que usa este
+stack, cada uno con: **(a)** el DAG mínimo, **(b)** qué infra necesita y **(c)** cómo lo monitoreás.
+La regla para elegir (detalle en §9.0):
+
+| Dato / trabajo | Sabor | Dónde corre | Detalle |
+|---|---|---|---|
+| Chico (<~1 GB), API, mover/validar archivos | **Python puro** | En la **EC2** (proceso del scheduler) | §17.1 |
+| Mediano/grande, joins/`groupBy`, muchos archivos | **PySpark** | **EMR Serverless** (escala a cero) | §17.2 |
+| Consulta SQL / BI / assert de calidad | **Athena** | **Serverless AWS** (paga por dato escaneado) | §17.3 |
+
+**Lo común a los tres (dónde mirar primero):** la **web de Airflow** (§5.6, ahora por HTTPS). En
+`Grid`/`Graph` ves cada run verde/rojo, reintentos y duración; en `Logs` el stdout de la task. Esa es
+la vista de *orquestación*. Lo que cambia entre sabores es **dónde vive la telemetría del cómputo**:
+en la EC2 (Prometheus/Loki) para Python puro, o en **AWS (CloudWatch)** para EMR y Athena, porque su
+cómputo es *managed* y no pasa por la EC2.
+
+> Los DAGs de abajo son **patrones** ilustrativos (no los copies tal cual a `dags/`: referencian
+> buckets/rutas que tenés que reemplazar). Las Airflow Variables `datalake`, `artifacts`, `emr_app_id`
+> y `emr_job_role_arn` salen de los `terraform output` cargados como env (§14.1).
+
+### 17.1 Python puro (en la EC2)
+
+**(a) DAG** — `PythonOperator`/TaskFlow; pandas lee de S3 y escribe curated, sin Spark
+(`requirements.txt`: `pandas`, `s3fs`, `pyarrow`):
+
+```python
+# dags/small_etl_dag.py — el caso "no necesito Spark"
+from datetime import datetime
+import pandas as pd
+from airflow.sdk import DAG, task, Variable      # Airflow 3: DAG y TaskFlow @task en airflow.sdk
+
+with DAG("small_etl", schedule="@daily", start_date=datetime(2026, 1, 1), catchup=False,
+         tags=["python"]) as dag:
+    @task
+    def transform(ds=None):                       # Airflow inyecta ds del context
+        base = f"s3://{Variable.get('datalake')}"
+        df = pd.read_csv(f"{base}/raw/ventas.csv") # s3fs + rol IAM de la EC2 (§6.2), sin keys
+        out = df[df["monto"] > 0].groupby("pais")["monto"].sum().reset_index()
+        out.to_parquet(f"{base}/curated/ventas_por_pais/{ds}.parquet")
+    transform()
+```
+
+**(b) Infra:** ninguna extra. Corre **dentro de la EC2** en el proceso del scheduler (LocalExecutor).
+Solo necesita el rol IAM de la EC2 con acceso al bucket (`s3:GetObject/PutObject`, ya en §6.2). No
+prende nada; ideal para pasos livianos (no arranques Spark para 50 MB).
+
+**(c) Monitoreo/observabilidad — todo local (EC2):**
+- **Orquestación** → web de Airflow: `Grid`/`Logs` de `small_etl` (el `print`/excepción de pandas
+  aparece ahí mismo).
+- **Recursos** → **Prometheus + Grafana** de la EC2 (§12): como el cómputo es la propia EC2, la CPU/RAM
+  del run se ve en `node-exporter`/`cAdvisor`. Si un `read_csv` se come la RAM, salta
+  `HostOutOfMemory`/`cAdvisor` en el dashboard "Overview".
+- **Logs** → **Loki + Promtail** (§12.7): el stdout del contenedor `airflow-scheduler` queda indexado;
+  buscás por `{container="airflow-scheduler"}` en Grafana.
+- **Métricas de DAG** → StatsD → Prometheus (§12.5): `airflow_dagrun_duration_success_count` alimenta
+  el dead-man switch si el DAG deja de correr.
+
+> Punto clave: en Python puro **toda** la telemetría vive en la EC2 (Airflow + Prometheus + Loki).
+> No hay que ir a la consola de AWS a buscar nada.
+
+### 17.2 PySpark en EMR Serverless
+
+**(a) DAG** — dispara el job con `EmrServerlessStartJobOperator` y espera su fin (provider
+`apache-airflow-providers-amazon`, §9.1). El código PySpark se sube a `s3://<artifacts>/emr/`
+(§6.4/§11.3):
+
+```python
+# dags/emr_etl_dag.py — el caso "sí necesito Spark"
+from datetime import datetime
+from airflow.sdk import DAG
+from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobOperator
+
+with DAG("emr_etl", schedule="@daily", start_date=datetime(2026, 1, 1), catchup=False,
+         tags=["spark", "emr"]) as dag:
+    run = EmrServerlessStartJobOperator(
+        task_id="ventas_spark",
+        application_id="{{ var.value.emr_app_id }}",           # output emr_app_id (§6.4)
+        execution_role_arn="{{ var.value.emr_job_role_arn }}",  # output emr_job_role_arn (§6.4)
+        job_driver={"sparkSubmit": {
+            "entryPoint": "s3://{{ var.value.artifacts }}/emr/ventas.py",
+            "entryPointArguments": ["s3://{{ var.value.datalake }}", "{{ ds }}"],
+            "sparkSubmitParameters": "--conf spark.executor.cores=2 --conf spark.executor.memory=4g",
+        }},
+        configuration_overrides={"monitoringConfiguration": {
+            "s3MonitoringConfiguration": {"logUri": "s3://{{ var.value.artifacts }}/emr/logs/"},
+        }},
+        wait_for_completion=True,   # la task no termina hasta que el job EMR termina (falla si FAILED)
+    )
+```
+
+**(b) Infra:** la app de **EMR Serverless** + su rol de ejecución (§6.4), y la EC2 con permiso para
+`emr-serverless:StartJobRun` + `iam:PassRole` del rol de ejecución. **La EC2 no corre Spark**: solo
+dispara y espera. El cómputo lo aprovisiona EMR por-job y **escala a cero** al terminar (pagás solo
+mientras corre).
+
+**(c) Monitoreo/observabilidad — split EC2 (orquestación) + AWS (cómputo):**
+- **Orquestación** → web de Airflow: la task `ventas_spark` queda "running" mientras el job vive; se
+  pone roja si el job termina `FAILED` (y dispara la alerta `EmrServerlessJobFailed`, §12.4).
+- **Métricas del job** → **CloudWatch**, namespace `AWS/EMRServerless` (runs por estado, vCPU/GB-seg,
+  memoria). Opcional: verlas en Grafana con un datasource CloudWatch (§12.6).
+- **Logs del job (driver+executors)** → **S3** `s3://<artifacts>/emr/logs/` y **CloudWatch Logs**
+  (`/aws/emr-serverless/pyspark-stack`, §6.4):
+  ```bash
+  aws logs tail /aws/emr-serverless/pyspark-stack --since 1h
+  ```
+- **Spark UI** → la **consola de EMR Serverless** reconstruye la Spark UI de cada corrida terminada
+  (reemplaza al History Server local, que ya no aplica).
+
+> Punto clave: la telemetría de *cómputo* **no** está en la EC2 — vive en **AWS (CloudWatch + consola
+> EMR + S3)**, porque el Spark es managed. En la EC2 solo ves el estado *orquestado* del job. Detalle
+> completo en §12.8.
+
+### 17.3 SQL con Athena
+
+**(a) DAG** — `AthenaOperator` (mismo provider Amazon). Típico: un **assert de calidad** barato tras
+el job EMR que escribió `analytics/ventas/` (§16.4):
+
+```python
+# fragmento de dags/emr_etl_dag.py — encadenado tras el job EMR
+from airflow.providers.amazon.aws.operators.athena import AthenaOperator
+
+assert_calidad = AthenaOperator(
+    task_id="assert_calidad",
+    query="SELECT count(*) AS filas FROM ventas WHERE dt = '{{ ds }}'",
+    database="pyspark_stack_analytics",
+    output_location="s3://{{ var.value.artifacts }}/athena-results/",
+    workgroup="pyspark-stack-analytics",
+)
+run >> assert_calidad     # corre después del job EMR de §17.2
+```
+
+**(b) Infra:** el **workgroup** de Athena + la base en el Glue Data Catalog + la tabla con *partition
+projection* (§16.1/§16.2), y la EC2 con permiso `athena:StartQueryExecution`/`GetQueryResults` +
+lectura del lake + escritura de resultados (§16.3). **No prende ningún cluster**: Athena escanea S3 y
+paga por dato leído (Parquet particionado ⇒ ~$0/mes a esta escala).
+
+**(c) Monitoreo/observabilidad — split EC2 (orquestación) + AWS (motor SQL):**
+- **Orquestación** → web de Airflow: `assert_calidad` roja = la query falló o devolvió algo que hiciste
+  fallar (p. ej. `0 filas`); el error de Athena aparece en `Logs` de la task.
+- **Métricas del motor** → **CloudWatch** (el workgroup tiene `publish_cloudwatch_metrics_enabled`,
+  §16.2): datos escaneados, tiempo y estado por query. De ahí sacás si una query escanea de más.
+- **Historial y plan** → **consola de Athena** → *Query history*: cada ejecución con su
+  `DataScannedInBytes`, duración y estado. La evidencia (resultado) queda en
+  `s3://<artifacts>/athena-results/` (expira a 7 días, §16.2):
+  ```bash
+  aws athena list-query-executions --work-group pyspark-stack-analytics --max-results 5
+  ```
+
+> Punto clave: como en EMR, el *motor* es managed → su telemetría vive en **AWS (CloudWatch + consola
+> Athena)**; Airflow solo te dice si el assert pasó. El costo se controla mirando `DataScannedInBytes`
+> (bajalo con Parquet + particiones, §16.5).
+
+**Resumen — dónde miro cada cosa:**
+
+| Sabor | Orquestación | Recursos / métricas del cómputo | Logs | Costo se ve en |
+|---|---|---|---|---|
+| Python puro | Web Airflow | **Prometheus/Grafana** (EC2) | **Loki** (EC2) | — (parte de la EC2) |
+| EMR Serverless | Web Airflow | **CloudWatch** `AWS/EMRServerless` + consola EMR | S3 `emr/logs/` + CloudWatch Logs | CloudWatch (vCPU/GB-seg) |
+| Athena | Web Airflow | **CloudWatch** (workgroup) | consola Athena (*Query history*) | `DataScannedInBytes` |
