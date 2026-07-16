@@ -19,7 +19,7 @@
 3. [Prerrequisitos](#3-prerrequisitos)
 4. [Fundamentos: backend Terraform (S3 + DynamoDB)](#4-fundamentos-backend-terraform)
 5. [Núcleo: EC2 con Docker](#5-núcleo-ec2-con-docker)
-   - 5.1 [Variables y red (SSH-only)](#51-variables-y-red)
+   - 5.1 [Variables y red (SSH + web de Airflow a tu IP)](#51-variables-y-red)
    - 5.2 [IAM + key pair](#52-iam--key-pair)
    - 5.3 [EC2 + EBS + user_data](#53-ec2--ebs--user_data)
    - 5.4 [**Automatización: EventBridge + Lambda (auto start/stop)**](#54-automatización-eventbridge--lambda)
@@ -307,7 +307,8 @@ aws dynamodb describe-table --table-name pyspark-stack-tf-lock --query 'Table.Ta
 
 ## 5. Núcleo: EC2 con Docker
 
-Una EC2 corre el `docker-compose` completo (idéntico al local). Acceso por **túnel SSH** para todo,
+Una EC2 corre el mismo `docker-compose` que en local **pero con el override de prod** (§14.1): solo el
+orquestador (Airflow + Postgres + monitoreo), sin Spark ni HDFS. Acceso por **túnel SSH** para todo,
 más una **excepción explícita**: la web de Airflow se publica por **HTTPS (443) restringida a tu IP**
 (§5.6), para poder seguir los DAGs desde el navegador sin túnel. Grafana/Prometheus/Loki/Jupyter
 siguen **solo por túnel**. Es el corazón del stack; las dos secciones siguientes le agregan el
@@ -914,7 +915,9 @@ output "public_ip"   { value = aws_eip.pyspark.public_ip }
 output "instance_id" { value = aws_instance.pyspark.id }
 output "tunnel_command" {
   # Solo Airflow (8082). Spark ya no corre en la EC2 (EMR Serverless), así que no hay UI 8081/9870
-  # que tunelear; Jupyter (8888) solo si activás el perfil dev.
+  # que tunelear; Jupyter (8888) solo si activás el perfil dev. Si exponés la web por HTTPS (§5.6),
+  # entrás directo a https://${var.airflow_domain} y este túnel a 8082 es opcional (y daría warning
+  # de cert en localhost:8082, porque el api-server ya sirve TLS del FQDN).
   value = "ssh -i ~/.ssh/pyspark_stack -L 8082:localhost:8082 -L 8888:localhost:8888 ec2-user@${aws_eip.pyspark.public_ip}"
 }
 ```
@@ -3730,7 +3733,8 @@ scrape_configs:
 
 ### 12.8 Acceso, verificación y observabilidad de EMR Serverless
 
-Acceso por **túnel SSH** (nada expuesto):
+Acceso por **túnel SSH** (las UIs de monitoreo no se exponen; la única puerta pública es la web de
+Airflow por 443 a tu IP, §5.6):
 
 ```bash
 ssh -i ~/.ssh/pyspark_stack -L 3000:localhost:3000 -L 9090:localhost:9090 -L 9093:localhost:9093 -L 3100:localhost:3100 ec2-user@$IP
@@ -4166,6 +4170,9 @@ services:
   spark-worker:  { profiles: ["disabled-in-prod"] }
 
   # ---- Airflow: env común (incluye EMR Serverless) + rotación de logs (restart: always del base) ----
+  # NOTA: exponer la web por HTTPS/443 es un DELTA OPCIONAL sobre este bloque (cert + puerto 443 +
+  # alias de red + EXECUTION_API_SERVER_URL en https) — ver §5.6. Sin ese delta, el api-server queda
+  # como acá: solo accesible por el túnel 8082 del base.
   airflow-apiserver:     { logging: *logrotate, environment: { <<: *airflow-env } }
   airflow-dag-processor: { logging: *logrotate, environment: { <<: *airflow-env } }
   airflow-triggerer:     { logging: *logrotate, environment: { <<: *airflow-env } }
@@ -4370,6 +4377,7 @@ aws s3 sync spark-apps/emr/ "s3://pyspark-stack-artifacts-$ACCT/emr/" --exclude 
 # 4. Generar el .env desde SSM y verificarlo:
 ./scripts/load-secrets.sh
 wc -l .env    # 12 variables (8 base + EMR_APP_ID + EMR_JOB_ROLE_ARN + DATALAKE_BUCKET + ARTIFACTS_BUCKET)
+              # +1 (AIRFLOW_DOMAIN) si exponés la web por HTTPS (§5.6)
 ls -l .env    # -rw------- (chmod 600); ningún valor default de dev adentro
 grep -E 'EMR_APP_ID|EMR_JOB_ROLE_ARN|DATALAKE_BUCKET|ARTIFACTS_BUCKET' .env   # con valor (alimentan las Airflow Variables)
 
@@ -4378,6 +4386,10 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet  
 
 # 6. Levantar el stack completo:
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+
+# 6b. (OPCIONAL) Exponer la web de Airflow por HTTPS a tu IP — solo si definiste airflow_domain:
+#     seguí §5.6 (emitir el cert con certbot, agregar AIRFLOW_DOMAIN al .env y el delta TLS del
+#     compose). Sin esto, Airflow queda accesible solo por el túnel 8082. La §17 asume esta web.
 
 # 7. Re-correr los smoke tests de §8, capas 2-5 completas (ahora la capa 5 pasa: monitoreo arriba).
 
@@ -4605,7 +4617,7 @@ prende nada; ideal para pasos livianos (no arranques Spark para 50 MB).
   aparece ahí mismo).
 - **Recursos** → **Prometheus + Grafana** de la EC2 (§12): como el cómputo es la propia EC2, la CPU/RAM
   del run se ve en `node-exporter`/`cAdvisor`. Si un `read_csv` se come la RAM, salta
-  `HostOutOfMemory`/`cAdvisor` en el dashboard "Overview".
+  `HostLowMemory` (§12.4) y lo ves en `cAdvisor` en el dashboard "Overview".
 - **Logs** → **Loki + Promtail** (§12.7): el stdout del contenedor `airflow-scheduler` queda indexado;
   buscás por `{container="airflow-scheduler"}` en Grafana.
 - **Métricas de DAG** → StatsD → Prometheus (§12.5): `airflow_dagrun_duration_success_count` alimenta
@@ -4634,7 +4646,7 @@ with DAG("emr_etl", schedule="@daily", start_date=datetime(2026, 1, 1), catchup=
         execution_role_arn="{{ var.value.emr_job_role_arn }}",  # output emr_job_role_arn (§6.4)
         job_driver={"sparkSubmit": {
             "entryPoint": "s3://{{ var.value.artifacts }}/emr/ventas.py",
-            "entryPointArguments": ["s3://{{ var.value.datalake }}", "{{ ds }}"],
+            "entryPointArguments": ["{{ var.value.datalake }}", "{{ ds }}"],  # bucket pelado (convención §9.0/§10.2)
             "sparkSubmitParameters": "--conf spark.executor.cores=2 --conf spark.executor.memory=4g",
         }},
         configuration_overrides={"monitoringConfiguration": {
