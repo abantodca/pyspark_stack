@@ -238,13 +238,13 @@ Desglose (producción con auto start/stop, 8 h × 22 días laborales):
 |---|---|---|
 | EC2 `m6i.xlarge` | 4 vCPU / 16 GB, encendida solo en horario | ~34 |
 | EBS gp3 root 40 GB | disco del SO | ~4 |
-| EBS gp3 data 200 GB | `/data` = HDFS + Postgres + Prometheus/Loki | ~16 |
+| EBS gp3 data 50 GB | `/data` = HDFS + Postgres + Prometheus/Loki (gp3 crece online) | ~4 |
 | Snapshots EBS (DLM) | 7 días de retención de `/data` | ~2 |
 | S3 data lake | ~50 GB + requests (con lifecycle a IA/Glacier) | ~1.5 |
 | Elastic IP | gratis mientras está asociada a una instancia | ~0 |
 | Lambda + EventBridge + SSM | trigger-airflow + startstop (free tier) | ~0 |
 | Monitoreo (Prom/Grafana/Loki) | corre dentro de la misma EC2 | ~0 |
-| **Total** | | **~58/mes** |
+| **Total** | | **~46/mes** |
 
 El tamaño de la EC2 lo manda la RAM de las JVMs + Airflow + monitoreo, no el dato (~50 MB es
 trivial). `m6i.xlarge` (16 GB) corre el stack completo; la familia `m6i` (CPU constante) evita que
@@ -254,8 +254,8 @@ Escenarios de encendido — lo único que mueve la aguja es cuánto está prendi
 
 | Escenario | Cómputo EC2 | Total aprox. |
 |---|---|---|
-| **Prod con auto start/stop** (8h×22d) | ~$34 | **~$58/mes** |
-| EC2 24/7 (sin apagar) | ~$140 | ~$164/mes |
+| **Prod con auto start/stop** (8h×22d) | ~$34 | **~$46/mes** |
+| EC2 24/7 (sin apagar) | ~$140 | ~$152/mes |
 | Dev-lite (`t3.large`, solo Spark+Jupyter, `docker-compose.dev.yml`) | ~$12 | ~$17/mes |
 
 El auto start/stop (Lambda `startstop` + EventBridge) es la palanca principal: convierte ~$140
@@ -267,7 +267,7 @@ fijos en ~$34. El resto (almacenamiento + serverless) es marginal y casi constan
 No hay un muro duro: Spark procesa por particiones y derrama a disco lo que no cabe en RAM, así
 que el límite no es un tope fijo sino velocidad + disco. Config de referencia: `m6i.xlarge`; el
 worker ofrece 3 GB / 2 cores con el `docker-compose.prod.yml` de la guía 02 — el compose base
-arranca el worker sin esos flags y ofrece todos los recursos del host; `/data` = 200 GB gp3
+arranca el worker sin esos flags y ofrece todos los recursos del host; `/data` = 50 GB gp3
 compartido con HDFS.
 
 | Tamaño por job | Comportamiento | Veredicto |

@@ -95,11 +95,11 @@ Por eso la EC2 se apaga fuera de horario (auto start/stop) y el data lake vive e
 | Item | US$/mes |
 |---|---|
 | EC2 `m6i.xlarge` (4 vCPU/16 GB) con **auto start/stop** (8h×22d) | ~34 |
-| EBS gp3 (root 40 + data 200) + snapshots DLM | ~22 |
+| EBS gp3 (root 40 + data 50) + snapshots DLM | ~10 |
 | S3 data lake (~50 GB) + requests | ~1.5 |
 | IPv4 pública (EIP; AWS la cobra desde feb-2024, asociada o no) | ~3.6 |
 | Lambda + EventBridge + SSM | ~0 (free tier) |
-| **Total** | **~61/mes** |
+| **Total** | **~49/mes** |
 
 `m6i.xlarge` alcanza porque el cuello no es el dato (los ~50 MB por corrida son triviales) sino la RAM de las JVMs +
 Airflow + monitoreo. Sin auto start/stop (EC2 24/7) serían ~$140/mes: el `start/stop` automático es la
@@ -113,7 +113,7 @@ uso. Comparación aproximada (us-east-1, datos chicos, ~20 tareas/día):
 
 | Opción | Cómo cobra | ~US$/mes a esta escala | Ops | Cuándo gana |
 |---|---|---|---|---|
-| **Self-managed EC2** (este stack) | tiempo encendido (flat) | ~34 compute (~61 total) | Vos | consolidar varias cargas en la máquina ya paga; control y portabilidad (cero lock-in) |
+| **Self-managed EC2** (este stack) | tiempo encendido (flat) | ~34 compute (~49 total) | Vos | consolidar varias cargas en la máquina ya paga; control y portabilidad (cero lock-in) |
 | **EMR Serverless** | vCPU-seg + GB-seg, escala a cero | ~9 (+ S3) | AWS | Spark chico/esporádico con mínima ops |
 | **Glue Spark** | DPU-hora (mín 2 DPU + 1 min por corrida) | ~44 | AWS | pocos jobs/día |
 | **EMR on EC2** (clásico) | fleet EC2 + ~25% recargo | ~120–160 | Vos (cluster) | TB sostenidos, multi-nodo |
@@ -309,7 +309,11 @@ variable "root_volume_gb" {
 }
 variable "data_volume_gb" {
   type    = number
-  default = 200
+  # gp3 crece online (aws ec2 modify-volume + xfs_growfs, sin downtime) pero NO se achica:
+  # arrancá chico y crecé cuando la alerta HostDiskAlmostFull (§12.4) avise. 50 GB cubre HDFS +
+  # Postgres + 15d de Prometheus + 7d de Loki con margen a esta escala. gp3 da 3000 IOPS /
+  # 125 MB/s independientes del tamaño, así que un disco más grande no rinde más, solo cuesta más.
+  default = 50
 }
 variable "my_ip_cidr" {
   description = "Tu IP /32 (única fuente de SSH). curl -s https://checkip.amazonaws.com"
@@ -550,8 +554,9 @@ echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-pyspark.conf && sysctl --syste
 1. **EC2 → Launch instance**: nombre `pyspark-stack-node` · AMI **Amazon Linux 2023 (x86_64)** ·
    tipo **m6i.xlarge** · key pair `pyspark-stack-key`.
 2. *Network settings* → **Select existing security group** → `pyspark-stack-sg`.
-3. *Configure storage*: root **40 GiB gp3, Encrypted** · *Add new volume* → **200 GiB gp3,
-   Encrypted**, device `/dev/xvdf`.
+3. *Configure storage*: root **40 GiB gp3, Encrypted** · *Add new volume* → **50 GiB gp3,
+   Encrypted**, device `/dev/xvdf` (gp3 crece online, así que empezás chico; ver la nota de la
+   variable `data_volume_gb`).
 4. *Advanced details*:
    - **IAM instance profile** → `pyspark-stack-ec2-role`.
    - **Metadata version** → **V2 only (token required)** (IMDSv2 obligatorio) y **Metadata
@@ -562,7 +567,7 @@ echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-pyspark.conf && sysctl --syste
    este tag; el workflow de CI busca por `Name`).
 6. **EC2 → Elastic IPs → Allocate Elastic IP address** → *Actions → Associate* con la instancia
    (sin EIP, la IP pública cambia en cada stop/start del ahorro automático).
-7. **EC2 → Volumes**: etiquetá a mano el volumen de datos (200 GiB) con `Name=pyspark-stack-data`
+7. **EC2 → Volumes**: etiquetá a mano el volumen de datos (50 GiB) con `Name=pyspark-stack-data`
    — el wizard de Launch instance no lo etiqueta, y sin ese tag el DLM de §6.3 no respalda nada.
 
 </details>
