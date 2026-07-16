@@ -981,18 +981,29 @@ Cuatro piezas, todas parametrizadas (nada hardcodeado — sale de `terraform out
 2. **Cert** — Let's Encrypt por **DNS-01** con `certbot/dns-route53`: usa el **rol de la EC2** para
    crear el TXT del reto en Route 53. **No abre el puerto 80** (encaja con el SG cerrado a tu IP).
 3. **TLS nativo** — el `api-server` de Airflow sirve HTTPS él mismo (`AIRFLOW__API__SSL_CERT/KEY`).
-   Cero contenedores extra.
+   Cero contenedores extra. (En Airflow 3 la config del webserver se mudó a la sección **`[api]`**;
+   los nombres `AIRFLOW__API__SSL_CERT` / `SSL_KEY` / `BASE_URL` son los de 3.2, verificados contra la
+   [config reference oficial](https://airflow.apache.org/docs/apache-airflow/stable/configurations-ref.html)
+   — ya **no** son los `AIRFLOW__WEBSERVER__*` de Airflow 2.)
 4. **SG** — 443 abierto **solo a `var.my_ip_cidr`** (ya lo agregó el `dynamic "ingress"` de §5.1).
 
-> **El gotcha que hay que resolver (importante).** En Airflow 3 el `api-server` sirve en el **mismo
-> puerto 8080** la UI, la API REST **y** la *Task Execution API* (`/execution/`) que el scheduler usa
-> internamente. Al activar TLS, *todo* 8080 pasa a HTTPS, incluido ese tráfico interno. El cert es
-> para `airflow.midominio.com`, pero los contenedores se hablan por el hostname `airflow-apiserver`
-> → la verificación TLS **fallaría** y las tasks dejarían de correr. **Solución:** darle al contenedor
-> un **alias de red** igual al FQDN del cert y apuntar `EXECUTION_API_SERVER_URL` a ese nombre. Así el
-> TLS matchea también adentro y el tráfico sigue por el bridge de Docker (no sale a internet). Es la
-> razón por la que un reverse-proxy (Caddy, al final) evita este paso — pero con el SG cerrado a tu IP,
-> el TLS nativo es el camino más directo (Caddy necesitaría el puerto 80 abierto al mundo, ver abajo).
+> **El gotcha que hay que resolver (importante, y está documentado oficialmente).** En Airflow 3 el
+> `api-server` sirve en el **mismo puerto 8080** la UI, la API REST **y** la *Task Execution API*
+> (`/execution/`) que el scheduler usa internamente. Al activar TLS, *todo* 8080 pasa a HTTPS, incluido
+> ese tráfico interno. El cert es para `airflow.midominio.com`, pero los contenedores se hablan por el
+> hostname `airflow-apiserver` → la verificación TLS **fallaría** y las tasks dejarían de correr (es
+> exactamente el [howto oficial de self-signed cert](https://airflow.apache.org/docs/apache-airflow/stable/howto/run-with-self-signed-certificate.html)
+> y los issues [#55147](https://github.com/apache/airflow/issues/55147) / [#53493](https://github.com/apache/airflow/issues/53493)).
+>
+> El howto oficial lo resuelve **metiendo `localhost` y `airflow-apiserver` como SANs del certificado**
+> — pero eso **solo sirve con un cert self-signed que vos generás**. Con un cert **Let's Encrypt** no
+> podés: LE solo firma dominios públicos que controlás, no hostnames internos. **La solución correcta
+> para un cert público** es al revés: darle al contenedor un **alias de red = el FQDN del cert** y
+> apuntar `EXECUTION_API_SERVER_URL` a ese FQDN. Así el hostname interno pasa a ser
+> `airflow.midominio.com` (que *sí* está en el cert), la verificación TLS pasa contra las CAs públicas
+> (sin `ssl_ca`) y el tráfico sigue por el bridge de Docker (no sale a internet). Es la razón por la que
+> un reverse-proxy (Caddy, al final) evita todo esto — pero con el SG cerrado a tu IP, el TLS nativo es
+> el camino más directo (Caddy necesitaría el puerto 80 abierto al mundo, ver abajo).
 
 **Terraform — `infra/prod/dns.tf`** (todo condicionado a `var.airflow_domain`: vacío ⇒ no crea nada):
 
