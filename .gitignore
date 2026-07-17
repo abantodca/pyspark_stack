@@ -28,6 +28,10 @@ spark-events/*
 notebooks/**/output/
 spark-apps/notebook-output/
 
+# --- Salidas y logs de ejecucion (resultados, no fuente) ---
+spark-apps/shared_output/
+spark-apps/logs/
+
 # --- Lambdas empaquetadas ---
 **/lambda/*.zip
 
