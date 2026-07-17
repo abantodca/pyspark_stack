@@ -452,6 +452,48 @@ resource "aws_security_group" "pyspark" {
 
 </details>
 
+> **Si tu IP de cliente cambia** (IP dinámica): la EC2 usa Elastic IP (§5.3), así que el *servidor* es
+> estable entre stop/start; lo que se desactualiza es **tu** `/32` en `var.my_ip_cidr` (el *Source* de
+> las reglas 22/443). Una Elastic IP no arregla esto —es tu IP de casa/oficina, no la de la EC2—.
+> Como **Terraform es la fuente de verdad**, no edites el SG a mano: el próximo `apply` lo revertiría a
+> `var.my_ip_cidr`. Reaplicá con tu IP actual en una línea (sin tocar el `tfvars`):
+>
+> ```bash
+> terraform -chdir=infra/prod apply -var "my_ip_cidr=$(curl -s https://checkip.amazonaws.com)/32"
+> ```
+>
+> (O actualizá `my_ip_cidr` en `terraform.tfvars` y `apply`.) Si preferís actualizar el SG **fuera** de
+> Terraform con un script CLI, agregá `lifecycle { ignore_changes = [ingress] }` al `aws_security_group`
+> para que el `apply` no pise el cambio; a cambio, Terraform deja de gestionar esas reglas (queda a
+> cargo del script). El script (corré desde tu máquina cuando cambie tu IP, o por cron local; actualiza
+> el `/32` de las reglas 22 y 443 sin tocar sus IDs, y salta el 443 si no lo expusiste):
+>
+> ```bash
+> #!/usr/bin/env bash
+> # scripts/update-sg-ip.sh — pone tu IP de cliente actual en las reglas 22 y 443 del SG.
+> set -euo pipefail
+> REGION="${AWS_REGION:-us-east-1}"
+> SG_NAME="pyspark-stack-sg"
+> MYIP="$(curl -s https://checkip.amazonaws.com)/32"
+> echo "IP actual: $MYIP"
+> SG_ID=$(aws ec2 describe-security-groups --region "$REGION" \
+>   --filters "Name=group-name,Values=$SG_NAME" \
+>   --query 'SecurityGroups[0].GroupId' --output text)
+> for PORT in 22 443; do
+>   RULE_ID=$(aws ec2 describe-security-group-rules --region "$REGION" \
+>     --filters "Name=group-id,Values=$SG_ID" \
+>     --query "SecurityGroupRules[?FromPort==\`$PORT\` && IsEgress==\`false\` && IpProtocol=='tcp'].SecurityGroupRuleId | [0]" \
+>     --output text)
+>   [ "$RULE_ID" = "None" ] || [ -z "$RULE_ID" ] && { echo "puerto $PORT: sin regla, salto"; continue; }
+>   aws ec2 modify-security-group-rules --region "$REGION" --group-id "$SG_ID" \
+>     --security-group-rules "SecurityGroupRuleId=$RULE_ID,SecurityGroupRule={IpProtocol=tcp,FromPort=$PORT,ToPort=$PORT,CidrIpv4=$MYIP,Description=auto-mi-ip}"
+>   echo "puerto $PORT: regla $RULE_ID -> $MYIP"
+> done
+> ```
+>
+> Necesita en tu usuario/rol local los permisos `ec2:DescribeSecurityGroups`,
+> `ec2:DescribeSecurityGroupRules` y `ec2:ModifySecurityGroupRules`.
+
 ### 5.2 IAM + key pair
 
 ```hcl
