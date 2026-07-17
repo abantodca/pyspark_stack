@@ -45,6 +45,7 @@ docker compose -f docker-compose.dev.yml up -d --build
 
 - [docs/01 — Docker Compose explicado](docs/01-docker-compose-explicado.md): anatomía del stack, bloque por bloque, y refactor de producción.
 - [docs/02 — Producción en AWS](docs/02-produccion-aws.md): un solo camino híbrido (Airflow en EC2 t3.large + EMR Serverless + S3, sin HDFS) con Terraform, CI/CD, monitoreo, secretos y hardening. Todo el código es copy-paste. Costo aproximado: ~$35/mes con auto start/stop o ~$83/mes 24/7 (a volumen real de 2 GB/día 3×/sem, ~$31/$79).
+- [docs/02b — Producción en AWS 100% por la consola](docs/02b-produccion-aws-consola.md): la misma arquitectura y objetivo que docs/02, pero construida enteramente a mano en la consola web de AWS (cero Terraform) — guía copy-paste manual, con las políticas IAM/JSON, el código de las Lambdas y los pasos clic a clic, más un teardown manual.
 - [docs/03 — Arquitectura](docs/03-arquitectura.md): diagramas y flujos del mismo camino híbrido.
 - [ANALISIS_FALLOS.md](ANALISIS_FALLOS.md): registro histórico de fallos del stack y sus fixes.
 
