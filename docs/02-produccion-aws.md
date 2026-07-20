@@ -107,7 +107,7 @@ La EC2 nunca corre Spark: solo orquesta.
 
 ## 2. Costo
 
-> Precios aproximados us-east-1 (on-demand), sujetos a cambio — validá en
+> Precios aproximados us-east-1 (on-demand), estimados en julio 2026 y sujetos a cambio — validá en
 > [calculator.aws](https://calculator.aws). Escenario **real**: ~2 GB/día, 3 corridas/semana
 > (≈13/mes) de Spark en EMR Serverless, con ~50 GB acumulados en el data lake.
 
@@ -624,9 +624,12 @@ resource "aws_volume_attachment" "data" {
 set -euxo pipefail
 dnf update -y && dnf install -y docker git && systemctl enable --now docker
 
+# Versión PINEADA (mismo criterio que las imágenes por @sha256): un boot de hoy y uno de dentro
+# de 6 meses instalan lo mismo. Actualizala a propósito, no dejes que "latest" decida por vos.
+COMPOSE_VERSION=v5.3.1
 DOCKER_CONFIG=/usr/local/lib/docker
 mkdir -p $DOCKER_CONFIG/cli-plugins
-curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+curl -SL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
   -o $DOCKER_CONFIG/cli-plugins/docker-compose
 chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
 usermod -aG docker ec2-user
@@ -1872,11 +1875,11 @@ ssm = boto3.client("ssm")
 
 def handler(event, context):
     """Dispara un DAG de Airflow dentro de la EC2 vía SSM SendCommand.
-    - Por cron (EventBridge): event = {"dag": "customer_etl_dag"}.
+    - Por cron (EventBridge): event = {"dag": "customer_etl_emr"}.
     - Por evento S3: event = {"Records": [{s3: {bucket, object{key}}}]} → pasa bucket/key como --conf.
     """
     instance_id = os.environ["INSTANCE_ID"]
-    default_dag = os.environ.get("DEFAULT_DAG", "customer_etl_dag")
+    default_dag = os.environ.get("DEFAULT_DAG", "customer_etl_emr")
 
     conf = {}
     dag = event.get("dag", default_dag)
@@ -1959,7 +1962,7 @@ resource "aws_lambda_function" "trigger_airflow" {
   environment {
     variables = {
       INSTANCE_ID = aws_instance.pyspark.id
-      DEFAULT_DAG = "customer_etl_dag"
+      DEFAULT_DAG = "customer_etl_emr" # el DAG de producción (EMR Serverless, §10.2) — no el flujo dev local
     }
   }
 }
@@ -1973,14 +1976,14 @@ resource "aws_lambda_function" "trigger_airflow" {
    (*Runtime settings → Edit*; el código define `def handler`, no `lambda_handler`).
    *Configuration → General*: timeout **60 s**.
 2. *Environment variables*: `INSTANCE_ID=<i-xxxxxxxx>` (tu instancia) y
-   `DEFAULT_DAG=customer_etl_dag`.
+   `DEFAULT_DAG=customer_etl_emr` (el DAG de producción, §10.2).
 3. Al rol de ejecución (*Permissions*) agregale una inline policy JSON con los statements del
    Terraform: `ssm:SendCommand` **solo** sobre el ARN de tu instancia y sobre
    `arn:aws:ssm:us-east-1::document/AWS-RunShellScript`, más
    `ssm:GetCommandInvocation`/`ListCommandInvocations` (los logs ya los cubre el basic execution
    role que crea la consola).
-4. Probala con *Test* → evento `{"dag": "customer_etl_dag"}` → en la EC2 debería aparecer un
-   DAG run nuevo (`airflow dags list-runs customer_etl_dag`).
+4. Probala con *Test* → evento `{"dag": "customer_etl_emr"}` → en la EC2 debería aparecer un
+   DAG run nuevo (`airflow dags list-runs customer_etl_emr`).
 
 </details>
 
@@ -1989,9 +1992,9 @@ resource "aws_lambda_function" "trigger_airflow" {
 ID=$(terraform -chdir=infra/prod output -raw instance_id)
 aws ssm describe-instance-information --query "InstanceInformationList[?InstanceId=='$ID'].PingStatus"  # ["Online"]
 aws lambda invoke --function-name pyspark-stack-trigger-airflow \
-  --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_dag"}' /dev/stdout
+  --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_emr"}' /dev/stdout
 # en la EC2: dag_id posicional (en Airflow 3 no existe -d)
-docker compose exec -T airflow-scheduler airflow dags list-runs customer_etl_dag
+docker compose exec -T airflow-scheduler airflow dags list-runs customer_etl_emr
 ```
 
 ### 7.2 Disparo por cron (EventBridge Scheduler)
@@ -2028,7 +2031,7 @@ resource "aws_scheduler_schedule" "daily_etl" {
   target {
     arn      = aws_lambda_function.trigger_airflow.arn
     role_arn = aws_iam_role.sched_etl.arn
-    input    = jsonencode({ dag = "customer_etl_dag" })
+    input    = jsonencode({ dag = "customer_etl_emr" }) # DAG de producción (§10.2)
   }
 }
 ```
@@ -2040,7 +2043,7 @@ resource "aws_scheduler_schedule" "daily_etl" {
 2. *Recurring* → cron **`0 12 ? * MON-FRI *`** (UTC — dentro de la ventana de encendido del
    auto start/stop) · *Flexible time window*: **Off**.
 3. *Target*: **AWS Lambda → Invoke** → `pyspark-stack-trigger-airflow` → *Payload*:
-   `{"dag": "customer_etl_dag"}`.
+   `{"dag": "customer_etl_emr"}`.
 4. El rol de invocación lo crea la consola automáticamente → *Create schedule*.
 
 </details>
@@ -2087,12 +2090,13 @@ resource "aws_s3_bucket_notification" "on_upload" {
 
 </details>
 
-> El `customer_etl_dag` actual del repo es el flujo local (landing → HDFS) y no lee
-> `dag_run.conf`: dispararlo por evento S3 lo corre, pero ignora el archivo que llegó. Para el
-> camino event-driven real, el DAG de producción debe leer `{{ dag_run.conf['bucket'] }}` /
-> `{{ dag_run.conf['key'] }}` y pasarlos al job como `entryPointArguments` del
-> `EmrServerlessStartJobOperator` (patrón de §9.0); el job Spark en EMR Serverless lee entonces
-> justo ese objeto de `s3a://`.
+> Los dos disparadores (cron y evento S3) apuntan al DAG de producción `customer_etl_emr`
+> (§10.2) — no al `customer_etl_dag` dev-local, que usa el Spark/HDFS deshabilitado en prod.
+> Tal como viene, `customer_etl_emr` tampoco lee `dag_run.conf` (procesa por `{{ ds }}`):
+> dispararlo por evento S3 lo corre, pero ignora el archivo puntual que llegó. Para el camino
+> event-driven real, hacé que lea `{{ dag_run.conf['bucket'] }}` / `{{ dag_run.conf['key'] }}`
+> y los pase como `entryPointArguments` del `EmrServerlessStartJobOperator` (patrón de §9.0);
+> el job Spark en EMR Serverless lee entonces justo ese objeto de `s3a://`.
 
 ---
 
@@ -2145,17 +2149,17 @@ $S 'aws s3 cp /etc/hostname "s3://pyspark-stack-datalake-'"$ACCT"'/raw/smoke-iam
 
 # ── 4. NEGOCIO end-to-end (orquestación) ─────────────────────────────────
 # El compose base no setea DAGS_ARE_PAUSED_AT_CREATION → los DAGs nacen pausados y el trigger quedaría en queued:
-$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags unpause customer_etl_dag'
+$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags unpause customer_etl_emr'
 aws lambda invoke --function-name pyspark-stack-trigger-airflow \
   --cli-binary-format raw-in-base64-out \
-  --payload '{"dag":"customer_etl_dag"}' /dev/stdout          # disparo manual (mismo camino que EventBridge/S3)
-$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags list-runs customer_etl_dag'
+  --payload '{"dag":"customer_etl_emr"}' /dev/stdout          # disparo manual (mismo camino que EventBridge/S3)
+$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags list-runs customer_etl_emr'
 # event-driven: un archivo nuevo en raw/ debe disparar el DAG solo
 echo "smoke" > /tmp/datos.csv
 aws s3 cp /tmp/datos.csv "s3://pyspark-stack-datalake-$ACCT/raw/"
 aws logs tail /aws/lambda/pyspark-stack-trigger-airflow --since 5m   # ¿llegó la notificación S3 → Lambda?  luego repetí el list-runs
-# Honestidad: el DAG actual ignora el conf {bucket,key} — esto valida el plumbing S3→Lambda→SSM,
-# no que se procese el archivo subido (el patrón real de DAG parametrizado es §9.0).
+# Honestidad: customer_etl_emr tal como viene ignora el conf {bucket,key} (procesa por {{ ds }}) —
+# esto valida el plumbing S3→Lambda→SSM, no que se procese el archivo subido (DAG parametrizado: §9.0).
 
 # ── 5. MONITOREO (por túnel -L 9090 -L 3000 -L 9093 -L 3100) ─────────────
 # Esta capa recién pasa cuando exista el monitoreo (§12–§14) — en la primera pasada de la guía, saltala.
@@ -2179,7 +2183,7 @@ aws lambda invoke --function-name pyspark-stack-startstop \
 
 # Disparar un DAG a mano (mismo camino que usa EventBridge/S3):
 aws lambda invoke --function-name pyspark-stack-trigger-airflow \
-  --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_dag"}' /dev/stdout
+  --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_emr"}' /dev/stdout
 
 # Teardown total
 cd infra/prod && terraform destroy
@@ -2227,7 +2231,7 @@ Dos usos distintos del mismo `.ipynb`:
 | Uso | Cómo | Dónde |
 |---|---|---|
 | **Explorar / desarrollar** | Interactivo en JupyterLab | `./notebooks` (montado en `/opt/notebooks`) |
-| **Ejecutar programado** (parte de un pipeline) | **papermill** disparado por un DAG | el mismo `./notebooks`, output a `./spark-apps/notebook-output` |
+| **Ejecutar programado** (parte de un pipeline) | **papermill** disparado por un DAG | el mismo `./notebooks`, output a `./notebooks/notebook-output` (§9.3) |
 
 Regla: los notebooks se guardan en `./notebooks` (versionados en git). Para ejecutarlos de forma
 automática se usa papermill, que inyecta parámetros y corre el notebook de punta a punta desde un
@@ -2423,32 +2427,41 @@ run_date = "2026-01-01"
 ### 9.3 DAG que ejecuta el notebook — `dags/run_notebook_dag.py`
 
 Prerrequisitos: creá `notebooks/analysis.ipynb` con una celda tagueada `parameters` (§9.2) y
-`mkdir -p spark-apps/notebook-output` (papermill no crea el directorio de salida).
+`mkdir -p notebooks/notebook-output` (papermill no crea el directorio de salida; al vivir dentro
+de `./notebooks`, entrada y salida usan el único mount que el scheduler de prod tiene, §9.1/§14.1).
 
 ```python
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from airflow.sdk import DAG   # Airflow 3: Task SDK (misma convención que el resto de los DAGs)
-from airflow.providers.papermill.operators.papermill import PapermillOperator
 
-with DAG(
-    dag_id="run_notebook_example",
-    schedule=None,  # manual o disparado por otro DAG/Lambda
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    tags=["notebook", "papermill"],
-) as dag:
-    PapermillOperator(
-        task_id="run_analysis_notebook",
-        input_nb="/opt/notebooks/analysis.ipynb",
-        output_nb="/opt/spark-apps/notebook-output/analysis_{{ ds }}.ipynb",
-        parameters={"run_date": "{{ ds }}"},  # inyecta la fecha de ejecución
-    )
+# Import PROTEGIDO (mismo patrón que los DAGs EMR de §10.2): el CI (§11.2) no instala el
+# provider papermill — sin el try/except, este archivo rompería el DagBag y el gate dag-validate.
+try:
+    from airflow.providers.papermill.operators.papermill import PapermillOperator
+except ImportError:
+    PapermillOperator = None  # entorno sin el provider (CI, dev local sin rebuild de §9.1)
+
+if PapermillOperator is not None:
+    with DAG(
+        dag_id="run_notebook_example",
+        default_args={"owner": "data-eng", "retries": 1, "retry_delay": timedelta(minutes=2)},
+        schedule=None,  # manual o disparado por otro DAG/Lambda
+        start_date=datetime(2026, 1, 1),
+        catchup=False,
+        tags=["notebook", "papermill"],
+    ) as dag:
+        PapermillOperator(
+            task_id="run_analysis_notebook",
+            input_nb="/opt/notebooks/analysis.ipynb",
+            output_nb="/opt/notebooks/notebook-output/analysis_{{ ds }}.ipynb",
+            parameters={"run_date": "{{ ds }}"},  # inyecta la fecha de ejecución
+        )
 ```
 
-papermill guarda una **copia ejecutada con outputs** en `notebook-output/` (queda como
+papermill guarda una **copia ejecutada con outputs** en `notebooks/notebook-output/` (queda como
 evidencia/auditoría de cada corrida). Comprobalo con un run manual del DAG y
-`ls spark-apps/notebook-output/`.
+`ls notebooks/notebook-output/`.
 
 ---
 
@@ -2769,7 +2782,10 @@ subproceso (~200–400 MB) y 10 concurrentes ajustan los 8 GB de la `t3.large`.
 verdad** lo fija el tope de la aplicación EMR Serverless:
 
 ```hcl
-maximum_capacity { cpu = "16 vCPU", memory = "64 GB" }   # ~2–4 jobs pesados en paralelo; el resto ENCOLA
+maximum_capacity {   # ~2–4 jobs pesados en paralelo; el resto ENCOLA
+  cpu    = "16 vCPU"
+  memory = "64 GB"
+}
 ```
 
 Con 16 vCPU, ~2–4 jobs "pesados" corren simultáneos y los demás **encolan** (arrancan al liberarse
@@ -3214,7 +3230,8 @@ precommit:  ## Corre todos los hooks
 ```
 
 > Verificá: `make lint && make test` en local reproduce los jobs `lint` y `dag-validate` del CI
-> (ruff pasa, pytest 6/6). Con `pre-commit install`, los hooks corren en cada commit.
+> (ruff pasa, pytest 5/5: parseo + DagBag no vacío + los 3 estándares parametrizados). Con
+> `pre-commit install`, los hooks corren en cada commit.
 
 ### 11.3 Workflow de Deploy — `.github/workflows/deploy.yml`
 
@@ -3573,13 +3590,13 @@ groups:
         # or absent(...): si la serie desaparece (p. ej. statsd-exporter reiniciado), increase()
         # devuelve vacío —no 0— y sin él la alerta nunca dispararía.
         expr: >-
-          increase(airflow_dagrun_duration_success_count{dag_id="customer_etl_dag"}[26h]) == 0
-          or absent(airflow_dagrun_duration_success_count{dag_id="customer_etl_dag"})
+          increase(airflow_dagrun_duration_success_count{dag_id="customer_etl_emr"}[26h]) == 0
+          or absent(airflow_dagrun_duration_success_count{dag_id="customer_etl_emr"})
         for: 10m
         labels: { severity: critical }
         annotations:
           summary: "El ETL diario no completó con éxito (dead-man switch)"
-          description: "customer_etl_dag no registró corrida exitosa en 26h (¿EC2 apagada? ¿trigger falló?). Ajustá dag_id/ventana al DAG real."
+          description: "customer_etl_emr (el DAG que dispara el cron de §7.2) no registró corrida exitosa en 26h (¿EC2 apagada? ¿trigger falló?). Ajustá la ventana a tu schedule real."
       # ── EMR Serverless: un job Spark que FALLA hace fallar la task del EmrServerlessJobSensor/
       # Operator en Airflow → se ve en airflow_ti_failures. Esta alerta lo hace explícito. ──
       - alert: EmrServerlessJobFailed
@@ -4125,7 +4142,7 @@ El `.gitignore` de la raíz ya cubre todo lo sensible; lo clave que debe mantene
 **/lambda/*.zip                            # lambdas empaquetadas
 monitoring/alertmanager/alertmanager.yml   # tiene el smtp password
 spark-events/*                             # event logs de Spark (se conserva spark-defaults.conf)
-notebooks/**/output/  ·  spark-apps/notebook-output/   # salidas de papermill
+notebooks/**/output/  ·  notebooks/notebook-output/    # salidas de papermill (§9.3)
 ```
 
 El `.env.example` (sin valores reales) y el `README.md` raíz (que enlaza estas guías y lista los

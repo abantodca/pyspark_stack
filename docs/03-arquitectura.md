@@ -63,8 +63,9 @@ clásico ni Glue.
    Otros buckets:  S3 artifacts (scripts / logs)   ·   S3 + DynamoDB (tfstate + lock)
 
    ─────────────────────────────────────────────────────────────────────────────
-   SEGURIDAD:  el Security Group abre SOLO el puerto 22 desde tu IP ·
-               todas las UIs van por túnel SSH · SSM opera sin abrir puertos
+   SEGURIDAD:  el Security Group abre SOLO el puerto 22 desde tu IP (y 443,
+               opcional, para la web de Airflow — guía 02 §5.6) ·
+               el resto de las UIs va por túnel SSH · SSM opera sin abrir puertos
 ```
 
 ### Versión Mermaid (se renderiza en GitHub / VS Code)
@@ -220,7 +221,7 @@ laptop (edita dags/spark-apps/notebooks) → git push a main
 ```
 Notebook en ./notebooks (celda tag 'parameters')
   → DAG con PapermillOperator inyecta params y ejecuta el .ipynb
-  → copia ejecutada (con outputs) a ./spark-apps/notebook-output/
+  → copia ejecutada (con outputs) a ./notebooks/notebook-output/
 ```
 > El provider de papermill no viene en `requirements.txt`; hay que instalarlo según la
 > [guía 02 §9.1](02-produccion-aws.md#91-habilitar-papermill).
@@ -229,8 +230,10 @@ Notebook en ./notebooks (celda tag 'parameters')
 
 ## 4. Red y seguridad
 
-- **Ingress:** solo el puerto 22 (SSH) desde tu IP. Ninguna UI (Airflow, Grafana, Spark…) se
-  expone a internet: se acceden por túnel SSH.
+- **Ingress:** solo el puerto 22 (SSH) desde tu IP, más una excepción **opcional**: 443 (HTTPS)
+  también restringido a tu IP si exponés la web de Airflow con TLS nativo (guía 02 §5.6 / guía
+  02b §4.6; off por defecto). El resto de las UIs (Grafana, Prometheus, Loki, Jupyter…) nunca se
+  exponen a internet: se acceden por túnel SSH.
 - **SSM Session Manager:** acceso e invocación de comandos (la Lambda dispara `airflow dags
   trigger`) sin abrir puertos ni exponer la API de Airflow.
 - **Credenciales S3:** ninguna capa usa access keys en disco. Airflow usa el rol IAM de la EC2
@@ -255,7 +258,7 @@ Notebook en ./notebooks (celda tag 'parameters')
 
 ## 5. Costo y capacidad de esta arquitectura (us-east-1)
 
-> Precios aproximados on-demand, sujetos a cambio — validá en
+> Precios aproximados on-demand, estimados en julio 2026 y sujetos a cambio — validá en
 > [calculator.aws](https://calculator.aws). Escenario real: 2 GB/día, 3 corridas/semana (≈13/mes).
 
 Desglose (producción con auto start/stop, 8 h × 22 días laborales):

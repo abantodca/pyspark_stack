@@ -112,7 +112,8 @@ que sigue la guía, y por qué:
 
 ## 2. Costo
 
-Idéntico a la guía 02 (la vía de creación no cambia el precio). Precios aproximados us-east-1
+Idéntico a la guía 02 (la vía de creación no cambia el precio). Precios aproximados us-east-1,
+estimados en julio 2026
 (on-demand), sujetos a cambio — validá en [calculator.aws](https://calculator.aws). Escenario real:
 ~2 GB/día, 3 corridas/semana (≈13/mes) de Spark en EMR Serverless, ~50 GB en el data lake.
 
@@ -289,9 +290,12 @@ Consola: **IAM → Roles → Create role**.
 set -euxo pipefail
 dnf update -y && dnf install -y docker git && systemctl enable --now docker
 
+# Versión PINEADA (mismo criterio que las imágenes por @sha256): un boot de hoy y uno de dentro
+# de 6 meses instalan lo mismo. Actualizala a propósito, no dejes que "latest" decida por vos.
+COMPOSE_VERSION=v5.3.1
 DOCKER_CONFIG=/usr/local/lib/docker
 mkdir -p $DOCKER_CONFIG/cli-plugins
-curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+curl -SL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
   -o $DOCKER_CONFIG/cli-plugins/docker-compose
 chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
 usermod -aG docker ec2-user
@@ -926,11 +930,11 @@ ssm = boto3.client("ssm")
 
 def handler(event, context):
     """Dispara un DAG de Airflow dentro de la EC2 vía SSM SendCommand.
-    - Por cron (EventBridge): event = {"dag": "customer_etl_dag"}.
+    - Por cron (EventBridge): event = {"dag": "customer_etl_emr"}.
     - Por evento S3: event = {"Records": [{s3: {bucket, object{key}}}]} → pasa bucket/key como --conf.
     """
     instance_id = os.environ["INSTANCE_ID"]
-    default_dag = os.environ.get("DEFAULT_DAG", "customer_etl_dag")
+    default_dag = os.environ.get("DEFAULT_DAG", "customer_etl_emr")
 
     conf = {}
     dag = event.get("dag", default_dag)
@@ -955,7 +959,8 @@ def handler(event, context):
 
 **Paso 2 — Handler y variables.** *Runtime settings → Edit* → **Handler** = `lambda_function.handler`.
 *Configuration → General → Edit* → **Timeout** = **1 min**. *Environment variables*:
-`INSTANCE_ID=<i-xxxxxxxx>` (tu instancia) y `DEFAULT_DAG=customer_etl_dag`.
+`INSTANCE_ID=<i-xxxxxxxx>` (tu instancia) y `DEFAULT_DAG=customer_etl_emr` (el DAG de
+producción EMR, §12 — no el flujo dev local).
 
 **Paso 3 — Permisos (inline policy en el rol de ejecución de la Lambda).** *Configuration →
 Permissions* → clic en el role → **Add permissions → Create inline policy → JSON**:
@@ -987,10 +992,10 @@ Permissions* → clic en el role → **Add permissions → Create inline policy 
 > ```bash
 > aws ssm describe-instance-information --query "InstanceInformationList[?InstanceId=='<i-xxxx>'].PingStatus"  # ["Online"]
 > aws lambda invoke --function-name pyspark-stack-trigger-airflow \
->   --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_dag"}' /dev/stdout
+>   --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_emr"}' /dev/stdout
 > ```
 > O en la consola: **Lambda → `pyspark-stack-trigger-airflow` → Test** con evento
-> `{"dag": "customer_etl_dag"}`.
+> `{"dag": "customer_etl_emr"}`.
 
 ### 6.2 Disparo por cron
 
@@ -1000,7 +1005,7 @@ Consola: **EventBridge → Scheduler → Create schedule**.
 - *Recurring* · *Cron-based* → `cron(0 12 ? * MON-FRI *)` (12:00 UTC, dentro de la ventana de
   encendido del auto start/stop, §4.4) · *Flexible time window* **Off** · *Timezone* **UTC**.
 - *Target*: **AWS Lambda → Invoke** → `pyspark-stack-trigger-airflow` · *Payload*
-  `{"dag": "customer_etl_dag"}`.
+  `{"dag": "customer_etl_emr"}` (el DAG de producción, §12).
 - *Permissions*: **Create a new role for this schedule** → **Create schedule**.
 
 > Verificá (CLI): `aws scheduler list-schedules --query 'Schedules[].Name'` → aparece
@@ -1020,9 +1025,11 @@ event notification**.
 > La consola agrega sola el permiso para que S3 invoque la Lambda (lo que en Terraform sería el
 > `aws_lambda_permission`). Si diera error de permisos, aceptá el diálogo que ofrece agregarlo.
 
-> El `customer_etl_dag` actual del repo es el flujo local y **no lee** `dag_run.conf`: dispararlo por
-> evento S3 lo corre pero ignora el archivo. Para el camino event-driven real, el DAG de producción
-> debe leer `{{ dag_run.conf['bucket'] }}` / `{{ dag_run.conf['key'] }}` y pasarlos al job como
+> Los dos disparadores (cron y evento S3) apuntan al DAG de producción `customer_etl_emr` (§12) —
+> no al `customer_etl_dag` dev-local, que usa el Spark/HDFS deshabilitado en prod. Tal como viene,
+> `customer_etl_emr` tampoco lee `dag_run.conf` (procesa por `{{ ds }}`): por evento S3 corre pero
+> ignora el archivo puntual. Para el camino event-driven real, hacé que lea
+> `{{ dag_run.conf['bucket'] }}` / `{{ dag_run.conf['key'] }}` y los pase como
 > `entryPointArguments` del `EmrServerlessStartJobOperator` (patrón de §12/§14).
 
 ---
@@ -1207,7 +1214,8 @@ rol).
 `.pre-commit-config.yaml` y `Makefile`). Reproducidos acá para que la guía sea autocontenida:
 
 **`.github/workflows/ci.yml`** — 3 jobs sin credenciales AWS: lint (ruff), validación de DAGs
-(pytest sobre el `DagBag`), security (gitleaks + checkov):
+(pytest sobre el `DagBag`), security (gitleaks; el step de checkov de la guía 02 no aplica acá —
+no hay Terraform que escanear):
 
 ```yaml
 name: CI
@@ -1380,8 +1388,8 @@ groups:
         annotations: { summary: "Disco /data casi lleno" }
       - alert: DailyEtlMissing   # dead-man switch: el ETL diario dejó de correr en silencio
         expr: >-
-          increase(airflow_dagrun_duration_success_count{dag_id="customer_etl_dag"}[26h]) == 0
-          or absent(airflow_dagrun_duration_success_count{dag_id="customer_etl_dag"})
+          increase(airflow_dagrun_duration_success_count{dag_id="customer_etl_emr"}[26h]) == 0
+          or absent(airflow_dagrun_duration_success_count{dag_id="customer_etl_emr"})
         for: 10m
         labels: { severity: critical }
         annotations: { summary: "El ETL diario no completó con éxito (dead-man switch)" }
@@ -1859,7 +1867,7 @@ aws lambda invoke --function-name pyspark-stack-startstop \
 
 # Disparar un DAG a mano (mismo camino que EventBridge/S3):
 aws lambda invoke --function-name pyspark-stack-trigger-airflow \
-  --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_dag"}' /dev/stdout
+  --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_emr"}' /dev/stdout
 ```
 
 > Sin CLI: prender/apagar desde **EC2 → Instances → Instance state**; disparar un DAG desde **Lambda →
@@ -2002,7 +2010,9 @@ aws s3 sync spark-apps/emr/ "s3://pyspark-stack-artifacts-$ACCT/emr/" --exclude 
 #    a) crear monitoring/alertmanager/alertmanager.yml con el app password real (no está en git)
 #    b) generar el .env desde SSM y verificarlo:
 ./scripts/load-secrets.sh
-wc -l .env           # 12 variables (+1 AIRFLOW_DOMAIN si exponés la web por HTTPS)
+wc -l .env           # 12 variables (las que emite load-secrets.sh)
+# Si exponés la web por HTTPS (§4.6), AIRFLOW_DOMAIN se agrega A MANO (no lo genera el script):
+#   echo "AIRFLOW_DOMAIN=airflow.midominio.com" >> .env     → wc -l .env pasa a 13
 ls -l .env           # -rw------- (chmod 600)
 
 # 4. Validar el merge de los compose ANTES de levantar:
@@ -2042,10 +2052,10 @@ $S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags li
 $S 'aws s3 cp /etc/hostname "s3://pyspark-stack-datalake-'"$ACCT"'/raw/smoke-iam.txt"'  # prueba el rol IAM
 
 # ── 4. NEGOCIO end-to-end ──
-$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags unpause customer_etl_dag'
+$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags unpause customer_etl_emr'
 aws lambda invoke --function-name pyspark-stack-trigger-airflow \
-  --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_dag"}' /dev/stdout
-$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags list-runs customer_etl_dag'
+  --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_emr"}' /dev/stdout
+$S 'cd pyspark_stack && docker compose exec -T airflow-scheduler airflow dags list-runs customer_etl_emr'
 
 # ── 5. MONITOREO (por túnel -L 9090 -L 3000 -L 9093 -L 3100) ──
 curl -sf localhost:9090/-/healthy && echo "Prometheus OK"

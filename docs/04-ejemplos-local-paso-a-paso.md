@@ -59,7 +59,7 @@ Y en el navegador: Airflow `:8082` (`admin`/`admin`), Jupyter `:8888`, Spark `:8
 
 > Si algún contenedor queda en `Created` con `address already in use` aunque el puerto parezca libre:
 > son `docker-proxy` huérfanos. `pgrep -a docker-proxy` → `sudo kill -9 <PIDs>` → `docker compose up -d`
-> (ANALISIS_FALLOS §8).
+> ([ANALISIS_FALLOS §8](../ANALISIS_FALLOS.md)).
 
 ### 0.3 Preparar el área de ejemplos (una sola vez)
 
@@ -95,7 +95,7 @@ docker compose up -d
 
 > Regla: `stop/start` para el día a día · `down` para liberar contenedores conservando datos ·
 > `down -v` **solo** para empezar limpio (o tras cambiar un `Dockerfile`/versión). Detalle en
-> [README](../README.md) y ANALISIS_FALLOS §5.6.
+> [README](../README.md) y [ANALISIS_FALLOS §5.6](../ANALISIS_FALLOS.md).
 
 ### 0.7 Empezar la "carrera"
 
@@ -317,7 +317,7 @@ enriquecido.show(truncate=False)
 columna `_corrupt_record` y el join fallará con `cannot resolve 'product_id'`.
 
 **Por qué:** `spark.read.json` asume **JSON Lines** (un objeto por línea). Un array con saltos de línea
-necesita `multiline=true`. Es el bug crítico #1 del histórico (ANALISIS_FALLOS §2.1).
+necesita `multiline=true`. Es el bug crítico #1 del histórico ([ANALISIS_FALLOS §2.1](../ANALISIS_FALLOS.md)).
 
 ---
 
@@ -526,7 +526,7 @@ provider `standard`, y `schedule=` (no `schedule_interval=`).
 `customer_etl_dag`. En prod ese Bash se cambia por un operador de EMR Serverless.
 
 > ⚠️ Añade `set -euo pipefail` si mueves esto a un `.sh`: el shell del pipeline heredado **no** lo
-> tiene y un fallo intermedio deja el DAG en `success` engañoso (ANALISIS_FALLOS §6.2).
+> tiene y un fallo intermedio deja el DAG en `success` engañoso ([ANALISIS_FALLOS §6.2](../ANALISIS_FALLOS.md)).
 
 ---
 
@@ -757,7 +757,7 @@ fila a fila. Mucho más rápido que un UDF Python clásico.
 
 **Por qué:** aquí se cobra el peaje del stack: el Pandas UDF **solo funciona porque driver y executors
 comparten Python 3.12** y ambos tienen `pyarrow` (viene con `pyspark`). Es la razón de fondo de toda
-la alineación de versiones (ANALISIS_FALLOS §5.3). Si algún día falla con `[PYTHON_VERSION_MISMATCH]`
+la alineación de versiones ([ANALISIS_FALLOS §5.3](../ANALISIS_FALLOS.md)). Si algún día falla con `[PYTHON_VERSION_MISMATCH]`
 o `ModuleNotFoundError: pyarrow`, el problema es de imagen, no del código.
 
 ---
