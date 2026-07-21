@@ -450,10 +450,9 @@ services:
     # contenedor menos 1 GB y todos los cores del host. Los 3G/2 cores se fijan en el
     # override de producción (docs/02).
 
-  jupyter:
-    <<: [*restart-policy, *default-logging]
-    environment:
-      - JUPYTER_TOKEN=${JUPYTER_TOKEN}   # ← token obligatorio, no vacío
+  # (jupyter no aparece acá: está bajo el perfil `dev` y el docker-compose.prod.yml de
+  #  docs/02 §14.1 no lo incluye — en producción no corre. Su JUPYTER_TOKEN se define en el
+  #  compose base, para el uso local.)
 
   airflow-db:
     <<: [*restart-policy, *default-logging]
@@ -532,7 +531,7 @@ Antes de considerar el stack "listo":
 
 - [ ] `.env` fuera de git (`.gitignore`) y con secretos generados con `openssl`.
 - [ ] `AIRFLOW_JWT_SECRET` único por entorno.
-- [ ] Jupyter con `JUPYTER_TOKEN` no vacío.
+- [ ] Jupyter con `JUPYTER_TOKEN` no vacío (solo aplica local: en prod no corre).
 - [ ] `restart: unless-stopped` en todos los servicios long-running.
 - [ ] Healthchecks en HDFS, Spark y Jupyter (no solo Postgres).
 - [ ] Límites de memoria por servicio (`deploy.resources.limits`).
@@ -542,5 +541,5 @@ Antes de considerar el stack "listo":
 - [ ] Volúmenes con backup (Postgres + HDFS namenode).
 
 > Siguiente paso: ver `02-produccion-aws.md` — guía única de producción (un solo camino: EC2
-> self-managed + S3 + Lambda/EventBridge), Terraform, estado remoto en S3+DynamoDB, monitoreo,
+> self-managed + S3 + Lambda/EventBridge), Terraform, estado remoto en S3, monitoreo,
 > CI/CD y automatización de costo con auto start/stop. La arquitectura está en `03-arquitectura.md`.

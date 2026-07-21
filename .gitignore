@@ -7,9 +7,10 @@
 **/.terraform/*
 *.tfstate
 *.tfstate.*
-.terraform.lock.hcl
 *.tfvars
 !*.tfvars.example
+# .terraform.lock.hcl SI se versiona: pinea las versiones exactas de los providers, para que un
+# init de hoy y uno de dentro de 6 meses instalen lo mismo (mismo criterio que COMPOSE_VERSION).
 
 # --- Config de monitoreo con credenciales ---
 monitoring/alertmanager/alertmanager.yml

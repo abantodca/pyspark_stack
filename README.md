@@ -32,15 +32,6 @@ docker compose up -d --build
 
 Jupyter es dev-only: vive en el perfil `dev` de Compose y en producción no arranca. Copiar `.env.example` deja `COMPOSE_PROFILES=dev`, así que `docker compose up` lo incluye; sin esa variable, se levanta con `docker compose --profile dev up -d jupyter`.
 
-### Modo dev-lite (~8 GB de RAM)
-
-Solo Spark + Jupyter, sin HDFS ni Airflow. El archivo `docker-compose.dev.yml` no viene en el repo: hay que crearlo copiándolo desde la [guía de producción](docs/02-produccion-aws.md), §14.2.
-
-```bash
-# Paso previo: crear docker-compose.dev.yml desde docs/02 §14.2
-docker compose -f docker-compose.dev.yml up -d --build
-```
-
 ## Documentación
 
 - [docs/01 — Docker Compose explicado](docs/01-docker-compose-explicado.md): anatomía del stack, bloque por bloque, y refactor de producción.

@@ -147,6 +147,10 @@ services:
       # del Dockerfile -> [PYTHON_VERSION_MISMATCH] contra los executors (3.12) del cluster.
       - PYSPARK_PYTHON=python3.12
       - PYSPARK_DRIVER_PYTHON=python3.12
+      # Sin esta línea el token del .env nunca llega al contenedor: compose usa el .env para
+      # sustituir en el YAML, no lo inyecta en el proceso. Dockerfile.jupyter lo lee como
+      # --ServerApp.token="${JUPYTER_TOKEN:-}" y, vacío, levanta JupyterLab SIN token.
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-}
 
   airflow-db:
     image: postgres:16

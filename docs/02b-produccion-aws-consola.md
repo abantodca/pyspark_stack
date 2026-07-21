@@ -190,6 +190,9 @@ Consola: **VPC → Security groups → Create security group**.
 
 1. **Basic details**: *Security group name* `pyspark-stack-sg` · *Description* `SSH + web Airflow a mi
    IP`. *VPC*: la **default**.
+   > Si cambiás ese texto: AWS solo acepta `a-zA-Z0-9` y `. _-:/()#,@[]+=&;{}!$*` en las descripciones
+   > de SG (las de las reglas incluidas). Un acento o una comilla simple y la creación falla con
+   > `InvalidParameterValue`. Escribí "tunel", no "túnel".
 2. **Inbound rules → Add rule**:
    - Regla 1: *Type* **SSH** (TCP 22) · *Source* **My IP** (te autocompleta tu `/32`).
    - Regla 2 (solo si vas a exponer la web, §4.6): *Type* **HTTPS** (TCP 443) · *Source* **My IP**.
@@ -295,7 +298,7 @@ dnf update -y && dnf install -y docker git && systemctl enable --now docker
 COMPOSE_VERSION=v5.3.1
 DOCKER_CONFIG=/usr/local/lib/docker
 mkdir -p $DOCKER_CONFIG/cli-plugins
-curl -SL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+curl -fSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
   -o $DOCKER_CONFIG/cli-plugins/docker-compose
 chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
 usermod -aG docker ec2-user
@@ -311,7 +314,11 @@ done
 if [ -n "$DATA_DEV" ]; then
   blkid "$DATA_DEV" || mkfs -t xfs "$DATA_DEV"
   mkdir -p /data && mount "$DATA_DEV" /data
-  echo "$DATA_DEV /data xfs defaults,nofail 0 2" >> /etc/fstab
+  # Por UUID, NO por nombre de device: la enumeración NVMe puede cambiar entre boots (AWS lo
+  # documenta), y esta EC2 para y arranca todos los días. Si el nombre baila, `nofail` hace
+  # exactamente lo que promete —no falla, no monta— y los servicios que escriben en /data quedan
+  # en crash-loop por permisos sobre un /data vacío del disco root.
+  echo "UUID=$(blkid -s UUID -o value "$DATA_DEV") /data xfs defaults,nofail 0 2" >> /etc/fstab
   chown -R ec2-user:ec2-user /data
   # Bind mounts del compose de prod. Prometheus (65534), Grafana (472) y Loki (10001) corren
   # sin privilegios: sin este chown quedan en crash-loop por "permission denied".
@@ -890,8 +897,13 @@ expone la Spark UI de cada corrida desde la consola de EMR.
 
 ### 5.5 S3 VPC Gateway Endpoint
 
-Para que el tráfico **EC2↔S3** y **EMR↔S3** no salga a internet (menor superficie, y **gratis** — el
+Para que el tráfico **EC2↔S3** no salga a internet (menor superficie, y **gratis** — el
 gateway endpoint de S3 no cobra por hora ni por GB). Consola: **VPC → Endpoints → Create endpoint**.
+
+> **No cubre a EMR Serverless.** Un gateway endpoint inyecta una ruta en la route table de tu VPC,
+> así que solo afecta tráfico que sale de ENIs de esa VPC. La app EMR se crea sin configuración de
+> red, o sea que corre en la red administrada de AWS, fuera de tu VPC: no hay ENI tuya y el endpoint
+> no le aplica. Solo aplicaría si le configuraras subnets.
 
 1. *Name* `pyspark-stack-s3-endpoint`.
 2. *Service category*: **AWS services** → buscá `com.amazonaws.us-east-1.s3` con *Type* **Gateway**
@@ -1113,7 +1125,8 @@ POSTGRES_PASSWORD=$(get postgres_password)
 AIRFLOW_JWT_SECRET=$(get airflow_jwt_secret)
 AIRFLOW_ADMIN_USER=admin
 AIRFLOW_ADMIN_PASSWORD=$(get airflow_admin_password)
-JUPYTER_TOKEN=$(get jupyter_token)
+# (Sin JUPYTER_TOKEN: en prod Jupyter no corre —perfil `dev`— y el compose no le pasa la
+#  variable al contenedor, así que era un secreto muerto.)
 GRAFANA_ADMIN_PASSWORD=$(get grafana_admin_password)
 EMR_APP_ID=${EMR_APP_ID}
 EMR_JOB_ROLE_ARN=${EMR_JOB_ROLE_ARN}
@@ -1881,7 +1894,8 @@ aws lambda invoke --function-name pyspark-stack-trigger-airflow \
       `ssm:SendCommand` sobre esta instancia; EMR con su propio rol scopeado a los buckets; la EC2
       solo `StartJobRun` + `PassRole` (con `iam:PassedToService`).
 - [ ] Spark (EMR) y Airflow usan `s3a://`/`s3://` con rol IAM, sin access keys en disco.
-- [ ] Tráfico EC2↔S3 y EMR↔S3 por el S3 VPC Gateway Endpoint (§5.5).
+- [ ] Tráfico EC2↔S3 por el S3 VPC Gateway Endpoint (§5.5). (EMR Serverless no aplica: corre
+      fuera de tu VPC — ver §5.5.)
 - [ ] Secretos en SSM Parameter Store / Secrets Manager (§7), no en texto plano.
 - [ ] `.env`, `monitoring/alertmanager/alertmanager.yml` en `.gitignore`.
 
@@ -2010,9 +2024,9 @@ aws s3 sync spark-apps/emr/ "s3://pyspark-stack-artifacts-$ACCT/emr/" --exclude 
 #    a) crear monitoring/alertmanager/alertmanager.yml con el app password real (no está en git)
 #    b) generar el .env desde SSM y verificarlo:
 ./scripts/load-secrets.sh
-wc -l .env           # 12 variables (las que emite load-secrets.sh)
+wc -l .env           # 11 variables (las que emite load-secrets.sh)
 # Si exponés la web por HTTPS (§4.6), AIRFLOW_DOMAIN se agrega A MANO (no lo genera el script):
-#   echo "AIRFLOW_DOMAIN=airflow.midominio.com" >> .env     → wc -l .env pasa a 13
+#   echo "AIRFLOW_DOMAIN=airflow.midominio.com" >> .env     → wc -l .env pasa a 12
 ls -l .env           # -rw------- (chmod 600)
 
 # 4. Validar el merge de los compose ANTES de levantar:

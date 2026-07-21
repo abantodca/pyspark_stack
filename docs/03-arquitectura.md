@@ -60,7 +60,7 @@ clásico ni Glue.
         │  archivo nuevo en raw/  →  evento S3 "ObjectCreated"
         └───────────────────────►  Lambda trigger-airflow   (ciclo event-driven)
 
-   Otros buckets:  S3 artifacts (scripts / logs)   ·   S3 + DynamoDB (tfstate + lock)
+   Otros buckets:  S3 artifacts (scripts / logs)   ·   S3 tfstate (lock nativo S3)
 
    ─────────────────────────────────────────────────────────────────────────────
    SEGURIDAD:  el Security Group abre SOLO el puerto 22 desde tu IP (y 443,
@@ -102,7 +102,7 @@ flowchart TD
         subgraph S3["S3"]
             dl["data lake · raw/curated/analytics"]
             art["artifacts · scripts/logs"]
-            tf["tfstate + DynamoDB lock"]
+            tf["tfstate + lock nativo S3"]
         end
     end
 
@@ -149,7 +149,7 @@ flowchart TD
 | EventBridge Scheduler | AWS | Cron de ETL y de start/stop |
 | EC2 + EBS + Elastic IP + SG | AWS | Host del stack |
 | IAM roles | AWS | Permisos least-privilege |
-| S3 + DynamoDB (tfstate) | AWS | Estado remoto de Terraform |
+| S3 (tfstate) | AWS | Estado remoto de Terraform (lock con `use_lockfile`) |
 | GitHub Actions + OIDC | AWS + GitHub | CI/CD: valida en PRs y despliega DAGs |
 | Snapshots EBS (DLM) | AWS | Backups automáticos de `/data` |
 | SSM Parameter Store / Secrets Manager | AWS | Secretos fuera del `.env` |
@@ -163,7 +163,7 @@ flowchart TD
 
 ### 3.1 Despliegue (una vez)
 ```
-bootstrap (S3+DynamoDB) → terraform apply (S3, EC2, IAM, Lambda, EventBridge, EIP)
+bootstrap (S3) → terraform apply (S3, EC2, IAM, Lambda, EventBridge, EIP)
 → rsync del proyecto a la EC2 → docker compose up -d --build
 ```
 
@@ -252,7 +252,7 @@ Notebook en ./notebooks (celda tag 'parameters')
 - **IMDSv2 + EBS:** metadata solo por IMDSv2 (`hop_limit` 2), volúmenes EBS cifrados, acceso al
   host solo por SSM (SG abre únicamente `:22` desde tu IP).
 - **Logs de EMR Serverless:** cifrados y con retención definida (S3 y/o CloudWatch Logs).
-- **Estado Terraform:** cifrado y versionado en S3, lock en DynamoDB.
+- **Estado Terraform:** cifrado y versionado en S3; lock nativo de S3 (`use_lockfile`), sin DynamoDB.
 
 ---
 
