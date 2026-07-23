@@ -2687,31 +2687,51 @@ aws lambda invoke --function-name pyspark-stack-startstop \
 ### 15.3 Teardown manual (borrar todo, en orden inverso)
 
 Sin `terraform destroy`, hay que borrar cada recurso a mano para no dejar cargos. Orden inverso al de
-creación (dependencias primero los consumidores, luego los recursos base):
+creación (dependencias primero los consumidores, luego los recursos base). **Actualizado con todo lo
+de §6.3 (SQS), §8.1b (dbt CI) y §16 (gobierno)** — si armaste esto hace tiempo y no pasaste por esas
+secciones, saltealas acá también:
 
 1. **EventBridge → Scheduler**: borrar `pyspark-stack-start`, `pyspark-stack-stop`,
    `pyspark-stack-daily-etl`.
-2. **Lambda**: borrar `pyspark-stack-startstop` y `pyspark-stack-trigger-airflow`.
-3. **S3 → bucket datalake → Properties → Event notifications**: borrar `on-upload-raw`.
-4. **EMR → EMR Serverless**: *Stop* y luego *Delete* la aplicación `pyspark-stack-spark`.
-5. **EC2**: *Terminate* la instancia `pyspark-stack-node`. Después **Volumes**: borrar el volumen de
+2. **Lambda**: borrar `pyspark-stack-startstop` y `pyspark-stack-trigger-airflow` (esto borra solo
+   el *event source mapping* con la cola SQS del paso 3, no hace falta sacarlo antes).
+3. **SQS** (§6.3/§16.1, si las creaste): borrar `pyspark-stack-trigger-events`,
+   `pyspark-stack-trigger-airflow-dlq`, `pyspark-stack-startstop-dlq`.
+4. **SNS** (§16, Paso 0, si lo creaste): borrar el topic `pyspark-stack-alerts` (se lleva la
+   suscripción de email con él).
+5. **S3 → bucket datalake → Properties → Event notifications**: borrar `on-upload-raw`.
+6. **EMR → EMR Serverless**: si hay un job **`RUNNING`**, cancelalo primero (*Job runs* → *Cancel*)
+   — si no, el *Delete* de la aplicación se traba. Después *Stop* y *Delete* la aplicación
+   `pyspark-stack-spark`.
+7. **EC2**: *Terminate* la instancia `pyspark-stack-node`. Después **Volumes**: borrar el volumen de
    datos (30 GiB) — **ojo, acá perdés Postgres/monitoreo**; si querés conservarlo, hacé un snapshot
-   antes. **Snapshots**: borrar los del DLM si no los querés.
-6. **EC2 → Elastic IPs**: *Release* la EIP (si no, sigue cobrando).
-7. **EC2 → Lifecycle Manager**: borrar la policy de snapshots.
-8. **VPC → Endpoints**: borrar el S3 gateway endpoint.
-9. **VPC → Security groups**: borrar `pyspark-stack-sg`.
-10. **S3**: vaciar y borrar `pyspark-stack-artifacts-<acct>`. El `pyspark-stack-datalake-<acct>` tiene
-    tus datos — borralo solo si estás seguro (está versionado; hay que vaciar todas las versiones).
-11. **Systems Manager → Parameter Store**: borrar los `/pyspark-stack/*`.
-12. **Athena/Glue** (si los creaste): borrar el workgroup `pyspark-stack-analytics` y la base
-    `pyspark_stack_analytics`. **CloudWatch → Log groups**: borrar `/aws/emr-serverless/pyspark-stack`.
-13. **IAM → Roles**: borrar `pyspark-stack-ec2-role`, `pyspark-stack-emr-serverless-job`,
-    `pyspark-stack-github-actions`, el service role del DLM (si lo creó la consola) y los roles que
-    EventBridge Scheduler creó para los schedules, más los roles de ejecución de las Lambdas.
-    **IAM → Identity providers**: borrar el OIDC de GitHub. **EC2 → Key pairs**: borrar
-    `pyspark-stack-key`.
-14. **Route 53** (si usaste §4.6): borrar el `A record` `airflow.midominio.com`.
+   antes. **Snapshots**: borrar los del DLM si no los querés (quedan huérfanos, cobrando de a poco,
+   si no los borrás — DLM no los limpia solo al borrar la policy del paso 8).
+8. **EC2 → Elastic IPs**: *Release* la EIP (si no, sigue cobrando).
+9. **EC2 → Lifecycle Manager**: borrar la policy de snapshots.
+10. **VPC → Endpoints**: borrar el S3 gateway endpoint.
+11. **VPC → Security groups**: borrar `pyspark-stack-sg`.
+12. **S3**: vaciar y borrar `pyspark-stack-artifacts-<acct>` — **está versionado igual que
+    datalake** (§5.1, Bucket Versioning se activó en los DOS), así que también hay que vaciar todas
+    las versiones y delete markers, no solo los objetos actuales, o el *Delete bucket* falla. El
+    `pyspark-stack-datalake-<acct>` tiene tus datos — borralo solo si estás seguro, mismo cuidado
+    con las versiones.
+13. **Systems Manager → Parameter Store**: borrar los `/pyspark-stack/*`.
+14. **Athena/Glue** (si los creaste): borrar el workgroup `pyspark-stack-analytics` y las **dos**
+    bases — `pyspark_stack_analytics` **y** `pyspark_stack_analytics_ci` (§8.1b, si hiciste dbt Slim
+    CI alguna vez; Glue borra las tablas de adentro solo, en cascada). **CloudWatch → Log groups**:
+    borrar `/aws/emr-serverless/pyspark-stack`, `/aws/lambda/pyspark-stack-trigger-airflow` y
+    `/aws/lambda/pyspark-stack-startstop`.
+15. **Gobierno** (§16, si lo aplicaste): **AWS Budgets** → borrar el presupuesto mensual. **Cost
+    Anomaly Detection** → borrar el monitor y la suscripción de alertas. **IAM → Access Analyzer** →
+    borrar el analyzer `pyspark-stack-analyzer`.
+16. **IAM → Roles**: borrar `pyspark-stack-ec2-role`, `pyspark-stack-emr-serverless-job`,
+    `pyspark-stack-github-actions`, `pyspark-stack-dbt-ci` (§8.1b, si lo creaste), el service role
+    del DLM (si lo creó la consola) y los roles que EventBridge Scheduler creó para los schedules,
+    más los roles de ejecución de las Lambdas. **IAM → Identity providers**: borrar el OIDC de
+    GitHub (lo usan `github-actions` y `dbt-ci` — borralo recién después de los dos roles).
+    **EC2 → Key pairs**: borrar `pyspark-stack-key`.
+17. **Route 53** (si usaste §4.6): borrar el `A record` `airflow.midominio.com`.
 
 > Con esto no queda nada cobrando. Verificá en **Billing → Cost Explorer** los días siguientes que el
 > gasto cae a cero.

@@ -40,6 +40,7 @@
     - 8.2 [Cheat-sheet de operación](#82-cheat-sheet-de-operación)
     - 8.3 [Seguridad (checklist)](#83-seguridad-checklist)
     - 8.4 [Palancas de ahorro (orden de impacto)](#84-palancas-de-ahorro-orden-de-impacto)
+    - 8.5 [Teardown limpio: terraform destroy que sí termina](#85-teardown-limpio-terraform-destroy-que-sí-termina)
 9. [Notebooks: dónde viven y cómo se ejecutan](#9-notebooks-dónde-viven-y-cómo-se-ejecutan)
    - 9.0 [Patrones de tarea para ETL batch (¿PySpark o Python puro?)](#90-patrones-de-tarea-para-etl-batch-pyspark-o-python-puro)
    - 9.1 [Instalar los providers de Airflow (amazon, papermill) y sus dependencias](#91-instalar-los-providers-de-airflow-amazon-papermill-y-sus-dependencias)
@@ -2806,13 +2807,12 @@ aws lambda invoke --function-name pyspark-stack-trigger-airflow \
   --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_emr"}' /dev/stdout
 
 # Teardown total. NO sale de una: hay tres guardas que lo abortan, a propósito.
-#  1) prevent_destroy en el bucket del data lake (§6.1) y en el volumen /data (§5.3): el destroy
-#     ABORTA entero, no saltea el recurso. Hay que borrar esas líneas del .tf primero.
-#  2) Los buckets tienen versionado y no tienen force_destroy: falla con BucketNotEmpty aunque
-#     los vacíes, porque quedan versiones y delete markers. Vaciá con:
-#       aws s3api delete-objects --bucket <b> --delete "$(aws s3api list-object-versions \
-#         --bucket <b> --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}')"
-#     (repetir con DeleteMarkers[]) o poné force_destroy = true y volvé a aplicar.
+# Procedimiento completo (qué comentar, en qué orden, y qué hacer si igual se traba) en §8.5 —
+# esto es solo el resumen de una línea de cada guarda:
+#  1) prevent_destroy en el bucket de tfstate (§4) y en el volumen /data (§5.3): el destroy
+#     ABORTA entero, no saltea el recurso. Comentá esas líneas del .tf primero (§8.5).
+#  2) El bucket del data lake tiene versionado y no tiene force_destroy: falla con BucketNotEmpty
+#     aunque lo vacíes, porque quedan versiones y delete markers. Agregá force_destroy = true (§8.5).
 #  3) Destruí infra/prod ANTES que infra/bootstrap: el bucket del bootstrap guarda el state de
 #     prod. Al revés te quedás sin state y con recursos huérfanos facturando.
 terraform -chdir=infra/prod destroy
@@ -2841,6 +2841,159 @@ terraform -chdir=infra/prod destroy
    menor que antes (la EC2 ya es chica), pero sigue contando.
 3. **S3 lifecycle a IA/Glacier** (ya aplicado): baja el costo de almacenamiento del lake.
 4. **Snapshots DLM con retención acotada** (7 días): backups sin acumular costo.
+
+### 8.5 Teardown limpio: `terraform destroy` que sí termina
+
+El comentario de §8.2 ya adelantaba el problema: `terraform destroy` **no sale de una** contra este
+stack, y es a propósito — dos protecciones (§4 y §5.3) existen específicamente para que un
+`destroy` accidental no te borre el volumen de Postgres o el bucket con el state. Mientras estás
+**iterando** (probando, todavía sin datos reales que te importe conservar) esas protecciones son un
+estorbo, no una ayuda. Esta sección es el procedimiento completo — qué tocar, en qué orden, y qué
+hacer si igual se traba — para poder tirar todo y volver a `apply` sin miedo, tantas veces como
+haga falta, hasta que decidas que esto ya es producción de verdad.
+
+**El principio: las protecciones son líneas de texto, no un flag.** `prevent_destroy` no admite
+variables (es una limitación real de Terraform, a propósito: si aceptara `var.algo`, un
+`-var prevent_destroy=false` tipeado en la terminal equivocada volaría el volumen de Postgres real
+sin que el `.tf` lo delatara). Así que el interruptor **es** editar el archivo: comentás las líneas
+mientras iterás, las volvés a poner cuando ya haya algo real corriendo ahí adentro.
+
+**Mientras iterás — comentá esto (y quitalo del `apply` corriendo `terraform apply` de nuevo):**
+
+```hcl
+# infra/bootstrap/main.tf — bucket del state (§4)
+resource "aws_s3_bucket" "tfstate" {
+  bucket = local.state_bucket
+  # lifecycle { prevent_destroy = true }   # ← comentado mientras iterás; sin esto, destroy no aborta acá
+}
+```
+
+```hcl
+# infra/prod/ec2.tf — volumen de datos (§5.3)
+resource "aws_ebs_volume" "data" {
+  availability_zone = var.availability_zone
+  size              = var.data_volume_gb
+  type              = "gp3"
+  encrypted         = true
+  tags              = { Name = "${var.name_prefix}-data" }
+  # lifecycle { prevent_destroy = true }   # ← comentado mientras iterás
+}
+```
+
+```hcl
+# infra/prod/s3.tf — los DOS buckets (§6.1), no solo el data lake
+resource "aws_s3_bucket" "datalake" {
+  bucket = local.datalake
+  # lifecycle { prevent_destroy = true }   # ← comentado mientras iterás
+
+  # force_destroy SÍ es un argumento normal del resource (no vive en `lifecycle{}`, así que esto
+  # no tiene la limitación de arriba): con el versionado activo (aws_s3_bucket_versioning.all,
+  # §6.1, que aplica a datalake Y artifacts con un for_each), un bucket con una sola versión de un
+  # objeto ya cuenta como "no vacío" para el destroy normal. force_destroy le dice a AWS que borre
+  # objetos + versiones + delete markers él solo al destruir el bucket.
+  force_destroy = true   # ← agregalo mientras iterás; quitalo (o volvé a false) antes de producción real
+}
+resource "aws_s3_bucket" "artifacts" {
+  bucket = local.artifacts
+  # También versionado por el mismo aws_s3_bucket_versioning.all de arriba — sin este
+  # force_destroy, el destroy falla acá TAMBIÉN, no solo en datalake (es el error que corregí
+  # después de escribir esta sección la primera vez: había asumido que artifacts no lo necesitaba).
+  force_destroy = true   # ← agregalo mientras iterás; quitalo (o volvé a false) antes de producción real
+}
+```
+
+**Antes de dar por buena esta arquitectura para producción real** (la primera vez que corra algo
+con datos que te importan): sacá el comentario de los dos `prevent_destroy`, sacá o volvé `false`
+los dos `force_destroy` (datalake y artifacts), y `terraform apply` — no destruye nada, solo
+actualiza esas cuatro líneas de protección. A partir de ahí, un `destroy` accidental vuelve a
+abortar en vez de borrar.
+
+**El orden importa — bootstrap se destruye AL FINAL, no antes:**
+
+```bash
+# 1) TODO lo de infra/prod primero — bootstrap todavía tiene que existir para guardar/leer el state
+terraform -chdir=infra/prod destroy
+
+# 2) Recién ahora, si además querés tirar el backend del state:
+terraform -chdir=infra/bootstrap destroy
+```
+
+> Al revés (`bootstrap` primero) te quedás sin bucket de state mientras `infra/prod` todavía existe
+> en AWS: Terraform pierde de dónde leer/escribir el estado y esos recursos quedan huérfanos,
+> facturando, sin que `destroy` los pueda encontrar más.
+
+**Si igual se traba — recuperación por capas, de menor a mayor intervención (la técnica que usaría
+alguien que hace esto seguido, no la fuerza bruta de borrar todo a mano por consola):**
+
+```bash
+# a) Dry-run: qué va a intentar borrar y en qué orden, ANTES de que falle a mitad de camino
+terraform -chdir=infra/prod plan -destroy
+
+# b) -refresh=false: salta comparar el state contra AWS antes de destruir. Sirve cuando algo ya se
+#    borró POR FUERA de Terraform (a mano, investigando un problema) y el refresh normal tira error
+#    al no encontrarlo — bloqueando el plan de destroy ANTES de que arranque, por un recurso que ya
+#    ni existe.
+terraform -chdir=infra/prod destroy -refresh=false -auto-approve
+
+# c) -target: aislá el recurso que traba y destruilo solo, para ver el error real sin ruido de los
+#    demás. Después corré el destroy normal para el resto.
+terraform -chdir=infra/prod destroy -target=aws_s3_bucket.datalake -auto-approve
+terraform -chdir=infra/prod destroy -auto-approve
+
+# d) state rm: el recurso YA NO EXISTE en AWS (lo borraste vos a mano en el paso anterior, o nunca
+#    se llegó a crear del todo) pero Terraform sigue pensando que lo administra y se queja al no
+#    encontrarlo. Esto lo saca del state SIN tocar AWS — Terraform simplemente deja de "verlo".
+terraform -chdir=infra/prod state list                    # ¿qué sigue trackeado?
+terraform -chdir=infra/prod state rm aws_sqs_queue.trigger_events
+```
+
+**Los tres bloqueos reales de ESTE stack, y por qué ya deberían estar resueltos con lo de arriba:**
+
+| Bloqueo | Causa | Ya cubierto por |
+|---|---|---|
+| `Instance cannot be destroyed` / plan aborta entero | `prevent_destroy` en `aws_ebs_volume.data` o `aws_s3_bucket.tfstate` | Comentar las líneas (arriba) mientras iterás |
+| `BucketNotEmpty` en el datalake **o** en artifacts | `aws_s3_bucket_versioning.all` (§6.1) aplica a los DOS buckets con un `for_each` — un bucket con una sola versión ya cuenta como no-vacío en cualquiera de los dos | `force_destroy = true` en **ambos** buckets (arriba) — ninguno de los dos tiene `prevent_destroy`, así que no hay lifecycle que comentar acá, solo agregar force_destroy |
+| State inaccesible / recursos huérfanos facturando | Se destruyó `infra/bootstrap` antes que `infra/prod` | Orden correcto (arriba): prod primero, bootstrap al final |
+
+**Lo que Terraform ya resuelve solo, sin que tengas que hacer nada — para que no los busques por
+las dudas:** el `aws_glue_catalog_database` (§16.2) borra sus tablas en cascada al destruirse (es
+comportamiento nativo de la API de Glue, no un flag de Terraform); la `aws_eip_association` y el
+`aws_lambda_event_source_mapping` (§7.3) se destruyen antes que el recurso del que dependen porque
+el grafo de dependencias de Terraform ya conoce ese orden. Donde sí hace falta un paso manual: un
+job de EMR Serverless **activo** al momento del destroy puede trabar el borrado de la aplicación —
+cancelalo antes con `aws emr-serverless cancel-job-run --application-id <id> --job-run-id <id>`.
+
+**Lo que Terraform NO borra — no bloquea el destroy, pero queda facturando de más si lo olvidás:**
+- **Snapshots del EBS `/data`** (`aws_dlm_lifecycle_policy.data`, §6.3): DLM los crea **fuera** del
+  grafo de Terraform (Terraform administra la *policy* que los genera, no los snapshots en sí). Al
+  destruir el volumen, los snapshots que ya sacó siguen ahí, cobrando (poco, pero indefinidamente).
+  Borralos a mano si no los querés: `aws ec2 describe-snapshots --owner-ids self
+  --filters "Name=tag:Name,Values=${var.name_prefix}-data" --query 'Snapshots[].SnapshotId' --output text
+  | xargs -n1 aws ec2 delete-snapshot --snapshot-id`.
+- **Certificado de Let's Encrypt** (§5.6, si lo activaste): vive en `/data/certs`, dentro del EBS —
+  se va con el volumen, no es un recurso de Terraform aparte. Nada que limpiar por separado.
+
+**Verificación — que no quede nada facturando:**
+
+```bash
+terraform -chdir=infra/prod state list   # vacío = destroy completo
+aws ec2 describe-instances --filters "Name=tag:Name,Values=pyspark-stack-node" \
+  --query 'Reservations[].Instances[].State.Name'   # sin resultados, o "terminated"
+aws s3 ls | grep pyspark-stack                       # ningún bucket (o solo tfstate, si no lo tiraste)
+aws emr-serverless list-applications --query 'applications[?name==`pyspark-stack-spark`]'
+```
+
+> 🖱️ **Si venís del camino de consola** (`docs/02b`, sin Terraform): no hay `prevent_destroy` que
+> comentar — el equivalente es borrar cada recurso a mano, en el orden correcto. Ese checklist
+> completo (14 pasos, orden inverso al de creación) ya está en
+> [`docs/02b` §15.3](02b-produccion-aws-consola.md#153-teardown-manual-borrar-todo-en-orden-inverso).
+
+> Si al volver a `apply` después de un destroy limpio te aparece `ResourceAlreadyExistsException` en
+> uno de los `aws_cloudwatch_log_group` de las Lambdas (§5.4/§7.1): algo invocó esa Lambda entre el
+> destroy y el apply (Lambda recrea su log group solo, sin retención, en la primera invocación). No
+> es un bloqueo del destroy en sí — se resuelve borrando ese log group a mano
+> (`aws logs delete-log-group --log-group-name /aws/lambda/pyspark-stack-trigger-airflow`) y
+> reaplicando.
 
 ### Resumen: qué corre y dónde
 
