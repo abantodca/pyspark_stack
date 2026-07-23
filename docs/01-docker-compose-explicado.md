@@ -447,12 +447,13 @@ services:
       resources:
         limits: { memory: 4g }        # tope duro del contenedor (cgroup)
     # Este snippet no pasa --memory/--cores al Worker: por defecto ofrece toda la RAM del
-    # contenedor menos 1 GB y todos los cores del host. Los 3G/2 cores se fijan en el
-    # override de producción (docs/02).
+    # contenedor menos 1 GB y todos los cores del host. Esto es solo para el hardening del
+    # stack LOCAL: en AWS, Spark ni HDFS existen en `docker-compose.prod.yml` (docs/02 §14.1)
+    # — el cómputo Spark de prod es EMR Serverless, sin límites de contenedor que fijar acá.
 
-  # (jupyter no aparece acá: está bajo el perfil `dev` y el docker-compose.prod.yml de
-  #  docs/02 §14.1 no lo incluye — en producción no corre. Su JUPYTER_TOKEN se define en el
-  #  compose base, para el uso local.)
+  # (jupyter no aparece acá: está bajo el perfil `dev`. En AWS, `docker-compose.prod.yml`
+  #  (docs/02 §14.1) es standalone y directamente no incluye el servicio — en producción no
+  #  corre. Su JUPYTER_TOKEN se define en el compose base, solo para el uso local.)
 
   airflow-db:
     <<: [*restart-policy, *default-logging]

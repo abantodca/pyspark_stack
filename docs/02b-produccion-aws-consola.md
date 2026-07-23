@@ -41,9 +41,9 @@
    - 5.4 [Cómputo Spark: EMR Serverless (app + roles + submit)](#54-cómputo-spark-emr-serverless)
    - 5.5 [S3 VPC Gateway Endpoint](#55-s3-vpc-gateway-endpoint)
 6. [Orquestación: Lambda trigger-airflow + EventBridge + evento S3](#6-orquestación-lambda-trigger-airflow)
-   - 6.1 [Lambda que dispara los DAGs vía SSM](#61-lambda-que-dispara-los-dags-vía-ssm)
+   - 6.1 [Lambda que dispara los DAGs vía SSM (retry + contrato de datos)](#61-lambda-que-dispara-los-dags-vía-ssm-con-retry-si-la-ec2-está-apagada--contrato-de-datos)
    - 6.2 [Disparo por cron (EventBridge Scheduler)](#62-disparo-por-cron)
-   - 6.3 [Disparo por evento (archivo nuevo en S3)](#63-disparo-por-evento)
+   - 6.3 [Disparo por evento (archivo nuevo en S3, vía SQS)](#63-disparo-por-evento-archivo-nuevo-en-s3-vía-sqs)
 7. [Secretos y parámetros (SSM Parameter Store / Secrets Manager)](#7-secretos-y-parámetros)
 8. [CI/CD con GitHub Actions (OIDC, sin claves)](#8-cicd-con-github-actions-oidc-sin-claves)
 9. [Monitoreo (Prometheus + Grafana + Alertmanager + Loki)](#9-monitoreo)
@@ -53,6 +53,8 @@
 13. [Operación, seguridad y ahorro](#13-operación-seguridad-y-ahorro)
 14. [Airflow, 3 sabores: Python puro · EMR Serverless · Athena](#14-airflow-3-sabores)
 15. [Runbook final + smoke tests + teardown](#15-runbook-final)
+16. [Gobierno, costo y resiliencia (extras)](#16-gobierno-costo-y-resiliencia-extras)
+17. [Lineage de datos con OpenLineage](#17-lineage-de-datos-con-openlineage)
 
 ---
 
@@ -170,7 +172,7 @@ scripts/
 ├── load-secrets.sh         # materializa .env desde SSM en la EC2 (§7)
 └── deploy.sh               # deploy rápido dev (§11)
 monitoring/                 # configs de Prometheus/Grafana/Alertmanager/Loki (§9/§11)
-docker-compose.prod.yml     # override de producción (§11)
+docker-compose.prod.yml     # stack de producción, standalone (§11)
 dags/                       # + los DAGs de producción EMR (§12)
 .github/workflows/          # ci.yml + deploy.yml (§8)
 ```
@@ -179,10 +181,10 @@ dags/                       # + los DAGs de producción EMR (§12)
 
 ## 4. Núcleo: EC2 con Docker
 
-La EC2 corre el mismo `docker-compose` que en local **pero con el override de prod** (§11): solo el
+La EC2 corre un `docker-compose.prod.yml` propio, standalone (§11) — no el mismo de local: solo el
 orquestador (Airflow + Postgres + monitoreo), sin Spark ni HDFS. Acceso por **túnel SSH** para todo,
 más una excepción explícita: la web de Airflow se publica por **HTTPS (443) restringida a tu IP**
-(§4.6). Grafana/Prometheus/Loki/Jupyter siguen **solo por túnel**.
+(§4.6). Grafana/Prometheus/Loki siguen **solo por túnel**.
 
 ### 4.1 Security group
 
@@ -199,7 +201,7 @@ Consola: **VPC → Security groups → Create security group**.
 3. **Outbound rules**: dejá la default (**All traffic** a `0.0.0.0/0`).
 4. **Create security group**.
 
-> **Verificá que NO haya inbound para 8082/8888/9090/3000/9093/3100** (ni ningún otro puerto de UI):
+> **Verificá que NO haya inbound para 8082/9090/3000/9093/3100** (ni ningún otro puerto de UI):
 > esas van solo por túnel SSH. La única UI publicable es Airflow por 443 (§4.6); la Spark UI vive en
 > la consola de EMR Serverless, no en la EC2.
 
@@ -460,6 +462,10 @@ JSON** → pegá (reemplazá `<acct>` y el `i-xxxx` de tu instancia):
 *Policy name* `startstop-policy` → **Create policy**. (El permiso de escribir logs a CloudWatch ya lo
 trae el *basic execution role* que la consola creó con la función.)
 
+**Paso 3b — Log retention (auditoría §1.2).** **CloudWatch → Log groups** → buscá
+`/aws/lambda/pyspark-stack-startstop` (Lambda lo crea solo en la primera invocación) →
+**Actions → Edit retention setting** → **14 days** (por defecto es *Never expire*).
+
 **Paso 4 — Los dos schedules (cron).** Consola: **Amazon EventBridge → Scheduler → Schedules →
 Create schedule** (×2). Para cada uno:
 
@@ -474,14 +480,15 @@ Create schedule** (×2). Para cada uno:
 - *Permissions*: **Create a new role for this schedule** (la consola crea sola el rol que invoca la
   Lambda) → **Create schedule**.
 
-> Los crons quedan activos ya: esa misma noche la EC2 se apaga y con el compose base solo los
-> `airflow-*` vuelven solos al prender; el resto vuelve cuando apliques el override de prod (§11).
+> Los crons quedan activos ya: esa misma noche la EC2 se apaga, y como `docker-compose.prod.yml`
+> (§4.5) ya trae `restart: unless-stopped` en todos sus servicios desde el arranque mínimo, todo el
+> stack vuelve solo al prender.
 
 **Por qué apagar/prender no degrada nada** (igual que en la guía 02): `t3.large` burstable es lo
 correcto (la caja ya no corre Spark, solo orquesta, carga a ráfagas — el perfil de los CPU credits de
 `t3`); EBS `gp3` rinde constante antes y después del ciclo; los datos persisten en EBS al *stop*; y el
-stack vuelve solo porque Docker arranca en boot y `restart: unless-stopped` (que agrega el override,
-§11) relevanta los contenedores. Lo único más lento es la primera corrida de Spark tras idle (~1-2
+stack vuelve solo porque Docker arranca en boot y `restart: unless-stopped` (ya en el archivo desde
+§4.5) relevanta los contenedores. Lo único más lento es la primera corrida de Spark tras idle (~1-2
 min): es el *cold start* de EMR Serverless, no una degradación sostenida.
 
 > Verificá (CLI): `aws lambda invoke --function-name pyspark-stack-startstop
@@ -495,13 +502,124 @@ min): es el *cold start* de EMR Serverless, no una degradación sostenida.
 Con la EC2 arriba, subís el proyecto y levantás el stack. Estos pasos corren en **tu máquina**
 (usando el CLI/ssh); `IP` es la Elastic IP de §4.3.
 
+**Antes de subir nada, creá `docker-compose.prod.yml` en la raíz de tu repo LOCAL** (todavía no
+existe). A diferencia de `docker-compose.yml` (el del dev local), **este no es un override que se
+fusiona**: es un archivo standalone y autosuficiente, sin Spark, sin HDFS y sin Jupyter (acá no se
+usa: el ETL corre por Airflow + EMR Serverless + papermill headless, sin UI interactiva; para
+explorar datos a mano usá el Jupyter del stack local, `docs/01`). Es obligatorio, no opcional: si le
+hicieras `docker compose up` pelado a `docker-compose.yml` (el de dev), levantarías Spark standalone
+y HDFS en esta EC2 orquestadora — justo lo que evita EMR Serverless (§1, guía 02 §6.4).
+
+Esta es la versión **mínima** (Airflow + Postgres); §7 (secretos) y §9 (monitoreo) van a pedirte que
+**reemplaces todo el archivo** por una versión más completa (la final está en §11.1) — no lo vayas
+parcheando a mano, cada sección te da el archivo entero de nuevo:
+
+```yaml
+# docker-compose.prod.yml — stack de PRODUCCIÓN, standalone (un solo archivo, sin merge).
+# Arranque mínimo: Airflow + Postgres. Sin Spark/HDFS (van a EMR Serverless, §5.4) y sin Jupyter
+# (no se usa en prod). §7/§9 amplían este mismo archivo — versión final en §11.1.
+#   docker compose -f docker-compose.prod.yml up -d --build
+x-airflow-common: &airflow-common
+  image: pyspark_stack-airflow:3.2.2
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow-db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:-change-me-in-prod}'
+    AIRFLOW_UID: 50000
+  volumes:
+    - ./dags:/opt/airflow/dags
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+  networks:
+    - hadoopnet
+
+services:
+  airflow-db:
+    image: postgres:16
+    container_name: airflow-db
+    restart: unless-stopped
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+    deploy: { resources: { limits: { memory: 512m } } }
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
+    volumes:
+      - /data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - hadoopnet
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    restart: "no"
+    depends_on:
+      airflow-db: { condition: service_healthy }
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow fab-db migrate &&
+        airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - "8082:8080"
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+networks:
+  hadoopnet:
+```
+
 ```bash
 IP=<tu-elastic-ip>
 
 # Esperar a que la instancia pase los status checks (primer boot + user_data tardan unos minutos)
 aws ec2 wait instance-status-ok --instance-ids <i-xxxxxxxx>
 
-# Subir el proyecto. --exclude '.env': el .env local (dev) no debe pisar el de prod,
+# Subir el proyecto (docker-compose.prod.yml creado arriba incluido).
+# --exclude '.env': el .env local (dev) no debe pisar el de prod,
 # que lo genera load-secrets.sh en la EC2 desde SSM (§7).
 rsync -avz --exclude '.git' --exclude '.env' --exclude '__pycache__' \
   -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@$IP:/home/ec2-user/pyspark_stack/
@@ -510,23 +628,24 @@ rsync -avz --exclude '.git' --exclude '.env' --exclude '__pycache__' \
 ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
   'cloud-init status --wait && docker compose version && df -h /data | tail -1'
 
-# Levantar el stack base (el completo con monitoreo/secretos es el runbook de §15)
+# Levantar el stack base, sin Spark/HDFS (el completo con monitoreo/secretos es el runbook de §15)
 ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
-  'cd pyspark_stack && docker compose up -d --build'
+  'cd pyspark_stack && docker compose -f docker-compose.prod.yml up -d --build'
 
 # Túnel a las UIs
-ssh -i ~/.ssh/pyspark_stack -L 8082:localhost:8082 -L 8888:localhost:8888 ec2-user@$IP
+ssh -i ~/.ssh/pyspark_stack -L 8082:localhost:8082 ec2-user@$IP
 ```
 
 UIs (con el túnel abierto): Airflow `localhost:8082` — o, si exponés la web por HTTPS (§4.6), directo
 en `https://airflow.midominio.com` sin túnel. Spark ya no corre en la EC2 (los jobs van a EMR
-Serverless — su UI y logs se ven desde la consola de EMR / CloudWatch / S3, §9). Jupyter
-`localhost:8888` solo si activaste el perfil `dev`.
+Serverless — su UI y logs se ven desde la consola de EMR / CloudWatch / S3, §9). No hay Jupyter en
+prod: la exploración interactiva queda para el stack local (`docs/01`).
 
 > Esto es el núcleo, no el final: la infra se arma incrementalmente. Seguí con S3 (§5), orquestación
-> (§6), secretos (§7) y monitoreo (§9); el arranque **real** de producción es el runbook de §15, que
-> usa el override de prod: `./scripts/load-secrets.sh && docker compose -f docker-compose.yml -f
-> docker-compose.prod.yml up -d`.
+> (§6), secretos (§7) y monitoreo (§9); cada una te da una versión más completa de
+> `docker-compose.prod.yml` para reemplazar el creado arriba (Spark/HDFS/Jupyter nunca estuvieron en
+> el archivo). El arranque **real** de producción es el runbook de §15:
+> `./scripts/load-secrets.sh && docker compose -f docker-compose.prod.yml up -d`.
 
 > **Sin CLI en tu máquina** podés hacer el rsync igual (solo necesitás `ssh`/`rsync`, que no son AWS
 > CLI). El `aws ec2 wait` reemplazalo mirando en la consola **EC2 → Instances** que *Status check*
@@ -598,32 +717,37 @@ ssh -i ~/.ssh/pyspark_stack ec2-user@$IP "
 El cert queda en `/data/certs/live/$DOMAIN/{fullchain.pem,privkey.pem}` (en el EBS, sobrevive al
 stop/start).
 
-**Paso 4 — Delta TLS en `docker-compose.prod.yml`.** El FQDN viaja como `AIRFLOW_DOMAIN` (no es
-secreto). Agregalo al `.env` en la EC2 (`echo "AIRFLOW_DOMAIN=airflow.midominio.com" >> .env`) y
-sumá al override (§11):
+**Paso 4 — Editá el `airflow-apiserver` de tu `docker-compose.prod.yml` directamente** (es un solo
+archivo, no hay nada que fusionar). El FQDN viaja como `AIRFLOW_DOMAIN` (no es secreto). Agregalo al
+`.env` en la EC2 (`echo "AIRFLOW_DOMAIN=airflow.midominio.com" >> .env`) y reemplazá el bloque
+`airflow-apiserver` por este — el `<<: *airflow-common-env` es el anchor **anidado** que ya tenés
+dentro de `x-airflow-common` (§11.1): permite sumar las 3 claves de TLS sin repetir el resto del
+environment a mano:
 
 ```yaml
-# 1) x-airflow-env: forzar que el tráfico INTERNO scheduler->api-server use el FQDN del cert.
-x-airflow-env: &airflow-env
-  # ...lo que ya tenías (StatsD, Airflow Variables de EMR/buckets)...
-  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "https://${AIRFLOW_DOMAIN}:8080/execution/"
-
-# 2) el servicio api-server: cert + puerto 443 + alias de red = FQDN (resuelve el gotcha)
 services:
   airflow-apiserver:
-    logging: *logrotate
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
     environment:
-      <<: *airflow-env
+      <<: *airflow-common-env
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "https://${AIRFLOW_DOMAIN}:8080/execution/"
       AIRFLOW__API__SSL_CERT: /opt/airflow/certs/fullchain.pem
       AIRFLOW__API__SSL_KEY:  /opt/airflow/certs/privkey.pem
       AIRFLOW__API__BASE_URL: "https://${AIRFLOW_DOMAIN}"
     ports:
-      - "443:8080"                                       # HTTPS público; el SG lo limita a tu IP
+      - "8082:8080"                                      # túnel local (seguís pudiendo usarlo)
+      - "443:8080"                                        # HTTPS público; el SG lo limita a tu IP
     volumes:
+      - ./dags:/opt/airflow/dags                          # el `<<:` no mergea volumes, hay que repetirlo
       - /data/certs/live/${AIRFLOW_DOMAIN}:/opt/airflow/certs:ro
     networks:
       hadoopnet:
         aliases: ["${AIRFLOW_DOMAIN}"]                   # adentro, el cert matchea este nombre
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
 ```
 
 **Paso 5 — Renovación automática (una vez, en la EC2).** `certbot renew` es no-op si faltan >30 días:
@@ -794,12 +918,26 @@ Consola: **IAM → Roles → Create role** → *Trusted entity type* **Custom tr
       ] },
     { "Sid": "CloudWatchLogs", "Effect": "Allow",
       "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-      "Resource": ["arn:aws:logs:us-east-1:<acct>:log-group:/aws/emr-serverless/*"] }
+      "Resource": ["arn:aws:logs:us-east-1:<acct>:log-group:/aws/emr-serverless/*"] },
+    { "Sid": "GlueCatalogIceberg", "Effect": "Allow",
+      "Action": ["glue:GetDatabase", "glue:GetTable", "glue:GetTables", "glue:CreateTable", "glue:UpdateTable"],
+      "Resource": [
+        "arn:aws:glue:us-east-1:<acct>:catalog",
+        "arn:aws:glue:us-east-1:<acct>:database/pyspark_stack_analytics",
+        "arn:aws:glue:us-east-1:<acct>:table/pyspark_stack_analytics/*"
+      ] }
   ]
 }
 ```
 
-*Policy name* `emr-serverless-job` → **Create policy**. **Sin Glue.**
+*Policy name* `emr-serverless-job` → **Create policy**. El `GlueCatalogIceberg` es el único permiso
+de Glue que necesita este rol: las tablas `curated/`/`analytics/` son **Iceberg** (§16.1), y el job
+Spark tiene que poder registrar/actualizar su metadata en el catálogo cada vez que escribe.
+
+**Paso 2b — Base de datos en el Glue Data Catalog.** Es el catálogo lógico donde Iceberg registra las
+tablas — hace falta exista o no la sección de Athena (§10), porque lo usa el job Spark, no solo
+Athena. Consola: **Glue → Data Catalog → Databases → Add database** → nombre
+`pyspark_stack_analytics` → **Create database**.
 
 **Paso 3 — La aplicación EMR Serverless.** Consola: **EMR → EMR Serverless → Get started / Create and
 launch application** (o **Applications → Create application**).
@@ -925,48 +1063,128 @@ Airflow corre dentro de la EC2. Para dispararlo desde AWS (por cron o cuando lle
 se usa una **Lambda que ejecuta `airflow dags trigger` vía SSM `SendCommand`** — sin abrir puertos ni
 depender de la web.
 
-### 6.1 Lambda que dispara los DAGs vía SSM
+### 6.1 Lambda que dispara los DAGs vía SSM (con retry si la EC2 está apagada + contrato de datos)
 
 **Paso 1 — Crear la función.** Consola: **Lambda → Create function** → *Function name*
 `pyspark-stack-trigger-airflow` · *Runtime* **Python 3.12** → **Create function**. Pegá el código
-(guardalo en el repo como `lambdas/trigger_airflow.py`) y **Deploy**:
+(guardalo en el repo como `lambdas/trigger_airflow.py`) y **Deploy**. Dos mejoras sobre la versión
+mínima, idénticas a la guía 02 §7.1: **(a)** si la EC2 está apagada, la Lambda la prende y deja que
+el reintento (SQS para eventos S3, retry async de Lambda para el cron) la reintente sola en unos
+minutos, en vez de fallar en silencio; **(b)** un **contrato de datos** liviano (stdlib, sin Lambda
+Layers) rechaza archivos con columnas faltantes antes de gastar en cómputo de EMR:
 
 ```python
 # lambdas/trigger_airflow.py
 import os
+import csv
 import json
+import hashlib
 import urllib.parse
 import boto3
 
 ssm = boto3.client("ssm")
+ec2 = boto3.client("ec2")
+s3  = boto3.client("s3")
 
-def handler(event, context):
-    """Dispara un DAG de Airflow dentro de la EC2 vía SSM SendCommand.
-    - Por cron (EventBridge): event = {"dag": "customer_etl_emr"}.
-    - Por evento S3: event = {"Records": [{s3: {bucket, object{key}}}]} → pasa bucket/key como --conf.
-    """
-    instance_id = os.environ["INSTANCE_ID"]
-    default_dag = os.environ.get("DEFAULT_DAG", "customer_etl_emr")
+INSTANCE_ID = os.environ["INSTANCE_ID"]
+DEFAULT_DAG = os.environ.get("DEFAULT_DAG", "customer_etl_emr")
 
-    conf = {}
-    dag = event.get("dag", default_dag)
-    if "Records" in event:  # vino de S3 ObjectCreated
-        rec = event["Records"][0]["s3"]
-        key = urllib.parse.unquote_plus(rec["object"]["key"])
-        conf = {"bucket": rec["bucket"]["name"], "key": key}
+# Contrato mínimo por archivo: columnas/keys requeridas. La validación de contenido de verdad es
+# Great Expectations (§9 de la guía 02 §20); esto es un gate barato, solo mira el header/las keys.
+CONTRACTS = {
+    "orders.csv":    {"order_id", "customer_id", "product_id", "quantity", "order_date"},
+    "customers.csv": {"customer_id", "customer_name", "city", "state", "signup_date"},
+    "products.json": {"product_id", "category", "unit_price"},
+}
 
+
+class ContractViolation(Exception):
+    pass
+
+
+def _peek_columns(bucket, key):
+    body = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-2047")["Body"].read()
+    head = body.decode("utf-8", errors="replace")
+    if key.endswith(".csv"):
+        return set(next(csv.reader([head.splitlines()[0]])))
+    if key.endswith(".json"):
+        try:
+            data = json.loads(head)
+        except json.JSONDecodeError:
+            return None  # muestra cortada a mitad de objeto: no bloqueamos por un falso positivo
+        first = data[0] if isinstance(data, list) and data else data
+        return set(first.keys()) if isinstance(first, dict) else None
+    return None
+
+
+def _validar_contrato(bucket, key):
+    esperado = CONTRACTS.get(key.rsplit("/", 1)[-1])
+    if esperado is None:
+        return
+    columnas = _peek_columns(bucket, key)
+    if columnas is None:
+        return
+    faltan = esperado - columnas
+    if faltan:
+        raise ContractViolation(f"{key}: faltan columnas {sorted(faltan)} (esperadas {sorted(esperado)})")
+
+
+def _ec2_lista(instance_id):
+    state = ec2.describe_instances(InstanceIds=[instance_id]) \
+               ["Reservations"][0]["Instances"][0]["State"]["Name"]
+    if state == "stopped":
+        ec2.start_instances(InstanceIds=[instance_id])
+        return False
+    if state != "running":
+        return False
+    infos = ssm.describe_instance_information(
+        Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
+    )["InstanceInformationList"]
+    return bool(infos) and infos[0]["PingStatus"] == "Online"
+
+
+def _disparar_dag(dag, conf, run_id=None):
     trigger = f"airflow dags trigger {dag}"
+    if run_id:
+        # Determinístico por archivo (auditoría §1.3 de la guía 02): un reintento del MISMO objeto
+        # produce el MISMO run_id — si el trigger anterior ya tuvo éxito (SendCommand es
+        # fire-and-forget, no lo confirmamos), este segundo intento falla en vez de crear un
+        # segundo dagrun duplicado para el mismo archivo.
+        trigger += f" --run-id '{run_id}'"
     if conf:
         trigger += f" --conf '{json.dumps(conf)}'"
-    cmd = f"docker exec airflow-scheduler {trigger}"
-
     resp = ssm.send_command(
-        InstanceIds=[instance_id],
-        DocumentName="AWS-RunShellScript",
+        InstanceIds=[INSTANCE_ID], DocumentName="AWS-RunShellScript",
         Comment=f"trigger airflow dag {dag}",
-        Parameters={"commands": [cmd]},
+        Parameters={"commands": [f"docker exec airflow-scheduler {trigger}"]},
     )
-    return {"dag": dag, "conf": conf, "commandId": resp["Command"]["CommandId"]}
+    return resp["Command"]["CommandId"]
+
+
+def handler(event, context):
+    """Cron (async directo): {"dag": "customer_etl_emr"}.
+    Evento S3 vía la cola SQS primaria (§6.3): {"Records": [{"body": "<S3 event JSON>"}]}."""
+    bucket = key = run_id = None
+    if "Records" in event and event["Records"] and "body" in event["Records"][0]:
+        rec = json.loads(event["Records"][0]["body"])["Records"][0]["s3"]
+        key = urllib.parse.unquote_plus(rec["object"]["key"])
+        bucket = rec["bucket"]["name"]
+        dag, conf = DEFAULT_DAG, {"bucket": bucket, "key": key}
+        run_id = "s3-" + hashlib.sha256(f"{bucket}/{key}".encode()).hexdigest()[:16]
+    else:
+        dag, conf = event.get("dag", DEFAULT_DAG), {}
+
+    try:
+        if bucket and key:
+            _validar_contrato(bucket, key)
+    except ContractViolation as e:
+        print(f"RECHAZADO por contrato de datos: {e}")
+        return {"status": "rejected", "reason": str(e)}
+
+    if not _ec2_lista(INSTANCE_ID):
+        raise RuntimeError(f"EC2 {INSTANCE_ID} no está lista todavía; reintentar")
+
+    return {"dag": dag, "conf": conf, "commandId": _disparar_dag(dag, conf, run_id)}
 ```
 
 **Paso 2 — Handler y variables.** *Runtime settings → Edit* → **Handler** = `lambda_function.handler`.
@@ -988,17 +1206,45 @@ Permissions* → clic en el role → **Add permissions → Create inline policy 
         "arn:aws:ssm:us-east-1::document/AWS-RunShellScript"
       ] },
     { "Sid": "SsmGet", "Effect": "Allow",
-      "Action": ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"], "Resource": "*" }
+      "Action": ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations", "ssm:DescribeInstanceInformation"],
+      "Resource": "*" },
+    { "Sid": "DescribeEc2", "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances"], "Resource": "*" },
+    { "Sid": "StartEc2IfStopped", "Effect": "Allow",
+      "Action": ["ec2:StartInstances"],
+      "Resource": "arn:aws:ec2:us-east-1:<acct>:instance/i-xxxxxxxxxxxxxxxxx" },
+    { "Sid": "ContractPeek", "Effect": "Allow",
+      "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::pyspark-stack-datalake-<acct>/raw/*" },
+    { "Sid": "ConsumeTriggerQueue", "Effect": "Allow",
+      "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+      "Resource": "arn:aws:sqs:us-east-1:<acct>:pyspark-stack-trigger-events" }
   ]
 }
 ```
 
-*Policy name* `trigger-airflow` → **Create policy**.
+*Policy name* `trigger-airflow` → **Create policy**. Nota: `StartInstances` va con ARN específico,
+no `"*"` — a diferencia de `DescribeInstances`, sí admite scoping por recurso (auditoría §1.1).
 
-> Interacción con el auto start/stop: si la EC2 está apagada cuando llega el evento/cron, el
-> `SendCommand` no ejecuta (no hay agente SSM online) y el DAG no se dispara — sin fallo obvio.
-> Programá el cron dentro de la ventana de encendido; la alerta `DailyEtlMissing` de §9 cubre el
-> caso silencioso.
+**Paso 3b — Log retention + límite de concurrencia (auditoría §1.2/§3.1).** *Configuration → General
+configuration → Edit*:
+
+- **Reserved concurrency** → **Reserve 2** (si suben muchos archivos a la vez a `raw/`, como máximo
+  2 invocaciones corren en paralelo — el resto queda esperando en la cola SQS de §6.3, no se pierde
+  ni se lanza como una avalancha de 50 jobs de EMR a la vez).
+
+Y en **CloudWatch → Log groups**, buscá `/aws/lambda/pyspark-stack-trigger-airflow`
+(Lambda lo crea solo en la primera invocación) → **Actions → Edit retention setting** → **14 days**
+(por defecto queda **Never expire**, que acumula logs para siempre sin necesidad).
+
+**Paso 4 — Dead-letter queue de la propia Lambda** (para el camino cron, invocación async): *Configuration
+→ Asynchronous invocation → Edit* → *Dead-letter queue* → `pyspark-stack-trigger-airflow-dlq` (la de §16.1).
+Para el camino de eventos S3, el redrive lo maneja la **cola** de §6.3, no esto — mismo DLQ final, dos
+mecanismos según el transporte.
+
+> **Por qué no un `time.sleep()` esperando a que la EC2 arranque.** Boot + agente SSM online tarda
+> ~2-5 min. Bloquear la Lambda ese tiempo cuesta y arriesga el timeout. Devolver "todavía no" y
+> dejar que el transporte reintente es gratis: SQS ya tiene *visibility timeout* + redrive, y el
+> cron ya tiene el retry async de Lambda.
 
 > Verificá (CLI): el agente SSM `Online` es prerrequisito de toda la §6.
 > ```bash
@@ -1023,19 +1269,43 @@ Consola: **EventBridge → Scheduler → Create schedule**.
 > Verificá (CLI): `aws scheduler list-schedules --query 'Schedules[].Name'` → aparece
 > `pyspark-stack-daily-etl`.
 
-### 6.3 Disparo por evento
+### 6.3 Disparo por evento (archivo nuevo en S3, vía SQS)
 
-Cuando llega un archivo a `raw/`, S3 invoca la Lambda, que dispara el DAG pasando `{bucket,key}` como
-`--conf`. ETL event-driven, sin polling.
+Cuando llega un archivo a `raw/`, S3 **no** invoca la Lambda directo: escribe un mensaje en una
+cola **SQS primaria**, y la Lambda la consume. Esa vuelta por SQS es lo que le da a §6.1 su
+reintento gratis cuando la EC2 está apagada: si el handler levanta una excepción, el mensaje no se
+borra de la cola y vuelve a estar visible pasado el *visibility timeout* — se reprocesa solo, sin
+que nadie haga nada.
 
-Consola: **S3 → bucket `pyspark-stack-datalake-<acct>` → Properties → Event notifications → Create
-event notification**.
+**Paso 1 — Crear la cola.** Consola: **SQS → Create queue** → *Standard* → nombre
+`pyspark-stack-trigger-events` → *Visibility timeout* **360 seconds** (6x el timeout de la Lambda, y
+suficiente para cubrir un boot completo de la EC2, ~2-5 min) → *Dead-letter queue*: **Enabled**,
+cola `pyspark-stack-trigger-airflow-dlq` (la de §16.1), *Maximum receives* **5** → **Create queue**.
 
-- *Event name* `on-upload-raw` · *Prefix* `raw/` · *Event types* **All object create events**.
-- *Destination*: **Lambda function** → `pyspark-stack-trigger-airflow` → **Save changes**.
+**Paso 2 — Access policy de la cola** (para que S3 pueda escribirle) → en la cola → **Access policy**
+→ pegá:
 
-> La consola agrega sola el permiso para que S3 invoque la Lambda (lo que en Terraform sería el
-> `aws_lambda_permission`). Si diera error de permisos, aceptá el diálogo que ofrece agregarlo.
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AllowS3Send", "Effect": "Allow",
+    "Principal": { "Service": "s3.amazonaws.com" },
+    "Action": "sqs:SendMessage",
+    "Resource": "arn:aws:sqs:us-east-1:<acct>:pyspark-stack-trigger-events",
+    "Condition": { "ArnEquals": { "aws:SourceArn": "arn:aws:s3:::pyspark-stack-datalake-<acct>" } }
+  }]
+}
+```
+
+**Paso 3 — Notificación S3 → SQS.** Consola: **S3 → bucket `pyspark-stack-datalake-<acct>` →
+Properties → Event notifications → Create event notification** → *Event name* `on-upload-raw` ·
+*Prefix* `raw/` · *Event types* **All object create events** · *Destination*: **SQS queue** →
+`pyspark-stack-trigger-events` → **Save changes**.
+
+**Paso 4 — La Lambda consume la cola.** Consola: **Lambda → `pyspark-stack-trigger-airflow` →
+Configuration → Triggers → Add trigger** → **SQS** → `pyspark-stack-trigger-events` → *Batch size*
+**1** (un archivo = una invocación: así uno rechazado o lento no bloquea a los demás) → **Add**.
 
 > Los dos disparadores (cron y evento S3) apuntan al DAG de producción `customer_etl_emr` (§12) —
 > no al `customer_etl_dag` dev-local, que usa el Spark/HDFS deshabilitado en prod. Tal como viene,
@@ -1044,12 +1314,16 @@ event notification**.
 > `{{ dag_run.conf['bucket'] }}` / `{{ dag_run.conf['key'] }}` y los pase como
 > `entryPointArguments` del `EmrServerlessStartJobOperator` (patrón de §12/§14).
 
+> Verificá el retry: apagá la EC2 a mano, subí un archivo a `raw/`, y mirá **SQS → la cola →
+> Monitoring** — el mensaje queda "in flight" (procesándose o esperando el próximo intento) hasta
+> que la EC2 esté arriba y el DAG se dispare solo.
+
 ---
 
 ## 7. Secretos y parámetros
 
-El compose base trae los secretos con defaults débiles de dev (`${POSTGRES_PASSWORD:-airflow}`, JWT
-`change-me-in-prod`, admin/admin, Jupyter sin token). En producción se generan valores fuertes, se
+`docker-compose.prod.yml` trae los secretos con defaults débiles de dev (`${POSTGRES_PASSWORD:-airflow}`,
+JWT `change-me-in-prod`, admin/admin). En producción se generan valores fuertes, se
 guardan en **SSM Parameter Store** (SecureString, cifrado con KMS), y la EC2 los lee con su rol IAM y
 los materializa en un `.env` efímero (chmod 600) antes de `docker compose up`. Cero secretos en git.
 
@@ -1059,7 +1333,6 @@ los materializa en un `.env` efímero (chmod 600) antes de `docker compose up`. 
 openssl rand -hex 24    # postgres_password
 openssl rand -hex 32    # airflow_jwt_secret
 openssl rand -hex 20    # airflow_admin_password
-openssl rand -hex 32    # jupyter_token
 openssl rand -hex 20    # grafana_admin_password
 ```
 
@@ -1067,13 +1340,12 @@ openssl rand -hex 20    # grafana_admin_password
 > `airflow-init`; caracteres como `( ) & *` romperían el comando en silencio.
 
 **Paso 2 — Guardarlos en Parameter Store.** Consola: **Systems Manager → Parameter Store → Create
-parameter** (×5). En cada uno: *Type* **SecureString** (KMS key **`alias/aws/ssm`** default),
+parameter** (×4). En cada uno: *Type* **SecureString** (KMS key **`alias/aws/ssm`** default),
 *Value* el valor generado. **Nombres exactos** (son los que lee `load-secrets.sh`):
 
 - `/pyspark-stack/postgres_password`
 - `/pyspark-stack/airflow_jwt_secret`
 - `/pyspark-stack/airflow_admin_password`
-- `/pyspark-stack/jupyter_token`
 - `/pyspark-stack/grafana_admin_password`
 
 El **SMTP de Alertmanager** va aparte (nunca en git): creá también
@@ -1125,8 +1397,6 @@ POSTGRES_PASSWORD=$(get postgres_password)
 AIRFLOW_JWT_SECRET=$(get airflow_jwt_secret)
 AIRFLOW_ADMIN_USER=admin
 AIRFLOW_ADMIN_PASSWORD=$(get airflow_admin_password)
-# (Sin JUPYTER_TOKEN: en prod Jupyter no corre —perfil `dev`— y el compose no le pasa la
-#  variable al contenedor, así que era un secreto muerto.)
 GRAFANA_ADMIN_PASSWORD=$(get grafana_admin_password)
 EMR_APP_ID=${EMR_APP_ID}
 EMR_JOB_ROLE_ARN=${EMR_JOB_ROLE_ARN}
@@ -1138,7 +1408,7 @@ echo ".env generado desde SSM (+ EMR app id / job role arn + buckets datalake/ar
 ```
 
 Uso en la EC2: `chmod +x scripts/load-secrets.sh && ./scripts/load-secrets.sh && docker compose -f
-docker-compose.yml -f docker-compose.prod.yml up -d`.
+docker-compose.prod.yml up -d`.
 
 > **Secrets Manager (opcional, para lo delicado con rotación).** Para el JWT secret o credenciales de
 > terceros, **Systems Manager → ... → Secrets Manager → Store a new secret → Other type of secret** →
@@ -1210,15 +1480,71 @@ rol).
 > permisos de tfstate ni `ReadOnlyAccess` (a diferencia del rol de la guía 02, que los tenía como
 > opcionales para correr `plan` en CI).
 
+### 8.1b Un segundo rol OIDC, solo para dbt Slim CI
+
+El rol de §8.1 está atado al environment `production` con *Required reviewers* — a propósito, es el
+gate de aprobación del deploy. dbt Slim CI (§8.3) necesita correr **automático en cada PR**, sin que
+nadie apruebe nada: si reusara ese rol, o le sacás el gate (y el deploy deja de estar protegido) o
+cada PR queda esperando aprobación manual. Por eso es un rol aparte, sin ese gate, pero con permisos
+acotados **solo** a la database `_ci` (guía 02 §16.2) — nunca puede tocar la de producción.
+
+**Paso 1 — Rol.** Consola: **IAM → Roles → Create role** → *Web identity* → mismo provider de §8.1 →
+audience `sts.amazonaws.com`. **No completes** *GitHub branch* en el asistente (dejalo vacío): a
+diferencia del rol de deploy, este debe poder asumirse desde **cualquier rama/PR**, no solo `main`.
+Nombre `pyspark-stack-dbt-ci` → **Create role**.
+
+**Paso 2 — Permisos.** Inline policy JSON — least-privilege a la database `_ci`, `dbt-ci/` y
+`dbt-state/manifest.json` del bucket de artifacts, y lectura de `raw/`/`curated/` del datalake:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "ReadSources", "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::pyspark-stack-datalake-<acct>", "arn:aws:s3:::pyspark-stack-datalake-<acct>/*"] },
+    { "Sid": "WriteCiOutputs", "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": [
+        "arn:aws:s3:::pyspark-stack-artifacts-<acct>/dbt-ci/*",
+        "arn:aws:s3:::pyspark-stack-artifacts-<acct>/athena-results/*",
+        "arn:aws:s3:::pyspark-stack-artifacts-<acct>/dbt-state/manifest.json"
+      ] },
+    { "Sid": "AthenaResultsBucket", "Effect": "Allow",
+      "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+      "Resource": "arn:aws:s3:::pyspark-stack-artifacts-<acct>" },
+    { "Sid": "AthenaQuery", "Effect": "Allow",
+      "Action": ["athena:StartQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults", "athena:StopQueryExecution"],
+      "Resource": "arn:aws:athena:us-east-1:<acct>:workgroup/pyspark-stack-analytics" },
+    { "Sid": "GlueCiOnly", "Effect": "Allow",
+      "Action": ["glue:GetDatabase", "glue:GetTable", "glue:GetTables", "glue:CreateTable", "glue:UpdateTable", "glue:DeleteTable", "glue:GetPartitions"],
+      "Resource": [
+        "arn:aws:glue:us-east-1:<acct>:catalog",
+        "arn:aws:glue:us-east-1:<acct>:database/pyspark_stack_analytics_ci",
+        "arn:aws:glue:us-east-1:<acct>:table/pyspark_stack_analytics_ci/*"
+      ] }
+  ]
+}
+```
+
+*Policy name* `dbt-ci-policy` → **Create policy**. Copiá el **Role ARN**.
+
+**Paso 3 — Database y lifecycle de CI.** **Glue → Data Catalog → Databases → Add database** →
+`pyspark_stack_analytics_ci` → **Create**. **S3 → bucket artifacts → Management → Create lifecycle
+rule** → *Name* `dbt-ci-expire` · *Prefix* `dbt-ci/` · *Expire current versions* a los **3 días**
+→ **Create rule** (las tablas que un PR materializa al testear no se limpian solas si no).
+
 ### 8.2 Variables y entorno en GitHub
 
-- **Settings → Secrets and variables → Actions → Variables → New repository variable** (×3, son
+- **Settings → Secrets and variables → Actions → Variables → New repository variable** (×4, son
   **variables**, no secrets):
   - `AWS_DEPLOY_ROLE_ARN` = el Role ARN de §8.1.
+  - `AWS_DBT_CI_ROLE_ARN` = el Role ARN de §8.1b.
   - `AWS_REGION` = `us-east-1`.
   - `ARTIFACTS_BUCKET` = `pyspark-stack-artifacts-<acct>`.
 - **Settings → Environments → New environment** → `production` → agregá **Required reviewers** (el
-  gate de aprobación manual que exige `environment: production` en `deploy.yml`).
+  gate de aprobación manual que exige `environment: production` en `deploy.yml`). El job
+  `dbt-slim-ci` de §8.3 **no** declara `environment` — corre sin aprobación en cada PR (§8.1b).
 
 ### 8.3 Los workflows
 
@@ -1226,9 +1552,10 @@ rol).
 §11.2 y §11.3 (junto con `tests/conftest.py`, `tests/test_dag_integrity.py`, `ruff.toml`,
 `.pre-commit-config.yaml` y `Makefile`). Reproducidos acá para que la guía sea autocontenida:
 
-**`.github/workflows/ci.yml`** — 3 jobs sin credenciales AWS: lint (ruff), validación de DAGs
-(pytest sobre el `DagBag`), security (gitleaks; el step de checkov de la guía 02 no aplica acá —
-no hay Terraform que escanear):
+**`.github/workflows/ci.yml`** — 4 jobs: lint (ruff), validación de DAGs (pytest sobre el
+`DagBag`), security (gitleaks; el step de checkov de la guía 02 no aplica acá — no hay Terraform
+que escanear), y **dbt Slim CI** — el único con credenciales AWS (rol `dbt_ci` de §8.1b, no el de
+deploy):
 
 ```yaml
 name: CI
@@ -1276,6 +1603,38 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: gitleaks/gitleaks-action@v2
         env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+  dbt-slim-ci:
+    name: dbt Slim CI (state:modified+)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: dbt }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - name: Autenticar en AWS (OIDC, rol dbt_ci — §8.1b)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DBT_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: pip install "dbt-core==1.9.*" "dbt-athena-community==1.9.*"
+      - name: Bajar el manifest de producción (baseline de state:modified+)
+        run: |
+          mkdir -p state
+          aws s3 cp "s3://${{ vars.ARTIFACTS_BUCKET }}/dbt-state/manifest.json" state/manifest.json \
+            || echo "sin baseline todavía — corre todos los modelos esta vez"
+      - name: dbt build --select state:modified+
+        working-directory: dbt
+        env: { ARTIFACTS_BUCKET: "${{ vars.ARTIFACTS_BUCKET }}" }
+        run: |
+          if [ -s ../state/manifest.json ]; then
+            dbt build --target ci --profiles-dir . --select state:modified+ --state ../state
+          else
+            dbt build --target ci --profiles-dir .
+          fi
 ```
 
 **`.github/workflows/deploy.yml`** — OIDC → `aws s3 sync` de `dags/` a `deploy/dags/` y de
@@ -1351,7 +1710,7 @@ encendido). Los PRs disparan **CI**.
 
 Observabilidad completa corriendo **dentro de la EC2** junto al `docker-compose`: métricas + alertas
 + logs centralizados (Prometheus + Grafana + Alertmanager + Loki). **No hay recursos de consola AWS
-que crear acá**: es todo archivos de configuración en el repo + contenedores en el override de prod.
+que crear acá**: es todo archivos de configuración en el repo + contenedores en `docker-compose.prod.yml`.
 Los archivos son idénticos a la guía 02 §12 y §14.1; reproducidos en §11 (compose) y abajo (configs).
 
 Qué se monitorea:
@@ -1470,10 +1829,10 @@ escaneado (~$5/TB, mínimo 10 MB/query) y escala a cero. A esta escala el gasto 
 para SQL ad-hoc sobre `analytics/`/`curated/`, BI (QuickSight/Grafana/Metabase), y asserts de calidad
 dentro de un DAG.
 
-**Paso 1 — Base de datos en el Glue Data Catalog.** Consola: **AWS Glue → Data Catalog → Databases →
-Add database** → *Name* `pyspark_stack_analytics` (Glue no admite `-`) → **Create**.
+> La base de datos del Glue Data Catalog (`pyspark_stack_analytics`) ya se creó en §5.4 — la usa
+> Iceberg desde el job Spark exista o no esta sección de Athena. Acá no hay que repetirla.
 
-**Paso 2 — Workgroup de Athena.** Consola: **Athena → Administration → Workgroups → Create
+**Paso 1 — Workgroup de Athena.** Consola: **Athena → Administration → Workgroups → Create
 workgroup**.
 
 - *Name* `pyspark-stack-analytics`.
@@ -1481,37 +1840,69 @@ workgroup**.
   `s3://pyspark-stack-artifacts-<acct>/athena-results/`.
 - *Encrypt query results*: **SSE-S3**.
 - *Override client-side settings*: **On** (equivale a `enforce_workgroup_configuration=true`).
-- *Publish query metrics to CloudWatch*: **On** → **Create workgroup**.
+- *Athena engine version*: **Athena engine version 3** — sin esto, `MERGE`/`UPDATE`/`DELETE` sobre
+  tablas Iceberg (Paso 3) fallan en workgroups viejos migrados de v2.
+- *Publish query metrics to CloudWatch*: **On**.
+- **Data usage controls → Track query limit per query** → **5,000 MB** (auditoría §2.2: sin esto,
+  un `SELECT *` sin filtro de partición sobre una tabla que creció puede ser $5-20 en una sola
+  query, a $5/TB — 5 GB es generoso a este volumen total de 2-5 GB/**día**) → **Create workgroup**.
 
-**Paso 3 — Expiración de resultados** (descartables). Consola: **S3 → bucket artifacts → Management →
+**Paso 2 — Expiración de resultados** (descartables). Consola: **S3 → bucket artifacts → Management →
 Create lifecycle rule** → *Name* `athena-results-expire` · *Prefix* `athena-results/` · *Expire
 current versions* a los **7 días** → **Create rule**.
 
-**Paso 4 — Tabla sin crawler (partition projection).** Consola: **Athena → Query editor** (elegí el
-workgroup `pyspark-stack-analytics`) → ejecutá una vez:
+**Paso 3 — Tabla Iceberg (ACID, time travel, `MERGE`, sin crawler).** Si el job Spark de §12 **ya
+escribió** la tabla (caso normal), no hay que declarar nada acá: aparece sola en
+`pyspark_stack_analytics.ventas` apenas Spark hace el primer `INSERT`/`MERGE` — Iceberg la registra
+en el mismo Glue Data Catalog. Si preferís crearla primero desde Athena (prototipar sin correr un
+job EMR todavía), consola: **Athena → Query editor** (workgroup `pyspark-stack-analytics`) →
+ejecutá una vez:
 
 ```sql
-CREATE EXTERNAL TABLE pyspark_stack_analytics.ventas (
+CREATE TABLE pyspark_stack_analytics.ventas (
   pais  string,
-  monto double
+  monto double,
+  dt    string
 )
-PARTITIONED BY (dt string)
-STORED AS PARQUET
-LOCATION 's3://pyspark-stack-datalake-<acct>/analytics/ventas/'
-TBLPROPERTIES (
-  'projection.enabled'          = 'true',
-  'projection.dt.type'          = 'date',
-  'projection.dt.format'        = 'yyyy-MM-dd',
-  'projection.dt.range'         = '2026-01-01,NOW',
-  'projection.dt.interval'      = '1',
-  'projection.dt.interval.unit' = 'DAYS',
-  'storage.location.template'   = 's3://pyspark-stack-datalake-<acct>/analytics/ventas/dt=${dt}'
-);
+PARTITIONED BY (dt)
+LOCATION 's3://pyspark-stack-datalake-<acct>/curated/ventas/'
+TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet');
 ```
 
-Con esto, `WHERE dt = '2026-07-16'` escanea solo ese prefijo — sin `MSCK REPAIR` ni crawler.
+`PARTITIONED BY (dt)` acá es partición **oculta** de Iceberg, no partition projection: Iceberg
+resuelve `WHERE dt = '...'` contra sus manifests solo, sin rangos de fecha que mantener a mano. Con
+la tabla creada, ya podés hacer desde el mismo Query editor:
 
-**Paso 5 — Permitir que un DAG consulte (rol de la EC2).** Consola: **IAM → Roles →
+```sql
+-- Time travel: la tabla como estaba hace 3 versiones
+SELECT * FROM pyspark_stack_analytics.ventas FOR VERSION AS OF 3 WHERE pais = 'PE';
+
+-- Upsert incremental — reemplaza el overwrite completo del Parquet suelto anterior
+MERGE INTO pyspark_stack_analytics.ventas t
+USING (VALUES ('PE', 120.50, '2026-07-16')) AS s(pais, monto, dt)
+ON t.pais = s.pais AND t.dt = s.dt
+WHEN MATCHED THEN UPDATE SET monto = s.monto
+WHEN NOT MATCHED THEN INSERT (pais, monto, dt) VALUES (s.pais, s.monto, s.dt);
+```
+
+**Paso 3b — Mantenimiento: compactación y expiración de snapshots (auditoría §2.1).** Sin esto,
+cada `MERGE` deja archivos chicos y un snapshot nuevo; después de meses de corridas 3x/semana el
+*planning time* de las queries se degrada solo, sin que nadie lo note hasta que ya molesta. Desde
+el mismo Query editor, o como task semanal de un DAG (`AthenaOperator`, guía 02 §16.1b):
+
+```sql
+-- Compacta archivos chicos en archivos más grandes
+OPTIMIZE pyspark_stack_analytics.ventas REWRITE DATA USING BIN_PACK;
+
+-- Libera snapshots/archivos ya no referenciados, más viejos que la retención por defecto
+VACUUM pyspark_stack_analytics.ventas;
+```
+
+> Verificá la sintaxis exacta contra tu versión de Athena engine — el soporte de mantenimiento de
+> Iceberg se fue agregando de forma incremental. El detalle completo (DAG semanal, por qué viernes
+> y no domingo por el auto start/stop) está en la [guía 02 §16.1b](02-produccion-aws.md#161b-mantenimiento-compactación-y-expiración-de-snapshots-auditoría-21).
+
+**Paso 4 — Permitir que un DAG consulte (rol de la EC2).** Consola: **IAM → Roles →
 `pyspark-stack-ec2-role` → Add permissions → Create inline policy → JSON**:
 
 ```json
@@ -1547,61 +1938,133 @@ calidad post-ETL) está en §14.3.
 Todo lo de esta sección son **archivos que viven en el repo** (no recursos de consola). Son idénticos
 a la guía 02; van acá para que la guía sea autocontenida. Se suben a la EC2 con el rsync de §4.5.
 
-### 11.1 `docker-compose.prod.yml` (override de producción, completo)
+### 11.1 `docker-compose.prod.yml` (standalone, completo)
 
-Incorpora persistencia en `/data`, `restart`, límites, logging, métricas StatsD y logs. Ya no lleva
-HDFS ni Spark: la caja solo tiene Airflow + Postgres + monitoreo. Las variables `${...}` las provee el
-`.env` que genera `load-secrets.sh` (§7).
+**No es un override que se fusiona con nada** — es un archivo único y autosuficiente, sin Spark, sin
+HDFS y sin Jupyter (acá no se usa: el ETL corre por Airflow + EMR Serverless + papermill, headless;
+si necesitás explorar datos a mano, usá el Jupyter del stack local, `docs/01`). Incorpora
+persistencia en `/data`, `restart`, límites, logging, métricas StatsD y las Airflow Variables de EMR
+Serverless. Las variables `${...}` las provee el `.env` que genera `load-secrets.sh` (§7). Es
+idéntico al de la guía 02 §14.1 — se levanta con `docker compose -f docker-compose.prod.yml up -d --build`:
 
 ```yaml
-# docker-compose.prod.yml — override de producción (se fusiona con docker-compose.yml).
-#   ./scripts/load-secrets.sh
-#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
-x-hard: &hard
+# docker-compose.prod.yml — stack de PRODUCCIÓN, standalone (un solo archivo, sin merge, sin
+# Spark/HDFS/Jupyter: Spark corre en EMR Serverless, §5.4; Jupyter no se usa en prod, §4.5).
+#   ./scripts/load-secrets.sh   # genera .env desde SSM (§7)
+#   docker compose -f docker-compose.prod.yml up -d --build
+x-airflow-common: &airflow-common
+  image: pyspark_stack-airflow:3.2.2
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:?definí POSTGRES_PASSWORD (scripts/load-secrets.sh)}@airflow-db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:?definí AIRFLOW_JWT_SECRET (scripts/load-secrets.sh)}'
+    AIRFLOW_UID: 50000
+    AIRFLOW__METRICS__STATSD_ON: "True"
+    AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
+    AIRFLOW__METRICS__STATSD_PORT: "9125"
+    AIRFLOW__METRICS__STATSD_PREFIX: airflow
+    AIRFLOW_VAR_EMR_APP_ID: "${EMR_APP_ID}"
+    AIRFLOW_VAR_EMR_JOB_ROLE_ARN: "${EMR_JOB_ROLE_ARN}"
+    AIRFLOW_VAR_DATALAKE: "${DATALAKE_BUCKET}"
+    AIRFLOW_VAR_ARTIFACTS: "${ARTIFACTS_BUCKET}"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+  volumes:
+    - ./dags:/opt/airflow/dags
   restart: unless-stopped
-  logging: &logrotate
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+  networks:
+    - hadoopnet
+
+x-mon-logging: &mon-logging
+  logging:
     driver: json-file
     options: { max-size: "10m", max-file: "3" }
 
-x-airflow-env: &airflow-env
-  AIRFLOW__METRICS__STATSD_ON: "True"
-  AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
-  AIRFLOW__METRICS__STATSD_PORT: "9125"
-  AIRFLOW__METRICS__STATSD_PREFIX: airflow
-  AIRFLOW_VAR_EMR_APP_ID: "${EMR_APP_ID}"
-  AIRFLOW_VAR_EMR_JOB_ROLE_ARN: "${EMR_JOB_ROLE_ARN}"
-  AIRFLOW_VAR_DATALAKE: "${DATALAKE_BUCKET}"
-  AIRFLOW_VAR_ARTIFACTS: "${ARTIFACTS_BUCKET}"
-  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
-  AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
-
 services:
   airflow-db:
-    <<: *hard
+    image: postgres:16
+    container_name: airflow-db
+    restart: unless-stopped
+    <<: *mon-logging
     deploy: { resources: { limits: { memory: 512m } } }
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?definí POSTGRES_PASSWORD (scripts/load-secrets.sh)}
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
     volumes:
       - /data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - hadoopnet
 
-  # Neutralizar Spark/HDFS del compose BASE sin tocarlo (con un profile que el `up` de prod no activa)
-  hdfs-namenode: { profiles: ["disabled-in-prod"] }
-  hdfs-datanode: { profiles: ["disabled-in-prod"] }
-  spark-master:  { profiles: ["disabled-in-prod"] }
-  spark-worker:  { profiles: ["disabled-in-prod"] }
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    restart: "no"
+    depends_on:
+      airflow-db: { condition: service_healthy }
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow fab-db migrate &&
+        airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:?definí AIRFLOW_ADMIN_PASSWORD (scripts/load-secrets.sh)} || true"
 
-  airflow-apiserver:     { logging: *logrotate, environment: { <<: *airflow-env } }
-  airflow-dag-processor: { logging: *logrotate, environment: { <<: *airflow-env } }
-  airflow-triggerer:     { logging: *logrotate, environment: { <<: *airflow-env } }
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - "8082:8080"
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
   airflow-scheduler:
-    logging: *logrotate
-    environment: { <<: *airflow-env }
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
     volumes:
+      - ./dags:/opt/airflow/dags
       - ./notebooks:/opt/notebooks   # papermill lee los .ipynb
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
 
   # ==================== MONITOREO ====================
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: prometheus
-    <<: *hard
+    restart: unless-stopped
+    <<: *mon-logging
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -1617,7 +2080,8 @@ services:
   alertmanager:
     image: prom/alertmanager:v0.27.0
     container_name: alertmanager
-    <<: *hard
+    restart: unless-stopped
+    <<: *mon-logging
     command: [--config.file=/etc/alertmanager/alertmanager.yml]
     volumes:
       - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
@@ -1627,7 +2091,8 @@ services:
   grafana:
     image: grafana/grafana:11.2.0
     container_name: grafana
-    <<: *hard
+    restart: unless-stopped
+    <<: *mon-logging
     depends_on: [prometheus]
     environment:
       - GF_SECURITY_ADMIN_USER=admin
@@ -1643,7 +2108,8 @@ services:
   node-exporter:
     image: prom/node-exporter:v1.8.2
     container_name: node-exporter
-    <<: *hard
+    restart: unless-stopped
+    <<: *mon-logging
     command:
       - --path.rootfs=/host
       - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
@@ -1654,7 +2120,8 @@ services:
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: cadvisor
-    <<: *hard
+    restart: unless-stopped
+    <<: *mon-logging
     privileged: true
     volumes:
       - /:/rootfs:ro
@@ -1667,7 +2134,8 @@ services:
   statsd-exporter:
     image: prom/statsd-exporter:v0.27.1
     container_name: statsd-exporter
-    <<: *hard
+    restart: unless-stopped
+    <<: *mon-logging
     command:
       - --statsd.mapping-config=/etc/statsd/statsd_mapping.yml
       - --statsd.listen-udp=:9125
@@ -1679,7 +2147,8 @@ services:
   loki:
     image: grafana/loki:3.1.1
     container_name: loki
-    <<: *hard
+    restart: unless-stopped
+    <<: *mon-logging
     command: [-config.file=/etc/loki/loki-config.yml]
     volumes:
       - ./monitoring/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
@@ -1690,12 +2159,16 @@ services:
   promtail:
     image: grafana/promtail:3.1.1
     container_name: promtail
-    <<: *hard
+    restart: unless-stopped
+    <<: *mon-logging
     command: [-config.file=/etc/promtail/promtail-config.yml]
     volumes:
       - ./monitoring/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks: [hadoopnet]
+
+networks:
+  hadoopnet:
 ```
 
 ### 11.2 `scripts/deploy.sh` (deploy rápido dev, sin CI)
@@ -1709,7 +2182,7 @@ KEY=~/.ssh/pyspark_stack
 rsync -avz --delete --exclude '__pycache__' -e "ssh -i $KEY" \
   dags spark-apps notebooks \
   ec2-user@"$IP":/home/ec2-user/pyspark_stack/
-echo "deploy hecho — Airflow detecta los DAGs en ~30s (refresh del override de prod)"
+echo "deploy hecho — Airflow detecta los DAGs en ~30s (refresh de docker-compose.prod.yml)"
 ```
 
 > A diferencia de la guía 02 (que saca la IP de `terraform output`), acá la pasás como argumento (no
@@ -1727,16 +2200,138 @@ echo "deploy hecho — Airflow detecta los DAGs en ~30s (refresh del override de
   §12.4–§12.7.
 - **Tests y tooling** (`tests/conftest.py`, `tests/test_dag_integrity.py`, `ruff.toml`,
   `.pre-commit-config.yaml`, `Makefile`): guía 02 §11.2.
-- **`requirements.txt`** — agregá (guía 02 §9.1):
+- **`requirements.txt`** — agregá (guía 02 §9.1/§19.2):
   ```text
   apache-airflow-providers-amazon==9.29.0   # operadores EMR Serverless — imprescindible
   apache-airflow-providers-papermill==3.9.1 # notebooks
   pandas
   s3fs
   pyarrow
+  dbt-core==1.9.*
+  dbt-athena-community==1.9.*
+  dbt-spark[session]==1.9.*   # solo si vas a usar el target `spark` de §11.4
   ```
 - **`.gitignore`** — que cubra `.env`, `monitoring/alertmanager/alertmanager.yml` (tiene el SMTP
   password), salidas de papermill.
+
+### 11.4 dbt Core (transformaciones SQL sobre las tablas Iceberg)
+
+Reemplaza SQL que viviría hardcodeado en un DAG por modelos versionados en Git, con tests y docs
+autogeneradas. **Airflow sigue siendo el único orquestador**: dbt es una task más (`BashOperator`),
+igual que ya disparás papermill o EMR Serverless. Detalle completo y la explicación de por qué el
+target `spark` no es un dbt-spark típico (EMR Serverless no tiene un endpoint persistente al que
+conectarse) está en la [guía 02 §19](02-produccion-aws.md#19-transformaciones-sql-con-dbt) — acá,
+los archivos tal cual, idénticos:
+
+```text
+dbt/
+├── dbt_project.yml
+├── profiles.yml
+└── models/
+    ├── athena/ventas_por_pais.sql   # la mayoría de los modelos: SQL directo sobre Athena/Iceberg
+    └── spark/ventas_reproceso.sql   # solo si un modelo necesita reprocesar a escala Spark
+```
+
+```yaml
+# dbt/profiles.yml — credenciales del rol IAM de la EC2, sin keys
+pyspark_stack:
+  target: athena
+  outputs:
+    athena:
+      type: athena
+      s3_staging_dir: "s3://{{ env_var('ARTIFACTS_BUCKET') }}/athena-results/"
+      region_name: us-east-1
+      database: pyspark_stack_analytics     # el Glue database de §5.4
+      work_group: pyspark-stack-analytics   # el workgroup engine v3 de §10
+      num_retries: 3
+    spark:
+      type: spark
+      method: session   # sin endpoint: corre embebido en el propio job EMR Serverless
+      schema: pyspark_stack_analytics
+      host: localhost
+```
+
+Task de Airflow (fragmento — se dispara tras el job EMR que puebla `curated/`):
+
+```python
+from airflow.providers.standard.operators.bash import BashOperator
+
+dbt_run = BashOperator(
+    task_id="dbt_run_ventas",
+    bash_command="cd /opt/dbt && dbt run --target athena --select ventas_por_pais --vars '{\"ds\": \"{{ ds }}\"}'",
+    env={"ARTIFACTS_BUCKET": "{{ var.value.artifacts }}"},
+)
+run_emr >> dbt_run
+```
+
+Montá `./dbt:/opt/dbt` en `airflow-scheduler` — sumalo al `docker-compose.prod.yml` de §11.1, junto
+a `./notebooks`:
+
+```yaml
+  airflow-scheduler:
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./notebooks:/opt/notebooks
+      - ./dbt:/opt/dbt
+```
+
+### 11.5 Great Expectations (calidad de datos)
+
+Gate más estricto que el `SELECT count(*)` de §10: valida schema/nulls/rangos de `curated/` **antes**
+de promoverlo a `analytics/` o de que dbt corra sobre esa tabla. Corre vía SQL sobre Athena (el mismo
+`pyathena`/workgroup de §10 y §11.4) — sin Spark, sin cargar el dataset a memoria. Detalle completo
+en la [guía 02 §20](02-produccion-aws.md#20-calidad-de-datos-con-great-expectations); acá, idéntico:
+
+```text
+# requirements.txt
+great-expectations==1.3.*
+pyathena==3.*
+```
+
+`great_expectations/expectations/curated_ventas.json` (fragmento; JSON no admite comentarios, la
+ruta va en el texto):
+
+```json
+{
+  "expectation_suite_name": "curated_ventas",
+  "expectations": [
+    { "expectation_type": "expect_table_row_count_to_be_between",
+      "kwargs": { "min_value": 1 } },
+    { "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": { "column": "pais" } },
+    { "expectation_type": "expect_column_values_to_be_between",
+      "kwargs": { "column": "monto", "min_value": 0, "max_value": 1000000 } }
+  ]
+}
+```
+
+Task de Airflow (corre entre el job EMR y dbt/la promoción a `analytics/`):
+
+```python
+from airflow.providers.standard.operators.bash import BashOperator
+
+validar_calidad = BashOperator(
+    task_id="validar_calidad_ventas",
+    bash_command=(
+        "cd /opt/great_expectations && "
+        "great_expectations checkpoint run curated_ventas_checkpoint"
+    ),
+)
+run_emr >> validar_calidad >> dbt_run   # solo transforma/promueve si la validación pasa
+```
+
+Sale con código de error si alguna expectation falla — la task queda roja en Airflow, mismo mecanismo
+que cualquier otra falla de DAG (no es un canal de alertas nuevo). Montá
+`./great_expectations:/opt/great_expectations` en `airflow-scheduler`, junto a `./dbt`:
+
+```yaml
+  airflow-scheduler:
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./notebooks:/opt/notebooks
+      - ./dbt:/opt/dbt
+      - ./great_expectations:/opt/great_expectations
+```
 
 ---
 
@@ -1771,6 +2366,7 @@ if EmrServerlessStartJobOperator is not None:
         start_date=datetime(2026, 1, 1),
         schedule=None,
         catchup=False,
+        max_active_runs=1,   # auditoría §3.1: 2 disparos el mismo día no duplican el trabajo
         tags=["emr", "prod", "etl"],
     ) as dag:
         run = EmrServerlessStartJobOperator(
@@ -2030,10 +2626,10 @@ wc -l .env           # 11 variables (las que emite load-secrets.sh)
 ls -l .env           # -rw------- (chmod 600)
 
 # 4. Validar el merge de los compose ANTES de levantar:
-docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet   # sin salida = OK
+docker compose -f docker-compose.prod.yml config --quiet   # sin salida = OK
 
 # 5. Levantar el stack completo:
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml up -d --build
 
 # 6. (OPCIONAL) Exponer la web de Airflow por HTTPS a tu IP: seguí §4.6.
 ```
@@ -2119,6 +2715,117 @@ creación (dependencias primero los consumidores, luego los recursos base):
 
 > Con esto no queda nada cobrando. Verificá en **Billing → Cost Explorer** los días siguientes que el
 > gasto cae a cero.
+
+---
+
+## 16. Gobierno, costo y resiliencia (extras)
+
+Cuatro piezas AWS-nativas, independientes de todo lo anterior — no tocan Airflow, EMR Serverless ni
+el compose. Las tres primeras son gratis o casi gratis; la cuarta (DLQ) es la más urgente: sin ella,
+si `trigger-airflow` falla a mitad de un `SendCommand`, el evento `S3 ObjectCreated` que lo disparó
+se pierde en silencio y nadie se entera hasta el día siguiente (o nunca, si es event-driven). El
+detalle Terraform completo (por si más adelante migrás a IaC) está en la guía 02 §18; acá, consola.
+
+**Paso 0 — un tema SNS para todas las alarmas.** Consola: **SNS → Topics → Create topic** →
+*Standard* → nombre `pyspark-stack-alerts` → **Create topic** → **Create subscription** → *Protocol*
+Email → tu dirección → **Create subscription** → confirmá el mail que te llega (si no confirmás, la
+suscripción queda `PendingConfirmation` y nunca te llega nada).
+
+### 16.1 DLQ para `trigger-airflow` y `startstop`
+
+1. **SQS → Create queue** ×2, *Standard*: `pyspark-stack-trigger-airflow-dlq` y
+   `pyspark-stack-startstop-dlq`, *Retention period* **14 days**.
+2. **Lambda → `pyspark-stack-trigger-airflow` → Configuration → Asynchronous invocation → Edit** →
+   *Dead-letter queue* → la cola `trigger-airflow-dlq` → **Save**. Repetí en
+   `pyspark-stack-startstop` con su propia cola.
+3. En el rol de ejecución de **cada** Lambda (IAM → Roles → el rol de esa función) →
+   **Add permissions → Create inline policy** → JSON:
+
+   ```json
+   { "Version": "2012-10-17", "Statement": [
+     { "Effect": "Allow", "Action": "sqs:SendMessage", "Resource": "<ARN de SU cola dlq>" }
+   ]}
+   ```
+
+   *Policy name* `lambda-dlq` → **Create policy**.
+4. **CloudWatch → Alarms → Create alarm** ×2 → métrica `AWS/SQS → ApproximateNumberOfMessagesVisible`,
+   filtrada por cada `QueueName` → *Statistic* Maximum, *Period* 5 minutes → condición **Greater
+   than 0** → acción: notificar al topic `pyspark-stack-alerts` del Paso 0.
+
+> **Reprocesar un mensaje de la DLQ:** `aws sqs receive-message --queue-url <url>` te da el evento
+> original; reenvialo a mano (`aws lambda invoke --function-name ... --payload file://evento.json`)
+> y después `aws sqs delete-message`. Sin redrive automático: a ~13 corridas/mes no se justifica un
+> pipeline de reproceso, es una cola chica que revisás cuando suena la alarma.
+>
+> Verificá (CLI): `aws lambda get-function --function-name pyspark-stack-trigger-airflow
+> --query 'Configuration.DeadLetterConfig'` debe devolver el ARN de la cola, no `null`.
+
+### 16.2 AWS Budgets
+
+**Billing and Cost Management → Budgets → Create budget** → *Customize (advanced)* → *Cost budget* →
+*Period* Monthly → monto (referencia: ~$35/mes start/stop o ~$83/mes 24/7, §2 — poné margen) → dos
+*Alert thresholds*: **80% Actual** y **100% Forecasted** (avisa *antes* de llegar, según la
+proyección de AWS) → tu email en ambas → **Create budget**. Gratis: los primeros presupuestos no
+tienen costo.
+
+### 16.3 Cost Anomaly Detection
+
+**Billing and Cost Management → Cost Anomaly Detection → Create monitor** → *Monitor type* AWS
+services → **Create** → **Create alert subscription** → *Frequency* Daily summary → *Threshold* $5
+(por debajo es ruido a esta escala) → tu email → **Save**. Detecta picos que no siguen el patrón
+histórico — por ejemplo un job de EMR Serverless que quedó escalando workers de más, o un DAG en loop.
+
+### 16.4 IAM Access Analyzer
+
+**IAM → Access Analyzer → Create analyzer** → *Zone of trust* Current account → nombre
+`pyspark-stack-analyzer` → **Create analyzer**. Gratis, sin mantenimiento. A esta escala (una sola
+cuenta, sin cross-account) no debería reportar nada — el valor es la detección temprana si algún día
+agregás un rol con `Principal` mal acotado. Los hallazgos aparecen en la misma pantalla; opcional:
+regla de EventBridge sobre `aws.access-analyzer` → el topic SNS del Paso 0, si querés que te avisen
+sin entrar a la consola.
+
+> Verificá (CLI): `aws accessanalyzer list-analyzers --query 'analyzers[].{name:name,status:status}'`
+> → `status` debe ser `ACTIVE`.
+
+---
+
+## 17. Lineage de datos con OpenLineage
+
+Saber "esta tabla de `analytics/` salió de qué archivo de `raw/`, pasando por qué job y qué modelo
+dbt" — sin desplegar Marquez (otro contenedor con estado en una `t3.large` ya ajustada). Los eventos
+de Airflow y dbt se escriben como JSON Lines a S3 y se consultan con Athena, mismo patrón que el
+resto de la plataforma (§10). Detalle completo, incluida la tabla de qué cubre y qué no (Spark en
+EMR Serverless queda afuera por defecto — necesita Marquez) en la
+[guía 02 §21](02-produccion-aws.md#21-lineage-de-datos-con-openlineage).
+
+**Instalación** (`requirements.txt`):
+
+```text
+apache-airflow-providers-openlineage==1.*   # verificá versión exacta compatible con Airflow 3.2.2
+openlineage-dbt==1.*                        # ídem, contra la versión de dbt-core de §11.4
+```
+
+**Config** — en el `docker-compose.prod.yml` de §11.1, dentro de `x-airflow-common` →
+`environment`:
+
+```yaml
+AIRFLOW__OPENLINEAGE__TRANSPORT: '{"type": "file", "log_file_path": "/opt/airflow/logs/openlineage/events.log"}'
+AIRFLOW__OPENLINEAGE__NAMESPACE: "pyspark-stack-prod"
+```
+
+Y montá un path persistente para ese archivo:
+
+```yaml
+  airflow-scheduler:
+    volumes:
+      - /data/openlineage:/opt/airflow/logs/openlineage
+```
+
+Una task de Airflow sincroniza el archivo a S3 particionado por fecha, y una tabla externa en
+Athena (con `UNNEST` sobre `inputs`/`outputs`) responde "¿qué produjo esta tabla?" — el SQL completo
+y el DDL están en la guía 02 §21.4. Si más adelante necesitás lineage columna-a-columna dentro de
+los jobs Spark, Marquez es el upgrade (guía 02 §21.5) — pero suma ~1-2 GB de RAM a la EC2, confirmá
+margen antes de sumarlo.
 
 ---
 

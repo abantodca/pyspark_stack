@@ -1,9 +1,10 @@
 # Ejemplos locales paso a paso — de lo más simple a lo avanzado
 
-> 20 ejemplos para **copiar código a código** y entender el stack uno a uno: 5 básicos, 5 intermedios,
-> 5 avanzados y 5 recontra ultra avanzados. Cada uno dice **dónde** correrlo, el **código** listo para
-> pegar, **qué observar** y el **por qué** (con las trampas propias de este montaje). Datos reales del repo:
-> `landing/customer_etl/` (`customers.csv`, `orders.csv`, `products.json`).
+> 21 ejemplos para **copiar código a código** y entender el stack uno a uno: 5 básicos, 5 intermedios,
+> 5 avanzados, 5 recontra ultra avanzados y un bonus (Ej. 21) que practica **exactamente** la técnica
+> que hoy corre en producción (Iceberg), sin AWS. Cada uno dice **dónde** correrlo, el **código**
+> listo para pegar, **qué observar** y el **por qué** (con las trampas propias de este montaje). Datos
+> reales del repo: `landing/customer_etl/` (`customers.csv`, `orders.csv`, `products.json`).
 >
 > Requisito: el stack arriba (`docker compose up -d`). UIs: Airflow `:8082`, Jupyter `:8888`,
 > Spark `:8081`, HDFS `:9870`.
@@ -721,8 +722,9 @@ spark.read.parquet(TARGET).groupBy("order_month").count().show()
 `overwrite` borraría toda la tabla.
 
 **Por qué:** es el patrón de *backfill* seguro. La ventana `row_number` colapsa reenvíos a la última
-versión por clave (base de un SCD-1 / upsert sin motor transaccional). En prod con Delta/Iceberg esto
-se hace con `MERGE INTO`, pero el principio —reprocesar sin efectos colaterales— es el mismo.
+versión por clave (base de un SCD-1 / upsert sin motor transaccional). En prod con Iceberg esto se
+hace con `MERGE INTO` de verdad (Ejemplo 21), pero el principio —reprocesar sin efectos
+colaterales— es el mismo.
 
 ---
 
@@ -850,15 +852,113 @@ se prueba en CI antes de desplegar, no "se ve en la UI de Airflow si funcionó".
 
 ---
 
+## Ejemplo 21 — Tablas Iceberg locales: `MERGE INTO` y time travel, sin AWS
+
+**Dónde:** Jupyter. Lo mismo que el Ejemplo 17 (upsert idempotente), pero con una tabla **Iceberg**
+de verdad en vez de particiones Parquet a mano — el mismo formato que usa producción
+([guía 02 §16.1](02-produccion-aws.md#161-tablas-iceberg-acid-time-travel-y-merge-desde-sql-sin-crawler)),
+solo que acá el catálogo es un directorio local (`file://`) en vez de Glue Data Catalog. El SQL —
+`MERGE INTO`, `FOR VERSION AS OF`— es **idéntico** al de Athena en prod.
+
+```python
+spark.stop()  # reiniciar la sesión con Iceberg habilitado (los `--conf` no se pueden agregar en caliente)
+
+from pyspark.sql import SparkSession
+
+WAREHOUSE = "file:///opt/spark-apps/ejemplos/out/iceberg_warehouse"
+
+spark = (SparkSession.builder
+    .appName("iceberg-local")
+    # Se resuelve de Maven Central la primera vez (cachea en ~/.ivy2); necesita salida a internet
+    # desde el contenedor. Versión Spark 4.0 / Scala 2.13, igual que el resto del stack.
+    .config("spark.jars.packages", "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.7.1")
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    # HadoopCatalog: catálogo basado en directorio, sin Hive/Glue — el equivalente local del
+    # GlueCatalog de prod (mismo Iceberg, catálogo distinto).
+    .config("spark.sql.catalog.local", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.local.type", "hadoop")
+    .config("spark.sql.catalog.local.warehouse", WAREHOUSE)
+    .getOrCreate())
+```
+
+```python
+from pyspark.sql import functions as F
+
+orders = (spark.read.option("header", True)
+          .csv("file:///opt/spark-apps/landing/customer_etl/orders.csv")
+          .withColumn("order_month", F.substring("order_date", 1, 7)))
+
+# 1) crear la tabla la primera vez (createOrReplace = "si no existe, creála")
+orders.limit(0).writeTo("local.db.orders").createOrReplace()
+
+# 2) MERGE de verdad — reemplaza el dedup + overwrite dinámico del Ejemplo 17 con una sola sentencia
+orders.createOrReplaceTempView("nuevo_lote")
+spark.sql("""
+  MERGE INTO local.db.orders t
+  USING nuevo_lote s
+  ON t.order_id = s.order_id
+  WHEN MATCHED THEN UPDATE SET *
+  WHEN NOT MATCHED THEN INSERT *
+""")
+
+spark.sql("SELECT order_month, count(*) FROM local.db.orders GROUP BY order_month").show()
+
+# correr el MERGE de nuevo con el mismo lote no duplica (upsert real, no hace falta el row_number a mano)
+spark.sql("""
+  MERGE INTO local.db.orders t USING nuevo_lote s ON t.order_id = s.order_id
+  WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *
+""")
+```
+
+```python
+# 3) time travel — la tabla como estaba en el snapshot anterior
+spark.sql("SELECT * FROM local.db.orders.history").show(truncate=False)   # lista los snapshot_id
+snap_id = spark.sql("SELECT snapshot_id FROM local.db.orders.history ORDER BY made_current_at LIMIT 1").first()[0]
+spark.read.format("iceberg").option("snapshot-id", snap_id).load("local.db.orders").show()
+```
+
+**Qué observar:** ni `row_number` a mano ni `partitionOverwriteMode` — el `MERGE INTO` hace la
+idempotencia sola, y `.history` te da versiones auditables que el Parquet suelto del Ejemplo 17 no
+tenía. `local.db.orders.history`/`.snapshots`/`.files` son *metadata tables* que Iceberg expone como
+si fueran tablas SQL normales — útiles para depurar sin salir de Spark SQL.
+
+**Por qué:** esto es literalmente lo que corre en producción (mismo `MERGE INTO`, mismo
+`writeTo(...).createOrReplace()`), cambiando solo el catálogo: acá `local` (directorio), en EMR
+Serverless `glue_catalog` (Glue Data Catalog) — ver el `spark.sql.catalog.*` de la
+[guía 02 §6.4](02-produccion-aws.md#64-cómputo-spark-emr-serverless). Practicar el `MERGE`/time-travel
+acá, sin AWS, es gratis y sin esperar el *cold start* de EMR Serverless.
+
+> Limpieza: `rm -rf spark-apps/ejemplos/out/iceberg_warehouse` — es un catálogo Iceberg completo
+> (metadata + datos), no solo Parquet suelto; `rm -rf` alcanza porque es local, no hace falta
+> `VACUUM` (eso importa recién con snapshots viejos acumulados en un catálogo real).
+
+---
+
 ## Cierre — del ejemplo al pipeline
 
 Recorrido: leer/escribir (1–5) → HDFS, joins, SQL, ventanas, jobs parametrizados (6–10) → job
-completo, orquestación, entornos, performance y layout de lake (11–15). El pipeline real del repo
-(`customer_etl`) es exactamente la suma de los ejemplos 7, 8, 10, 11 y 12.
+completo, orquestación, entornos, performance y layout de lake (11–15) → streaming, carga
+incremental, UDFs, tuning y testing (16–20) → Iceberg, el formato real de producción (21). El
+pipeline real del repo (`customer_etl`) es exactamente la suma de los ejemplos 7, 8, 10, 11 y 12.
 
-**Siguiente paso:** cuando un job funciona en local con estos patrones, el salto a producción solo
-cambia dos cosas —`hdfs://…` → `s3://…` y el `--master spark://…` por EMR Serverless—; la lógica del
-job queda igual. Ver [docs/02](02-produccion-aws.md) y [docs/03](03-arquitectura.md).
+**Siguiente paso:** cuando un job funciona en local con estos patrones, el salto a producción cambia
+tres cosas —`hdfs://…` → `s3a://…`, el `--master spark://…` por EMR Serverless, y el `.parquet(...)`
+suelto del Ej. 17 por el `writeTo(...).createOrReplace()` / `MERGE INTO` de Iceberg del Ej. 21—; la
+lógica del job queda igual. De ahí en más, lo que ya está montado en producción y no tiene
+equivalente local (porque corre contra servicios AWS, no contra el cluster de esta máquina):
+
+| Capacidad de prod | Dónde practicarla | Guía |
+|---|---|---|
+| Cómputo Spark (EMR Serverless) | Ej. 1–20 son el mismo Spark; solo cambia el `--master`/submit | [docs/02 §6.4](02-produccion-aws.md#64-cómputo-spark-emr-serverless) |
+| Tablas Iceberg (ACID/MERGE/time-travel) | **Ej. 21**, acá mismo, sin AWS | [docs/02 §16.1](02-produccion-aws.md#161-tablas-iceberg-acid-time-travel-y-merge-desde-sql-sin-crawler) |
+| Consumo SQL/BI (Athena) | El SQL del Ej. 21 es el mismo que correrías en Athena | [docs/02 §16](02-produccion-aws.md#16-athena--capa-de-consumo-sqlbi-opcional) |
+| Transformaciones versionadas (dbt) | No hay equivalente local en este repo — dbt corre contra Athena/EMR reales | [docs/02 §19](02-produccion-aws.md#19-transformaciones-sql-con-dbt) |
+| Calidad de datos (Great Expectations) | No hay equivalente local — valida contra Athena real | [docs/02 §20](02-produccion-aws.md#20-calidad-de-datos-con-great-expectations) |
+| Lineage de datos (OpenLineage) | No hay equivalente local — los eventos van a S3/Athena reales | [docs/02 §21](02-produccion-aws.md#21-lineage-de-datos-con-openlineage) |
+| Disparo event-driven con retry (SQS + Lambda) | No hay equivalente local — depende de S3/SQS/SSM reales | [docs/02 §7.3](02-produccion-aws.md#73-disparo-por-evento-archivo-nuevo-en-s3-vía-sqs) |
+| Orquestación (Airflow, siempre) | Ej. 12–13 ya son Airflow real, mismo motor que en prod | [docs/02 §5](02-produccion-aws.md#5-núcleo-ec2-con-docker) |
+
+Ver [docs/02](02-produccion-aws.md) (el cómo, copy-paste) y [docs/03](03-arquitectura.md) (el mapa).
 
 > Limpieza: los `spark-apps/ejemplos/out/` y las rutas `/ejemplos/...` de HDFS son scratch. Bórralos
 > con `hdfs dfs -rm -r /ejemplos` y `rm -rf spark-apps/ejemplos/out` cuando termines (no los versiones).
