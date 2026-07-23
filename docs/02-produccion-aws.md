@@ -521,9 +521,11 @@ resource "aws_security_group" "pyspark" {
 > Para refrescar ese `/32` **elegí una de las dos opciones de abajo, no las dos**: son excluyentes.
 >
 > **Opción A — Terraform lo sigue gestionando (recomendada).** Reaplicá con tu IP actual en una línea,
-> sin tocar el `tfvars`:
+> sin tocar el `tfvars`. Si es la primera vez que corrés Terraform contra `infra/prod` en esta máquina
+> (hasta acá solo inicializaste `infra/bootstrap`, §4), primero `init`:
 >
 > ```bash
+> terraform -chdir=infra/prod init
 > terraform -chdir=infra/prod apply -var "my_ip_cidr=$(curl -s https://checkip.amazonaws.com)/32"
 > ```
 >
@@ -701,17 +703,26 @@ resource "aws_volume_attachment" "data" {
 set -euxo pipefail
 dnf update -y && dnf install -y docker git && systemctl enable --now docker
 
-# Versión PINEADA (mismo criterio que las imágenes por @sha256): un boot de hoy y uno de dentro
-# de 6 meses instalan lo mismo. Actualizala a propósito, no dejes que "latest" decida por vos.
+# Versiones PINEADAS (mismo criterio que las imágenes por @sha256): un boot de hoy y uno de dentro
+# de 6 meses instalan lo mismo. Actualizalas a propósito, no dejes que "latest" decida por vos.
 COMPOSE_VERSION=v5.3.1
+BUILDX_VERSION=v0.35.0
 DOCKER_CONFIG=/usr/local/lib/docker
 mkdir -p $DOCKER_CONFIG/cli-plugins
-# OJO con el $$: este archivo pasa por templatefile(), así que Terraform interpretaría un ${...}
-# como variable SUYA y fallaría ("vars map does not contain key"). $${...} emite un ${...} literal
-# que expande bash en el boot. Todo ${...} que agregues acá y sea de bash necesita el mismo escape.
+# OJO: templatefile() trata TODO este archivo como plantilla, comentarios incluidos. Cualquier
+# apertura de variable sin escapar rompe el parseo ("Invalid expression") aunque esté dentro de
+# un comentario, o -si el parseo no rompe- Terraform la interpreta como variable SUYA y falla
+# ("vars map does not contain key"). Para que bash expanda una variable en el boot hay que
+# escribirla con el símbolo de pesos duplicado antes de la llave, como en la línea de abajo. Todo
+# lo que agregues acá entre llaves y sea de bash necesita el mismo escape.
 curl -fSL "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
   -o $DOCKER_CONFIG/cli-plugins/docker-compose
 chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
+# El paquete `docker` de dnf en AL2023 no trae buildx (o trae uno viejo): sin esto, el paso 5 de
+# infra/deploy revienta con "compose build requires buildx 0.17.0 or later" al hacer `up --build`.
+curl -fSL "https://github.com/docker/buildx/releases/download/$${BUILDX_VERSION}/buildx-$${BUILDX_VERSION}.linux-amd64" \
+  -o $DOCKER_CONFIG/cli-plugins/docker-buildx
+chmod +x $DOCKER_CONFIG/cli-plugins/docker-buildx
 usermod -aG docker ec2-user
 
 # Disco de datos (Nitro => /dev/nvme1n1). Solo formatea si está vacío (no borra en recreación).
@@ -1097,6 +1108,33 @@ Es obligatorio, no opcional: si le hicieras `docker compose up` pelado a `docker
 de dev), levantarías Spark standalone + HDFS en la EC2 orquestadora, justo lo que este stack evita
 moviendo Spark a EMR Serverless (§1, §6.4).
 
+**Paso 0b — creá también `Dockerfile.airflow.prod`** (junto a `docker-compose.prod.yml`, no
+reemplaza a `Dockerfile.airflow`: ese sigue siendo el de `docker-compose.yml`/dev). `Dockerfile.airflow`
+instala JDK 17 + Spark 4.0.3 + Hadoop CLI (~1.2 GB) para que el dev local pueda hacer `spark-submit`
+contra el cluster standalone — en prod eso **nunca se ejecuta**: los jobs van a EMR Serverless
+(§6.4) vía `EmrServerlessStartJobOperator`, que llama a la API de AWS, no a un binario `spark-submit`
+local. Compartir el mismo Dockerfile pesado en prod solo suma minutos de build y una descarga lenta
+e inestable contra `archive.apache.org`, sin ningún beneficio:
+
+```dockerfile
+# Dockerfile.airflow.prod — imagen de PRODUCCIÓN (EC2 orquestador). A propósito NO instala
+# JDK/Spark/Hadoop como Dockerfile.airflow: acá Airflow nunca corre spark-submit local.
+FROM apache/airflow:3.2.2-python3.12
+
+ARG AIRFLOW_VERSION=3.2.2
+ARG PYTHON_VERSION=3.12
+
+USER airflow
+COPY requirements.txt /
+RUN pip install --no-cache-dir -r /requirements.txt \
+      --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+```
+
+Los providers de `requirements.txt` (`apache-airflow-providers-apache-spark`, que usan los DAGs de
+ejemplo de §5, y luego `apache-airflow-providers-amazon` de §9.1) son paquetes Python puros: se
+importan bien sin que Java/Spark estén instalados, solo fallarían si de verdad intentaras correr
+`spark-submit` — y en prod eso no pasa nunca.
+
 Esta es la versión **mínima** (Airflow + Postgres); las secciones 9 (papermill), 12 (monitoreo) y 13
 (EMR Serverless env + secretos + hardening) van a pedirte que **reemplaces todo el archivo** por una
 versión más completa (la final está en §14.1) — no lo vayas parcheando a mano por partes, total cada
@@ -1109,10 +1147,10 @@ sección te da el archivo entero de nuevo:
 # §9/§12/§13 amplían este mismo archivo — versión final en §14.1.
 #   docker compose -f docker-compose.prod.yml up -d --build
 x-airflow-common: &airflow-common
-  image: pyspark_stack-airflow:3.2.2
+  image: pyspark_stack-airflow-prod:3.2.2
   build:
     context: .
-    dockerfile: Dockerfile.airflow
+    dockerfile: Dockerfile.airflow.prod   # liviana (Paso 0b): sin JDK/Spark/Hadoop
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
@@ -1223,6 +1261,14 @@ IP=$(terraform -chdir=infra/prod output -raw public_ip)
 aws ec2 wait instance-status-ok \
   --instance-ids "$(terraform -chdir=infra/prod output -raw instance_id)"
 
+# La EIP (public_ip) es estable entre stop/start, PERO si el `apply` del paso 1 reemplazó la
+# instancia (-/+ en el plan: pasa con cambios al SG, al user_data, a la AMI...) la EC2 nueva
+# generó una host key SSH nueva. Tu ~/.ssh/known_hosts todavía tiene la vieja asociada a esa
+# misma IP → rsync y ssh fallan con "Host key verification failed" o el warning de "REMOTE HOST
+# IDENTIFICATION HAS CHANGED". Limpiala siempre acá, sin preguntar (si no hubo reemplazo, esto
+# no hace nada):
+ssh-keygen -f ~/.ssh/known_hosts -R "$IP" >/dev/null 2>&1 || true
+
 # ─── 3. Subir el código ──────────────────────────────────────────────────────
 # --exclude '.env': el .env local (dev) no debe pisar el de prod, que lo genera
 # load-secrets.sh en la EC2 desde SSM (§13.1). 'infra' tampoco viaja: vive en tu máquina.
@@ -1237,7 +1283,8 @@ ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
   'cloud-init status --wait && docker compose version && df -h /data | tail -1'
 
 # ─── 5. Levantar el stack (sin Spark/HDFS: no hacen falta en la EC2) ─────────
-# (la 1ª vez tarda: compila imágenes de Airflow) ───
+# (la 1ª vez tarda un par de minutos: instala los providers de requirements.txt; con
+# Dockerfile.airflow.prod ya NO baja JDK/Spark/Hadoop, así que no depende de archive.apache.org) ───
 ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
   'cd pyspark_stack && docker compose -f docker-compose.prod.yml up -d --build'
 
@@ -1251,13 +1298,17 @@ directo en `https://airflow.midominio.com` sin túnel. Spark ya no corre en la E
 EMR Serverless — su UI de Spark y sus logs se ven desde la consola de EMR / CloudWatch / S3, §12.8).
 No hay Jupyter en prod (§5.5): la exploración interactiva queda para el stack local (`docs/01`).
 
-> Lo aplicado hasta acá es el núcleo, no la infra final: se arma incrementalmente. El `apply` de acá crea solo
-> lo definido hasta la §5. Las secciones 6-7 (data lake S3, orquestación), 11 (CI/CD) y 13
-> (secretos) agregan más `.tf` a `infra/prod/`; cada vez que sumás archivos, volvés a correr
-> `terraform apply`. Del mismo modo, el `docker-compose.prod.yml` del Paso 0 ya arranca **sin**
-> Spark/HDFS (nunca estuvieron en el archivo); la puesta en producción real —monitoreo, env de EMR
-> Serverless, hardening y secretos desde SSM— reemplaza ese archivo por una versión más completa
-> (§12-14, final en §14.1): `./scripts/load-secrets.sh && docker compose -f docker-compose.prod.yml up -d`.
+> **Esto es orientación sobre lo que viene, no un paso para ejecutar ahora** — seguí con §5.6 abajo.
+>
+> Lo aplicado hasta acá (§1-5) es el núcleo, no la infra final: se arma incrementalmente a medida que
+> avanzás por la guía. El `apply` que ya corriste crea solo lo definido hasta la §5. Las secciones 6-7
+> (data lake S3, orquestación), 11 (CI/CD) y 13 (secretos) van a agregar más `.tf` a `infra/prod/`;
+> recién ahí, en cada una de esas secciones, corresponde volver a correr `terraform apply` — no hace
+> falta hacerlo ahora. Del mismo modo, el `docker-compose.prod.yml` del Paso 0 arranca a propósito
+> **sin** Spark/HDFS (nunca estuvieron en el archivo): recién en §12-14 ese archivo se reemplaza por una
+> versión más completa (monitoreo, env de EMR Serverless, hardening, secretos desde SSM), y **ahí** —no
+> acá— el comando para levantar el stack pasa a ser (§14.1 final):
+> `./scripts/load-secrets.sh && docker compose -f docker-compose.prod.yml up -d`.
 
 ---
 
@@ -1351,6 +1402,9 @@ resource "aws_iam_role_policy" "ec2_route53_certbot" {
 **Terraform — outputs (agregá a `infra/prod/outputs.tf`)** — de acá saca todo el resto:
 
 ```hcl
+# infra/prod/outputs.tf — agregá estos 3 al final del archivo que ya tenías (§5.3/§5.5). No
+# los pegues en terraform.tfvars: outputs van en un output "..." { value = ... }, tfvars son
+# asignaciones sueltas (bloque de abajo) — mezclarlos rompe el parseo de Terraform.
 output "airflow_domain" { value = var.airflow_domain }
 output "airflow_url" {
   value = var.airflow_domain == "" ? "(no expuesto: solo túnel SSH)" : "https://${var.airflow_domain}"
@@ -1380,6 +1434,8 @@ zona. Si la ampliás a `*`, cualquier proceso de la EC2 puede reescribir todo tu
 **Definí las variables** en `terraform.tfvars` (§5.5) — vacías = no exponer:
 
 ```hcl
+# infra/prod/terraform.tfvars — agregá estas 3 líneas al archivo que ya tenías (my_ip_cidr,
+# ssh_public_key, §4). Es el ÚNICO archivo donde va esta sintaxis de asignación suelta.
 airflow_domain    = "airflow.midominio.com"   # el FQDN de la web
 dns_zone          = "midominio.com"           # tu hosted zone en Route 53
 letsencrypt_email = "tu@email.com"
@@ -1426,11 +1482,64 @@ stop/start de la EC2).
 
 **Compose — activar el TLS nativo, editando el `airflow-apiserver` de tu `docker-compose.prod.yml`
 directamente** (ya no hay dos archivos que fusionar: es el único archivo, así que esto se edita
-in-place). El FQDN viaja como `AIRFLOW_DOMAIN` (no es secreto): agregalo al `.env` con
-`echo "AIRFLOW_DOMAIN=$(terraform -chdir=infra/prod output -raw airflow_domain)" >> .env`
-(o metelo en SSM junto a los demás, §13.1). Reemplazá el bloque `airflow-apiserver` por este —
-nota el `<<: *airflow-common-env` (el anchor **anidado** que definís junto con `x-airflow-common`,
-§14.1): permite sumar las 3 claves de TLS sin repetir todo el resto del environment a mano:
+in-place).
+
+> **¿Dónde se edita esto — en tu máquina o en la EC2?** Siempre en tu **repo LOCAL**, el mismo
+> `docker-compose.prod.yml` que creaste en el Paso 0. Es el mismo patrón de §5.5: editás local →
+> `rsync` lo sube → `ssh` lo levanta en la EC2. **No lo edites a mano dentro de la EC2** (por ejemplo
+> con `vim` en una sesión `ssh`): funciona en el momento, pero la próxima vez que corras el `rsync`
+> del Paso 3 (§5.5) para subir código nuevo, ese `rsync` **pisa** el `docker-compose.prod.yml` de la
+> EC2 con la versión vieja de tu repo local — sin el bloque TLS — y perdés el cambio sin ningún
+> aviso. Editá siempre acá, en tu máquina, y volvé a desplegar (más abajo, en "Verificar").
+
+El FQDN viaja como `AIRFLOW_DOMAIN` (no es secreto): agregalo a tu `.env` **local**, junto con las
+4 variables derivadas que arma el bloque de abajo (`AIRFLOW_BASE_URL`, `AIRFLOW_EXECUTION_API_URL`,
+`AIRFLOW_SSL_CERT`, `AIRFLOW_SSL_KEY`):
+
+```bash
+# EN TU MÁQUINA (repo local) — misma terminal donde corriste terraform: infra/ y su state
+# viven acá, no en la EC2 (§5.5).
+DOMAIN=$(terraform -chdir=infra/prod output -raw airflow_domain)
+{
+  echo "AIRFLOW_DOMAIN=$DOMAIN"
+  echo "AIRFLOW_BASE_URL=https://$DOMAIN"
+  echo "AIRFLOW_EXECUTION_API_URL=https://$DOMAIN:8080/execution/"
+  echo "AIRFLOW_SSL_CERT=/opt/airflow/certs/live/$DOMAIN/fullchain.pem"
+  echo "AIRFLOW_SSL_KEY=/opt/airflow/certs/live/$DOMAIN/privkey.pem"
+} >> .env
+```
+
+> **Ojo: este `.env` que acabás de tocar es el de tu repo LOCAL — no llega solo a la EC2.** El
+> `rsync` del Paso 3 (§5.5) excluye `.env` a propósito (`--exclude '.env'`), porque el `.env` de la
+> EC2 lo genera `load-secrets.sh` desde SSM (§13.1): son dos archivos distintos que nunca se pisan
+> entre sí. Sumá estas 5 variables también del lado de la EC2, por uno de estos dos caminos:
+>
+> - **Recomendado** (mismo mecanismo que el resto de los secretos): agregalas a SSM junto a las
+>   demás (§13.1) — `load-secrets.sh` las baja solas la próxima vez que corras
+>   `./scripts/load-secrets.sh && docker compose -f docker-compose.prod.yml up -d` en la EC2.
+> - **Directo**, mismo patrón que el comando de certbot de arriba (variable local, comando remoto
+>   por `ssh`):
+>
+>   ```bash
+>   IP=$(terraform -chdir=infra/prod output -raw public_ip)
+>   ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP" "cd pyspark_stack && {
+>     echo AIRFLOW_DOMAIN=$DOMAIN
+>     echo AIRFLOW_BASE_URL=https://$DOMAIN
+>     echo AIRFLOW_EXECUTION_API_URL=https://$DOMAIN:8080/execution/
+>     echo AIRFLOW_SSL_CERT=/opt/airflow/certs/live/$DOMAIN/fullchain.pem
+>     echo AIRFLOW_SSL_KEY=/opt/airflow/certs/live/$DOMAIN/privkey.pem
+>   } >> .env"
+>   ```
+>
+> **Si tu `.env` de la EC2 ya tenía `AIRFLOW_DOMAIN` de una corrida vieja de este comando (antes de
+> sumar `AIRFLOW_SSL_CERT`/`AIRFLOW_SSL_KEY` acá), el bloque `{ ... } >> .env` de arriba solo
+> AGREGA líneas al final — no pisa las viejas — así que corré `grep AIRFLOW_SSL .env` en la EC2
+> después y, si no aparece nada, agregalas a mano (mismo `echo ... >> .env`, sin las 3 primeras
+> líneas que ya tenías).**
+
+Reemplazá el bloque `airflow-apiserver` (en tu `docker-compose.prod.yml` **local**) por este — nota
+el `<<: *airflow-common-env` (el anchor **anidado** que definís junto con `x-airflow-common`,
+§14.1): permite sumar las claves de TLS sin repetir todo el resto del environment a mano:
 
 ```yaml
 services:
@@ -1440,18 +1549,48 @@ services:
     command: api-server
     environment:
       <<: *airflow-common-env
-      # Fuerza que el tráfico INTERNO scheduler → api-server use el FQDN del cert (resuelve el
-      # gotcha de Airflow 3: api-server, UI y Task Execution API comparten el puerto 8080, §5.6).
-      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "https://${AIRFLOW_DOMAIN}:8080/execution/"
-      AIRFLOW__API__SSL_CERT: /opt/airflow/certs/fullchain.pem
-      AIRFLOW__API__SSL_KEY:  /opt/airflow/certs/privkey.pem
-      AIRFLOW__API__BASE_URL: "https://${AIRFLOW_DOMAIN}"    # links/redirects correctos
+      # SSL_CERT/SSL_KEY vienen de AIRFLOW_SSL_CERT/AIRFLOW_SSL_KEY, dos variables aparte que se
+      # completan en el `.env` (mismo motivo que BASE_URL/EXECUTION_API_URL más abajo: docker
+      # compose NO soporta interpolación anidada, "${AIRFLOW_DOMAIN:+/opt/.../${AIRFLOW_DOMAIN}/x}"
+      # da "" SIEMPRE aunque AIRFLOW_DOMAIN esté seteado — se prueba con `docker compose config`,
+      # pasó justo eso probando este archivo). Sin ellas en el .env (default, modo túnel-only)
+      # ambas quedan en "" y Airflow sirve HTTP plano — es `if ssl_cert:` en
+      # airflow/cli/commands/api_server_command.py::_get_ssl_cert_and_key_filepaths(), un string
+      # vacío es falsy ahí. Si en cambio apuntaran siempre a una ruta fija, el api-server queda en
+      # restart loop buscando un cert que nunca se generó apenas hacés `docker compose up` sin
+      # haber corrido certbot todavía — pasó justo eso en un deploy real, con el puerto 8082 del
+      # túnel dando "Connection refused" porque el contenedor nunca llegaba a levantar. Con esto
+      # el mismo archivo sirve para los dos modos, sin tener que acordarte de "no tocar nada".
+      AIRFLOW__API__SSL_CERT: '${AIRFLOW_SSL_CERT:-}'
+      AIRFLOW__API__SSL_KEY:  '${AIRFLOW_SSL_KEY:-}'
+      # BASE_URL y EXECUTION_API_SERVER_URL SÍ necesitan el valor de AIRFLOW_DOMAIN adentro (no
+      # solo su presencia como en SSL_CERT/KEY arriba), y por la misma limitación de interpolación
+      # anidada van por dos variables aparte, que completás en el `.env` recién ACÁ, cuando de
+      # verdad configurás HTTPS (mismo patrón que el `echo AIRFLOW_DOMAIN=... >> .env` de arriba):
+      #   echo "AIRFLOW_BASE_URL=https://$(terraform -chdir=infra/prod output -raw airflow_domain)" >> .env
+      #   echo "AIRFLOW_EXECUTION_API_URL=https://$(terraform -chdir=infra/prod output -raw airflow_domain):8080/execution/" >> .env
+      # Sin ellas (default, modo túnel-only) BASE_URL queda "" → Airflow arma el `<base href="/">`
+      # del HTML relativo, funciona bien detrás del túnel a 8082. Si quedara fijo en
+      # "https://${AIRFLOW_DOMAIN}" con el dominio vacío, el resultado es el string literal
+      # "https://" y el `<base href>` sale roto: el navegador resuelve cualquier link relativo
+      # (p.ej. el de login, "auth/login/?next=%2F") contra ESE base roto, y termina pidiendo
+      # "https://auth/login/?next=%2F" (toma "auth" como si fuera el hostname) — pasó justo eso.
+      AIRFLOW__API__BASE_URL: '${AIRFLOW_BASE_URL:-}'
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: '${AIRFLOW_EXECUTION_API_URL:-http://airflow-apiserver:8080/execution/}'
     ports:
       - "8082:8080"                                          # túnel local (seguís pudiendo usarlo)
       - "443:8080"                                            # HTTPS público; el SG lo limita a tu IP
     volumes:
       - ./dags:/opt/airflow/dags                              # el `<<:` no mergea `volumes`, hay que repetirlo
-      - /data/certs/live/${AIRFLOW_DOMAIN}:/opt/airflow/certs:ro
+      # Monta la raíz de certbot completa, NO solo live/$AIRFLOW_DOMAIN: certbot deja
+      # live/$DOMINIO/fullchain.pem como symlink RELATIVO a ../../archive/$DOMINIO/fullchain1.pem
+      # (`ls -la /data/certs/live/$DOMINIO` lo muestra). Si montás nada más que la carpeta
+      # `live/$DOMINIO`, ese `../../archive/...` resuelve DENTRO del contenedor contra
+      # `/opt/archive/...`, que no existe — el symlink queda roto aunque el archivo exista en el
+      # host, y el api-server tira "SSL related file does not exist /opt/airflow/certs/.../
+      # fullchain.pem" (pasó justo eso en un deploy real). Montando `/data/certs` entero, `live/`
+      # y `archive/` quedan hermanos igual que en el host y el symlink relativo resuelve bien.
+      - /data/certs:/opt/airflow/certs:ro
     networks:
       hadoopnet:
         aliases: ["${AIRFLOW_DOMAIN}"]                       # <- adentro, el cert matchea este nombre
@@ -1462,27 +1601,68 @@ services:
 
 > `<<:` en YAML mergea al nivel del mapping donde se usa: como acá reemplazás `environment`,
 > `ports`, `volumes` y `networks` del servicio con tus propios valores, tenés que repetir lo que
-> ya tenías en cada uno (por eso `./dags:/opt/airflow/dags` aparece de nuevo). Si `airflow_domain`
-> está vacío, no toques nada: dejá el `airflow-apiserver` de §14.1 como está (8082 por túnel).
+> ya tenías en cada uno (por eso `./dags:/opt/airflow/dags` aparece de nuevo). Con
+> `AIRFLOW_BASE_URL`/`AIRFLOW_EXECUTION_API_URL`/`AIRFLOW_SSL_CERT`/`AIRFLOW_SSL_KEY` sin definir en
+> el `.env` (default de las cuatro: `""`, el hostname interno, `""` y `""`), este mismo bloque es
+> seguro **aunque `airflow_domain` esté vacío** (sirve HTTP plano por el túnel 8082, sin crashear
+> buscando un cert que no existe y sin el `<base href>` roto de la UI) — podés aplicar este
+> `docker-compose.prod.yml` de una y recién sumar las 5 variables al `.env` cuando corras certbot
+> más adelante, no hace falta coordinar el orden a mano.
 
-**Renovación automática (una vez, en la EC2).** `certbot renew` es no-op si faltan >30 días; corre
-semanal y recarga el cert reiniciando el api-server:
+**Renovación automática (una vez, EN LA EC2 — pegalo en la sesión `ssh` que ya tenés abierta, o
+mandalo en un solo `ssh ec2-user@$IP '...'` desde tu máquina).** `certbot renew` es no-op si faltan
+>30 días; corre semanal y recarga el cert reiniciando el api-server:
 
 ```bash
 echo '0 3 * * 1 root docker run --rm -v /data/certs:/etc/letsencrypt certbot/dns-route53 renew --quiet && chmod -R g+rX /data/certs && docker restart airflow-apiserver' \
   | sudo tee /etc/cron.d/airflow-cert-renew
 ```
 
-**Verificar:**
+> **Chequeo previo — ¿el `.env` de la EC2 ya tiene `AIRFLOW_DOMAIN`?** El `up -d` del Paso 1 de abajo
+> NO falla si no lo tiene: cae solo al modo túnel-only (HTTP plano en 8082/443, el fallback que
+> describe el bloque de arriba) sin ningún error visible — así que si saltaste el paso "Directo"/SSM
+> de más arriba, el resultado es un despliegue silenciosamente sin TLS, no un crash. Confirmalo
+> ANTES de gastar tiempo debugueando un 2) que va a fallar por esto:
+> ```bash
+> ssh -i ~/.ssh/pyspark_stack ec2-user@"$(terraform -chdir=infra/prod output -raw public_ip)" \
+>   'grep AIRFLOW_DOMAIN ~/pyspark_stack/.env 2>&1 || echo "falta: corré el paso Directo/SSM de arriba"'
+> ```
+
+**Verificar** — dos partes, cada una en su máquina:
 
 ```bash
-docker compose -f docker-compose.prod.yml up -d   # con AIRFLOW_DOMAIN en el .env
+# 1) EN TU MÁQUINA: subir el docker-compose.prod.yml editado (local) y redesplegar en la EC2 —
+#    mismo Paso 3 + Paso 5 de §5.5 (rsync sube el código, ssh levanta el stack). El .env de la EC2
+#    ya tiene AIRFLOW_DOMAIN gracias al paso de arriba (SSM o el ssh directo), así que este `up -d`
+#    ya arranca en modo HTTPS:
+IP=$(terraform -chdir=infra/prod output -raw public_ip)
+rsync -avz --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
+  -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@$IP:/home/ec2-user/pyspark_stack/
+ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
+  'cd pyspark_stack && docker compose -f docker-compose.prod.yml up -d'
+# El `up -d` reimprime el progreso de cada contenedor a medida que arranca; vas a ver
+# "Container airflow-init Exited" (varias veces, es el redraw del spinner, no 4 corridas
+# distintas) — es intencional: airflow-init es one-shot (migra + crea el admin y sale, ver
+# comentario en el compose más arriba), termina en exit 0 y se queda "Exited" para siempre,
+# a diferencia de apiserver/scheduler/dag-processor/triggerer que quedan "Running". Si en vez
+# de eso el que aparece en "Exited" es **apiserver**, ahí sí mirá los logs:
+#   ssh -i ~/.ssh/pyspark_stack ec2-user@$IP docker logs airflow-apiserver --tail 50
+
+# 2) EN TU MÁQUINA: verificar desde afuera (el SG solo deja pasar 443 a tu IP):
 curl -sSfI "https://$(terraform -chdir=infra/prod output -raw airflow_domain)/" | head -1  # 200/302 desde tu IP
 # Desde OTRA IP debe cortar (timeout): el SG solo deja 443 a var.my_ip_cidr.
 ```
 
 Entrás a `https://airflow.midominio.com` con el usuario **admin** y la password que generó SSM
 (§13.1). La restricción por IP es defensa-en-profundidad **sobre** el login de Airflow, no un reemplazo de este.
+
+> **¿Cuál es la URL de Airflow ahora que tiene DNS/HTTPS?** Un solo comando, no hace falta acordarse
+> del dominio a mano (`terraform output` ya lo tiene guardado en el state):
+> ```bash
+> terraform -chdir=infra/prod output -raw airflow_url
+> # → https://airflow.midominio.com — antes de este §5.6 (sin DNS/TLS) era el túnel a
+> #   localhost:8082 (tunnel_command, §5.5); después de este paso es esta URL pública directa.
+> ```
 
 > **Consecuencia en el túnel SSH (§5.5).** Con el TLS activo ya **no tuneleás Airflow**: entrás por la
 > URL pública. El `-L 8082` del `tunnel_command` deja de aplicar para Airflow (si igual lo abrís,
@@ -5183,10 +5363,10 @@ Airflow Variables de los DAGs).
 #   ./scripts/load-secrets.sh   # genera .env desde SSM (§13.1)
 #   docker compose -f docker-compose.prod.yml up -d --build
 x-airflow-common: &airflow-common
-  image: pyspark_stack-airflow:3.2.2
+  image: pyspark_stack-airflow-prod:3.2.2
   build:
     context: .
-    dockerfile: Dockerfile.airflow
+    dockerfile: Dockerfile.airflow.prod   # liviana (§5.5 Paso 0b): sin JDK/Spark/Hadoop
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
@@ -5477,9 +5657,12 @@ ssh -i ~/.ssh/pyspark_stack ec2-user@$IP 'cd pyspark_stack && \
 El archivo debe tener **11 líneas** (7 base + los 4 derivados), permisos `-rw-------` y los cuatro
 derivados **con valor**. Dos trampas: si alguno dice `None`, la app EMR no existe o está en otra región —el
 script no falla, escribe `None` y el error aparece recién en el primer `StartJobRun`—; y si exponés la
-web por HTTPS (§5.6) las líneas son 12, porque se suma `AIRFLOW_DOMAIN`. Esa línea se agrega a mano
-y `load-secrets.sh` **reescribe el `.env` entero** en cada corrida, así que hay que volver a
-agregarla después de cada ejecución del script.
+web por HTTPS (§5.6) las líneas son **16**, porque se suman las 5 variables de §5.6
+(`AIRFLOW_DOMAIN`, `AIRFLOW_BASE_URL`, `AIRFLOW_EXECUTION_API_URL`, `AIRFLOW_SSL_CERT`,
+`AIRFLOW_SSL_KEY`) — no solo `AIRFLOW_DOMAIN`: sin las otras 4, el api-server vuelve a caer a HTTP
+plano (o, si le apuntás `AIRFLOW_SSL_CERT`/`KEY` a una ruta que no existe, a un restart loop). Esas
+5 líneas se agregan a mano (el bloque "Directo" de §5.6) y `load-secrets.sh` **reescribe el `.env`
+entero** en cada corrida, así que hay que volver a agregarlas después de cada ejecución del script.
 
 **Paso 5 — Validar el merge de los compose antes de levantar** `[EC2]`:
 
@@ -5502,8 +5685,9 @@ por error), levantarías Spark standalone + HDFS en la EC2 y Postgres arrancarí
 Docker nuevo en vez de `/data/postgres` (EBS): usá siempre `docker-compose.prod.yml`, nunca el de dev.
 
 **Paso 6b — (opcional) Exponer la web por HTTPS.** Solo si definiste `airflow_domain`: seguí §5.6
-—emitir el cert, agregar `AIRFLOW_DOMAIN` al `.env`, aplicar el delta TLS del compose—. Sin esto,
-Airflow queda accesible solo por el túnel 8082. La §17 asume esta web.
+—emitir el cert, agregar las 5 variables (`AIRFLOW_DOMAIN`, `AIRFLOW_BASE_URL`,
+`AIRFLOW_EXECUTION_API_URL`, `AIRFLOW_SSL_CERT`, `AIRFLOW_SSL_KEY`) al `.env`, aplicar el delta TLS
+del compose—. Sin esto, Airflow queda accesible solo por el túnel 8082. La §17 asume esta web.
 
 **Paso 7 — Re-correr los smoke tests de §8.1, capas 2 a 5** `[LOCAL]`. Ahora sí pasa la capa 5:
 el monitoreo está arriba. Tené presente que esas capas corren **desde tu máquina** (usan `nc`, `$S` y la CLI

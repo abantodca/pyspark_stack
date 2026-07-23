@@ -1,0 +1,147 @@
+# docker-compose.prod.yml — stack de PRODUCCIÓN, standalone (un solo archivo, sin merge).
+# Arranque mínimo: Airflow + Postgres. Sin Spark/HDFS (esos jobs van a EMR Serverless, §6.4) y sin
+# Jupyter (no se usa en prod: exploración interactiva queda para el dev local, docs/01).
+# §9/§12/§13 amplían este mismo archivo — versión final en §14.1.
+#   docker compose -f docker-compose.prod.yml up -d --build
+x-airflow-common: &airflow-common
+  image: pyspark_stack-airflow-prod:3.2.2
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow.prod   # liviana: sin JDK/Spark/Hadoop, EMR Serverless hace el cómputo (§6.4)
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow-db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+    # El scheduler/worker habla con el api-server via la Task Execution API (Airflow 3); debe
+    # apuntar al hostname del contenedor, NO a localhost.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:-change-me-in-prod}'
+    AIRFLOW_UID: 50000
+  volumes:
+    - ./dags:/opt/airflow/dags
+  # Sin este bloque en cada servicio, `restart`/`logging` no se hereda desde acá con `<<: *airflow-common`
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+  networks:
+    - hadoopnet
+
+services:
+  airflow-db:
+    image: postgres:16
+    container_name: airflow-db
+    restart: unless-stopped
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+    deploy: { resources: { limits: { memory: 512m } } } # calibrado a t3.large 8GB, sin Spark compitiendo
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
+    volumes:
+      - /data/postgres:/var/lib/postgresql/data   # EBS persistente (§5.3), no un volumen Docker
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - hadoopnet
+
+  # Init one-shot: migra el esquema (core + FAB) y crea el admin, luego sale.
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    restart: "no"   # one-shot: pisa el `unless-stopped` heredado, no reintenta en loop
+    depends_on:
+      airflow-db: { condition: service_healthy }
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow fab-db migrate &&
+        airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    environment:
+      <<: *airflow-common-env
+      # SSL_CERT/SSL_KEY vienen de AIRFLOW_SSL_CERT/AIRFLOW_SSL_KEY, dos variables aparte que se
+      # completan en el `.env` (mismo motivo que BASE_URL/EXECUTION_API_URL más abajo: docker
+      # compose NO soporta interpolación anidada, "${AIRFLOW_DOMAIN:+/opt/.../${AIRFLOW_DOMAIN}/x}"
+      # da "" SIEMPRE aunque AIRFLOW_DOMAIN esté seteado — se prueba con `docker compose config`,
+      # pasó justo eso probando este archivo). Sin ellas en el .env (default, modo túnel-only)
+      # ambas quedan en "" y Airflow sirve HTTP plano — es `if ssl_cert:` en
+      # airflow/cli/commands/api_server_command.py::_get_ssl_cert_and_key_filepaths(), un string
+      # vacío es falsy ahí. Si en cambio apuntaran siempre a una ruta fija, el api-server queda en
+      # restart loop buscando un cert que nunca se generó apenas hacés `docker compose up` sin
+      # haber corrido certbot todavía — pasó justo eso en un deploy real, con el puerto 8082 del
+      # túnel dando "Connection refused" porque el contenedor nunca llegaba a levantar. Con esto
+      # el mismo archivo sirve para los dos modos, sin tener que acordarte de "no tocar nada".
+      AIRFLOW__API__SSL_CERT: '${AIRFLOW_SSL_CERT:-}'
+      AIRFLOW__API__SSL_KEY:  '${AIRFLOW_SSL_KEY:-}'
+      # BASE_URL y EXECUTION_API_SERVER_URL SÍ necesitan el valor de AIRFLOW_DOMAIN adentro (no
+      # solo su presencia como en SSL_CERT/KEY arriba), y docker compose NO soporta interpolación
+      # anidada: "${AIRFLOW_DOMAIN:+https://${AIRFLOW_DOMAIN}}" da "" siempre, se prueba con
+      # `docker compose config` — no lo intentes. Por eso van por dos variables aparte, que
+      # completás en el `.env` recién ACÁ, cuando de verdad configurás HTTPS (mismo patrón que
+      # el `echo AIRFLOW_DOMAIN=... >> .env` de arriba):
+      #   echo "AIRFLOW_BASE_URL=https://$(terraform -chdir=infra/prod output -raw airflow_domain)" >> .env
+      #   echo "AIRFLOW_EXECUTION_API_URL=https://$(terraform -chdir=infra/prod output -raw airflow_domain):8080/execution/" >> .env
+      # Sin ellas (default, modo túnel-only) BASE_URL queda "" → Airflow arma el `<base href="/">`
+      # del HTML relativo, funciona bien detrás del túnel a 8082. Si quedara fijo en
+      # "https://${AIRFLOW_DOMAIN}" con el dominio vacío, el resultado es el string literal
+      # "https://" y el `<base href>` sale roto: el navegador resuelve cualquier link relativo
+      # (p.ej. el de login, "auth/login/?next=%2F") contra ESE base roto, y termina pidiendo
+      # "https://auth/login/?next=%2F" (toma "auth" como si fuera el hostname) — pasó justo eso.
+      AIRFLOW__API__BASE_URL: '${AIRFLOW_BASE_URL:-}'
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: '${AIRFLOW_EXECUTION_API_URL:-http://airflow-apiserver:8080/execution/}'
+    ports:
+      - "8082:8080"                                          # túnel local (seguís pudiendo usarlo)
+      - "443:8080"                                            # HTTPS público; el SG lo limita a tu IP
+    volumes:
+      - ./dags:/opt/airflow/dags                              # el `<<:` no mergea `volumes`, hay que repetirlo
+      # Monta la raíz de certbot completa, NO solo live/$AIRFLOW_DOMAIN: certbot deja
+      # live/$DOMINIO/fullchain.pem como symlink RELATIVO a ../../archive/$DOMINIO/fullchain1.pem
+      # (`ls -la /data/certs/live/$DOMINIO` lo muestra). Si montás nada más que la carpeta
+      # `live/$DOMINIO`, ese `../../archive/...` resuelve DENTRO del contenedor contra
+      # `/opt/archive/...`, que no existe — el symlink queda roto aunque el archivo exista en el
+      # host, y el api-server tira "SSL related file does not exist /opt/airflow/certs/.../
+      # fullchain.pem" (pasó justo eso en un deploy real). Montando `/data/certs` entero, `live/`
+      # y `archive/` quedan hermanos igual que en el host y el symlink relativo resuelve bien.
+      - /data/certs:/opt/airflow/certs:ro
+    networks:
+      hadoopnet:
+        aliases: ["${AIRFLOW_DOMAIN}"]                       # <- adentro, el cert matchea este nombre
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+networks:
+  hadoopnet:

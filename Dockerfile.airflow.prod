@@ -1,0 +1,15 @@
+# Airflow 3.2.2 sobre Python 3.12 — imagen de PRODUCCIÓN (EC2 orquestador, docs/02 §5.5).
+# A propósito NO instala JDK/Spark/Hadoop como Dockerfile.airflow: en prod Airflow nunca corre
+# spark-submit local, los jobs van a EMR Serverless (docs/02 §6.4) vía EmrServerlessStartJobOperator
+# (API, no binario). Bajar/compilar ~1.2 GB de JDK+Spark+Hadoop en cada build no aporta nada acá y
+# es la parte lenta/inestable del build (archive.apache.org). Para el stack de DEV (Spark standalone
+# local, spark-submit real) seguí usando Dockerfile.airflow.
+FROM apache/airflow:3.2.2-python3.12
+
+ARG AIRFLOW_VERSION=3.2.2
+ARG PYTHON_VERSION=3.12
+
+USER airflow
+COPY requirements.txt /
+RUN pip install --no-cache-dir -r /requirements.txt \
+      --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
