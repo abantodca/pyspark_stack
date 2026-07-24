@@ -1,5 +1,11 @@
 # Guía experta — Producción en AWS para DataOps
 
+> **Estado antes del primer despliegue: implementación parcial.** Terraform, Lambdas, el DAG de
+> EMR Serverless y la carga de secretos existen en el repositorio, pero todavía no fueron validados
+> de extremo a extremo en AWS. Observabilidad, Iceberg, dbt, Great Expectations, OpenLineage y CD
+> son arquitectura objetivo/roadmap. Consulta la [matriz de estado](README.md) antes de ejecutar
+> una sección.
+
 > Arquitectura híbrida de bajo costo: Airflow y Postgres se ejecutan en una EC2; Spark se ejecuta
 > en EMR Serverless; S3 funciona como data lake; EventBridge, SQS, Lambda y SSM automatizan los
 > disparos; Terraform administra la infraestructura; GitHub Actions entrega el código mediante
@@ -50,7 +56,7 @@
 Una EC2 **chica** corre solo el orquestador en Docker; AWS *serverless* lo rodea para el cómputo
 Spark (EMR Serverless), storage durable (S3), disparo de DAGs (Lambda + EventBridge) y ahorro
 (auto start/stop). El detalle conceptual y los diagramas están en
-[`docs/03-arquitectura.md`](03-arquitectura.md); esta guía es el cómo (Terraform copy-paste).
+[`docs/03-arquitectura-mejorada.md`](03-arquitectura-mejorada.md); esta guía es el cómo.
 
 Regla mental: almacenar es barato y constante; computar es lo que cuesta, y solo cuando corrés.
 Por eso Spark vive en EMR Serverless (escala a cero, paga solo mientras corre el job), la EC2 se
@@ -1365,6 +1371,22 @@ No hay Jupyter en prod (§5.5): la exploración interactiva queda para el stack 
 ---
 
 ### 5.6 Exponer la web de Airflow (HTTPS nativo, solo tu IP)
+
+HTTPS es opt-in. El archivo base solo publica `8082` para el túnel; después de emitir el
+certificado se añade `docker-compose.prod.https.yml`:
+
+```bash
+docker compose \
+  -f docker-compose.prod.yml \
+  -f docker-compose.prod.https.yml \
+  config --quiet
+docker compose \
+  -f docker-compose.prod.yml \
+  -f docker-compose.prod.https.yml \
+  up -d
+```
+
+Así un `.env` incompleto no publica accidentalmente HTTP plano en el puerto 443.
 
 Hasta acá **nada** estaba expuesto: veías Airflow tuneleando `-L 8082`. Práctico para operar, incómodo
 para *seguir los DAGs* desde el navegador. Esta sección publica **solo la web de Airflow** por
@@ -3152,6 +3174,9 @@ Todo DAG nuevo debe definir:
 
 **Archivo:** `requirements.txt`.
 
+El archivo del repositorio es la fuente canónica. Este fragmento enumera únicamente las
+dependencias adicionales de producción; no reemplaza los providers usados por el stack local.
+
 ```text
 apache-airflow-providers-amazon[aiobotocore]==9.29.0
 pandas
@@ -3167,8 +3192,11 @@ Airflow, providers y Python en el mismo cambio.
 
 **Archivo:** `dags/customer_etl_emr_dag.py`.
 
+El archivo versionado es la fuente canónica y está cubierto por
+`tests/test_dag_integrity.py`. El bloque siguiente es explicativo; si diverge, prevalece el archivo.
+
 ```python
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from airflow.providers.amazon.aws.operators.emr import (
@@ -3179,7 +3207,7 @@ from airflow.sdk import DAG, task
 
 with DAG(
     dag_id="customer_etl_emr",
-    start_date=datetime(2026, 1, 1),
+    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     schedule=None,
     catchup=False,
     max_active_runs=1,
@@ -3204,7 +3232,6 @@ with DAG(
                 ),
                 "entryPointArguments": [
                     "{{ dag_run.conf.get('bucket', var.value.datalake) }}",
-                    "{{ dag_run.conf.get('key', '') }}",
                     "{{ ds }}",
                 ],
                 "sparkSubmitParameters": (
@@ -3491,6 +3518,9 @@ Si la EC2 está apagada, el código queda publicado en S3. El script de arranque
 
 ## 12. Observabilidad e incidentes
 
+> **Roadmap:** los archivos `monitoring/` descritos en esta sección todavía no están versionados.
+> Esta sección define criterios de implementación y no forma parte aún del runbook ejecutable.
+
 ### 12.1 Qué debe verse
 
 | Capa | Señales mínimas | Fuente |
@@ -3738,6 +3768,10 @@ y regenerarse en cada host nuevo.
 ---
 
 ## 14. Compose canónico de producción
+
+> **Estado parcial:** el `docker-compose.prod.yml` versionado contiene el núcleo Airflow/Postgres.
+> Los servicios de observabilidad mostrados en esta sección son la configuración objetivo y se
+> incorporarán cuando exista el directorio `monitoring/` y sus pruebas de configuración.
 
 ### 14.1 `docker-compose.prod.yml`
 
@@ -4073,6 +4107,9 @@ Eso convierte un despliegue manual en un cambio auditable.
 
 ## 16. Athena e Iceberg
 
+> **Roadmap:** el job actual escribe Parquet. Esta sección es el diseño de la migración a Iceberg,
+> no una descripción del formato actualmente producido.
+
 Athena se usa para consumo SQL, controles y dbt. Spark sigue siendo el motor principal para ETL
 pesado.
 
@@ -4327,6 +4364,8 @@ La capacidad máxima es un límite de seguridad y costo, no una reserva.
 
 ## 19. Transformaciones con dbt
 
+> **Roadmap:** todavía no existe un proyecto `dbt/` versionado.
+
 ### 19.1 Estructura
 
 ```text
@@ -4379,6 +4418,9 @@ de producción.
 ---
 
 ## 20. Calidad de datos
+
+> **Roadmap:** los contratos ligeros de la Lambda sí existen; Great Expectations todavía no está
+> integrado ni versionado.
 
 La calidad no es un reporte posterior: es una puerta entre `curated` y `analytics`.
 
@@ -4489,6 +4531,8 @@ la eliminación de EBS, buckets y backend requiere una revisión separada y resp
 ---
 
 ## 22. Lineage con OpenLineage
+
+> **Roadmap:** todavía no existe backend ni configuración OpenLineage versionada.
 
 OpenLineage responde qué job produjo un dataset y qué entradas utilizó.
 

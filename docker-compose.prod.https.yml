@@ -1,0 +1,17 @@
+# Override opcional: publicar Airflow con TLS después de emitir y validar el certificado.
+# Uso: docker compose -f docker-compose.prod.yml -f docker-compose.prod.https.yml config
+services:
+  airflow-apiserver:
+    environment:
+      AIRFLOW__API__SSL_CERT: '${AIRFLOW_SSL_CERT:?AIRFLOW_SSL_CERT requerido para HTTPS}'
+      AIRFLOW__API__SSL_KEY: '${AIRFLOW_SSL_KEY:?AIRFLOW_SSL_KEY requerido para HTTPS}'
+      AIRFLOW__API__BASE_URL: '${AIRFLOW_BASE_URL:?AIRFLOW_BASE_URL requerido para HTTPS}'
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: '${AIRFLOW_EXECUTION_API_URL:?AIRFLOW_EXECUTION_API_URL requerido para HTTPS}'
+    ports:
+      - "443:8080"
+    volumes:
+      - /data/certs:/opt/airflow/certs:ro
+    networks:
+      hadoopnet:
+        aliases:
+          - '${AIRFLOW_DOMAIN:?AIRFLOW_DOMAIN requerido para HTTPS}'

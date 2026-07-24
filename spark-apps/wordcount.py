@@ -7,14 +7,16 @@ Disparado por el DAG `spark_wordcount_trigger`:
 No depende de ningún archivo de entrada: genera su propio texto en memoria,
 por lo que la tarea de Airflow siempre tiene algo que ejecutar.
 """
+
 from pyspark.sql import SparkSession
 
 
 def main():
-    spark = SparkSession.builder \
-        .appName("WordCount") \
-        .master("spark://spark-master:7077") \
+    spark = (
+        SparkSession.builder.appName("WordCount")
+        .master("spark://spark-master:7077")
         .getOrCreate()
+    )
 
     lines = [
         "spark hadoop spark airflow",
@@ -23,8 +25,7 @@ def main():
     ]
 
     counts = (
-        spark.sparkContext
-        .parallelize(lines)
+        spark.sparkContext.parallelize(lines)
         .flatMap(lambda line: line.split())
         .map(lambda word: (word, 1))
         .reduceByKey(lambda a, b: a + b)

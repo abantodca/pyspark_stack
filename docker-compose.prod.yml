@@ -11,12 +11,17 @@ x-airflow-common: &airflow-common
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow-db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:?POSTGRES_USER requerido}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requerido}@airflow-db:5432/${POSTGRES_DB:?POSTGRES_DB requerido}
     AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
     # El scheduler/worker habla con el api-server via la Task Execution API (Airflow 3); debe
     # apuntar al hostname del contenedor, NO a localhost.
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
-    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:-change-me-in-prod}'
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:?AIRFLOW_JWT_SECRET requerido}'
+    # Airflow convierte AIRFLOW_VAR_* en Variables sin guardar configuración operativa a mano.
+    AIRFLOW_VAR_EMR_APP_ID: '${EMR_APP_ID:?EMR_APP_ID requerido}'
+    AIRFLOW_VAR_EMR_JOB_ROLE_ARN: '${EMR_JOB_ROLE_ARN:?EMR_JOB_ROLE_ARN requerido}'
+    AIRFLOW_VAR_DATALAKE: '${DATALAKE_BUCKET:?DATALAKE_BUCKET requerido}'
+    AIRFLOW_VAR_ARTIFACTS: '${ARTIFACTS_BUCKET:?ARTIFACTS_BUCKET requerido}'
     AIRFLOW_UID: 50000
   volumes:
     - ./dags:/opt/airflow/dags
@@ -36,9 +41,9 @@ services:
     logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
     deploy: { resources: { limits: { memory: 512m } } } # calibrado a t3.large 8GB, sin Spark compitiendo
     environment:
-      - POSTGRES_USER=${POSTGRES_USER:-airflow}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
-      - POSTGRES_DB=${POSTGRES_DB:-airflow}
+      - POSTGRES_USER=${POSTGRES_USER:?POSTGRES_USER requerido}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requerido}
+      - POSTGRES_DB=${POSTGRES_DB:?POSTGRES_DB requerido}
     volumes:
       - /data/postgres:/var/lib/postgresql/data   # EBS persistente (§5.3), no un volumen Docker
     healthcheck:
@@ -60,7 +65,8 @@ services:
       bash -c "
         airflow db migrate &&
         airflow fab-db migrate &&
-        airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true"
+        (airflow users create --username ${AIRFLOW_ADMIN_USER:?AIRFLOW_ADMIN_USER requerido} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:?AIRFLOW_ADMIN_PASSWORD requerido} ||
+         airflow users reset-password --username ${AIRFLOW_ADMIN_USER:?AIRFLOW_ADMIN_USER requerido} --password ${AIRFLOW_ADMIN_PASSWORD:?AIRFLOW_ADMIN_PASSWORD requerido})"
 
   airflow-apiserver:
     <<: *airflow-common
@@ -100,21 +106,10 @@ services:
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: '${AIRFLOW_EXECUTION_API_URL:-http://airflow-apiserver:8080/execution/}'
     ports:
       - "8082:8080"                                          # túnel local (seguís pudiendo usarlo)
-      - "443:8080"                                            # HTTPS público; el SG lo limita a tu IP
     volumes:
       - ./dags:/opt/airflow/dags                              # el `<<:` no mergea `volumes`, hay que repetirlo
-      # Monta la raíz de certbot completa, NO solo live/$AIRFLOW_DOMAIN: certbot deja
-      # live/$DOMINIO/fullchain.pem como symlink RELATIVO a ../../archive/$DOMINIO/fullchain1.pem
-      # (`ls -la /data/certs/live/$DOMINIO` lo muestra). Si montás nada más que la carpeta
-      # `live/$DOMINIO`, ese `../../archive/...` resuelve DENTRO del contenedor contra
-      # `/opt/archive/...`, que no existe — el symlink queda roto aunque el archivo exista en el
-      # host, y el api-server tira "SSL related file does not exist /opt/airflow/certs/.../
-      # fullchain.pem" (pasó justo eso en un deploy real). Montando `/data/certs` entero, `live/`
-      # y `archive/` quedan hermanos igual que en el host y el symlink relativo resuelve bien.
-      - /data/certs:/opt/airflow/certs:ro
     networks:
-      hadoopnet:
-        aliases: ["${AIRFLOW_DOMAIN}"]                       # <- adentro, el cert matchea este nombre
+      - hadoopnet
     depends_on:
       airflow-db: { condition: service_healthy }
       airflow-init: { condition: service_completed_successfully }

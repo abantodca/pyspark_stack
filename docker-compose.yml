@@ -26,7 +26,6 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./spark-apps:/opt/spark-apps
-    - /var/run/docker.sock:/var/run/docker.sock
     - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
   networks:
     - hadoopnet
@@ -182,7 +181,8 @@ services:
       bash -c "
         airflow db migrate &&
         airflow fab-db migrate &&
-        airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true"
+        (airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:-admin} ||
+         airflow users reset-password --username ${AIRFLOW_ADMIN_USER:-admin} --password ${AIRFLOW_ADMIN_PASSWORD:-admin})"
 
   # UI + API REST (antes 'airflow webserver'). Sirve en 8080 dentro del contenedor.
   airflow-apiserver:

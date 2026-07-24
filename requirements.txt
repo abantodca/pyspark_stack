@@ -5,3 +5,5 @@
 # pyspark==4.0.3 se instala aparte en Dockerfile.airflow (sin constraints) para casar con el cluster Spark 4.0.3.
 apache-airflow-providers-apache-spark==6.0.2
 apache-airflow-providers-fab==3.6.4
+# Producción: EmrServerlessStartJobOperator. Pin compatible con Airflow 3.2.2/Python 3.12.
+apache-airflow-providers-amazon[aiobotocore]==9.29.0

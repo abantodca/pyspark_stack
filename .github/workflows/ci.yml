@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  static-validation:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: testing
+      AWS_SECRET_ACCESS_KEY: testing
+      AWS_EC2_METADATA_DISABLED: "true"
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Python dependencies
+        run: |
+          pip install \
+            "apache-airflow==3.2.2" \
+            --requirement requirements.txt \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.2.2/constraints-3.12.txt"
+          pip install pytest ruff
+      - name: Python
+        run: |
+          ruff check dags spark-apps infra/prod/lambda tests scripts/check-doc-links.py
+          ruff format --check dags spark-apps infra/prod/lambda tests scripts/check-doc-links.py
+          pytest -q
+      - name: Documentation links
+        run: python scripts/check-doc-links.py
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform -chdir=infra/prod init -backend=false -input=false
+          terraform -chdir=infra/prod validate
+      - name: Compose
+        env:
+          POSTGRES_USER: airflow
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: airflow
+          AIRFLOW_JWT_SECRET: ci-only-jwt-secret
+          AIRFLOW_ADMIN_USER: admin
+          AIRFLOW_ADMIN_PASSWORD: ci-only
+          EMR_APP_ID: ci-app
+          EMR_JOB_ROLE_ARN: arn:aws:iam::000000000000:role/ci
+          DATALAKE_BUCKET: ci-datalake
+          ARTIFACTS_BUCKET: ci-artifacts
+          AIRFLOW_DOMAIN: airflow.example.com
+          AIRFLOW_BASE_URL: https://airflow.example.com
+          AIRFLOW_EXECUTION_API_URL: https://airflow.example.com:8080/execution/
+          AIRFLOW_SSL_CERT: /opt/airflow/certs/live/airflow.example.com/fullchain.pem
+          AIRFLOW_SSL_KEY: /opt/airflow/certs/live/airflow.example.com/privkey.pem
+        run: |
+          docker compose config --quiet
+          docker compose -f docker-compose.prod.yml config --quiet
+          docker compose -f docker-compose.prod.yml -f docker-compose.prod.https.yml config --quiet

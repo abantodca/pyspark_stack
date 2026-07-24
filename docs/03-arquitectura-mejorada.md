@@ -1,25 +1,25 @@
 # Arquitectura de producción — pyspark_stack (híbrida en AWS)
 
+> **Estado:** este documento combina la base implementada con la arquitectura objetivo. La
+> [matriz de estado](README.md) es la fuente de verdad. Hoy el job EMR escribe Parquet; Iceberg,
+> observabilidad, dbt, Great Expectations y OpenLineage son roadmap y no deben interpretarse
+> como servicios ya desplegables desde este repositorio.
+
 > **Edición optimizada:** este documento describe responsabilidades, fronteras y flujos. Los
 > procedimientos ejecutables viven en las guías 02 y 02b. Se corrigieron la semántica de DLQ, el
 > alcance del endpoint S3 de la VPC y los permisos de Glue requeridos por Iceberg.
 >
-Referencia conceptual del único camino de producción. El *cómo* (Terraform, compose y monitoreo
-listos para copiar) está en la [guía 02](02-produccion-aws-dataops-operativa-v3.md); este documento es el mapa y los
-flujos.
+Referencia conceptual del camino de producción. El *cómo* está en la
+[guía 02](02-produccion-aws-dataops-operativa-v3.md); este documento es el mapa y los flujos.
 
-Resumen: arquitectura híbrida. Airflow corre self-managed en una EC2 chica (`t3.large`) con Docker
-como orquestador (Airflow + Postgres + monitoreo), y el cómputo Spark sale de la caja: corre en
-**EMR Serverless** (pago por uso, escala a cero). Ya no hay HDFS en producción — todo el dato vive
-en S3 como tablas **Apache Iceberg** (`curated/`/`analytics/`; `raw/` sigue siendo archivos sueltos)
-sobre **Glue Data Catalog** (sin crawlers), que EMR Serverless y Athena comparten. Sobre esas tablas
-corren **dbt** (transformaciones SQL versionadas) y **Great Expectations** (gate de calidad), ambos
-disparados por Airflow. Lo complementan servicios AWS serverless: Lambda + EventBridge para disparar
-DAGs por horario o por evento, para el auto start/stop, y con DLQ + AWS Budgets + Cost Anomaly
-Detection + IAM Access Analyzer como gobierno de costo/resiliencia. Monitoreo con Prometheus +
-Grafana + Alertmanager (métricas) y Loki + Promtail (logs). CI/CD con GitHub Actions + OIDC y
-secretos en SSM/Secrets Manager. Usa EMR Serverless para el cómputo y Glue Data Catalog para Iceberg;
-no usa MWAA, EMR-on-EC2 clásico ni crawlers de Glue.
+**Base implementada, pendiente de despliegue:** Airflow y Postgres en una EC2 `t3.large`, Spark en
+EMR Serverless, datos Parquet en S3, Glue Data Catalog, Lambdas/EventBridge/SQS para disparo y
+auto start/stop, secretos en SSM y CI de validación sin permisos de escritura sobre AWS.
+
+**Arquitectura objetivo:** tablas Iceberg en `curated/` y `analytics/`, dbt, Great Expectations,
+OpenLineage y observabilidad con Prometheus, Grafana, Alertmanager, Loki y Promtail. Estos
+componentes aparecen en los diagramas para mostrar la evolución prevista, no el inventario
+actualmente desplegable.
 
 ## Configuración de referencia
 
@@ -29,7 +29,7 @@ no usa MWAA, EMR-on-EC2 clásico ni crawlers de Glue.
 | Availability Zone | `us-east-1a` (fija, para que el EBS `/data` no se recree) | `var.availability_zone`, guía 02 §5.1 |
 | Instancia orquestadora | `t3.large` (Airflow + Postgres + monitoreo, sin Spark) | `var.instance_type`, guía 02 §5.1 |
 | Motor Spark | EMR Serverless, `emr-7.5.0` | `release_label`, guía 02 §6.4 |
-| Formato de tabla | Apache Iceberg sobre Glue Data Catalog | guía 02 §16.1 |
+| Formato actual / objetivo | Parquet / Apache Iceberg sobre Glue Data Catalog | guía 02 §16.1 |
 | IP del cliente | `${MY_IP_CIDR}` — única fuente de SSH (22) y HTTPS (443) | `var.my_ip_cidr`, guía 02 §5.1 |
 | Dominio Airflow (opcional) | vacío por defecto = solo túnel SSH | `var.airflow_domain`, guía 02 §5.6 |
 | Email de alertas | usado por DLQ, Budgets, Cost Anomaly Detection | `var.alert_email`, guía 02 §18 |
@@ -431,7 +431,7 @@ costos, servicio por servicio y con punto de cruce, está en la
 
 ---
 
-## 7. Lakehouse (Iceberg) — adoptado
+## 7. Lakehouse (Iceberg) — roadmap aprobado
 
 > Hasta hace poco esta sección era "mejoras futuras": Parquet suelto, sin catálogo. Ya no — se
 > aplicó. Queda documentado acá porque cambia cómo se lee/escribe el dato, no solo qué servicio se
@@ -467,7 +467,7 @@ solo, mes a mes. Un DAG semanal corre `OPTIMIZE ... REWRITE DATA USING BIN_PACK`
 
 ---
 
-## 8. dbt Core y Great Expectations — adoptados
+## 8. dbt Core y Great Expectations — roadmap
 
 Dos piezas más que se sumaron sobre las tablas Iceberg de §7, ambas disparadas por Airflow (nunca
 un orquestador nuevo — sigue siendo el único). Detalle completo, Terraform y DAGs en la
@@ -483,7 +483,7 @@ un orquestador nuevo — sigue siendo el único). Detalle completo, Terraform y 
 
 ---
 
-## 9. Gobierno, costo y resiliencia — adoptado
+## 9. Gobierno, costo y resiliencia — implementación parcial
 
 Cuatro piezas AWS-nativas que cierran huecos operativos que antes quedaban solo como advertencia en
 el CI (`checkov` marcaba "Lambda sin DLQ" desde el día uno). Detalle en

@@ -1,5 +1,10 @@
 # Guía experta — Producción en AWS **100% por la consola** (Airflow en EC2 + EMR Serverless)
 
+> **Documento de referencia, no fuente canónica.** Esta variante manual todavía no fue ejecutada
+> de extremo a extremo. La ruta recomendada y mantenida como código es Terraform
+> ([guía 02](02-produccion-aws-dataops-operativa-v3.md)); usa esta guía solo cuando exista una
+> restricción explícita que impida IaC.
+
 > **Edición optimizada:** la consola se usa para crear recursos; la operación posterior usa
 > comandos verificables. Se corrigieron el montaje seguro de EBS por ID, la semántica de DLQ y la
 > separación entre el endpoint S3 de la EC2 y la red de EMR Serverless.

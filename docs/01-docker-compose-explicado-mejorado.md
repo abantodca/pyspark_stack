@@ -110,12 +110,11 @@ Volúmenes compartidos:
   volumes:
     - ./dags:/opt/airflow/dags
     - ./spark-apps:/opt/spark-apps             # los .py de Spark, compartidos con el cluster
-    - /var/run/docker.sock:/var/run/docker.sock   # permite lanzar contenedores (DockerOperator)
     - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml  # config de cliente HDFS
 ```
 
-> Montar `docker.sock` equivale a dar root del host al contenedor. Es la mayor superficie de
-> ataque del stack. Si no usás DockerOperator, quitalo (§8.4).
+> El stack no monta `docker.sock`: ninguno de los DAGs actuales usa DockerOperator. Añadirlo
+> equivaldría a dar control del host a todos los procesos Airflow que heredan este anchor.
 
 ---
 
@@ -355,7 +354,7 @@ Los problemas del compose actual, aceptables en dev pero no en producción:
 | 2 | Sin `restart` en HDFS/Spark/Jupyter | Un crash deja el servicio caído |
 | 3 | Sin healthchecks salvo Postgres | `depends_on` no sabe si el servicio *funciona* |
 | 4 | Sin límites de recursos | Un Spark job puede comerse toda la RAM del host |
-| 5 | `docker.sock` montado siempre | Superficie de ataque = root del host |
+| 5 | `docker.sock` | Ya resuelto: no se monta en el Compose actual |
 | 6 | Clave `version:` en el compose — obsoleta en la Compose Specification (Compose v2 la ignora con un warning). Ya resuelto: se eliminó; el compose actual no la lleva | Warning ruidoso y falsa sensación de "pin" que no controla nada |
 | 7 | Jupyter sin token | Cualquiera en la red entra |
 
@@ -504,16 +503,16 @@ Y el `airflow-init` usando las vars:
 > Los defaults existen para el entorno local. El Compose de AWS no debe aceptar defaults para
 > secretos: carga valores desde SSM antes de arrancar.
 
-### 8.4. Quitar `docker.sock` si no lo usás
+### 8.4. Mantener `docker.sock` fuera del stack
 
-Si tus DAGs no usan `DockerOperator`, eliminá esta línea del `x-airflow-common`:
+El Compose actual no monta el socket. No agregues esta línea al `x-airflow-common`:
 
 ```yaml
-    - /var/run/docker.sock:/var/run/docker.sock   # ← BORRAR si no hay DockerOperator
+    - /var/run/docker.sock:/var/run/docker.sock   # no agregar
 ```
 
-Si sí lo usás, en prod considerá un socket-proxy (p.ej. `tecnativa/docker-socket-proxy`) que
-expone solo las APIs necesarias en vez del socket crudo.
+Si en el futuro un caso exige DockerOperator, aislalo en un ejecutor dedicado y evaluá un
+socket-proxy con API limitada; no lo heredes en api-server, scheduler, triggerer y dag-processor.
 
 ### 8.5. Añadir el history-server (opcional, ya casi listo)
 

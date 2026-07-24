@@ -34,14 +34,16 @@ Jupyter es dev-only: vive en el perfil `dev` de Compose y en producción no arra
 
 ## Documentación
 
-- [docs/01 — Docker Compose explicado](docs/01-docker-compose-explicado.md): anatomía del stack, bloque por bloque, y refactor de producción.
-- [docs/02 — Producción en AWS](docs/02-produccion-aws.md): un solo camino híbrido (Airflow en EC2 t3.large + EMR Serverless + S3, sin HDFS) con Terraform, CI/CD, monitoreo, secretos y hardening. Todo el código es copy-paste. Costo aproximado: ~$35/mes con auto start/stop o ~$83/mes 24/7 (a volumen real de 2 GB/día 3×/sem, ~$31/$79).
-- [docs/02b — Producción en AWS 100% por la consola](docs/02b-produccion-aws-consola.md): la misma arquitectura y objetivo que docs/02, pero construida enteramente a mano en la consola web de AWS (cero Terraform) — guía copy-paste manual, con las políticas IAM/JSON, el código de las Lambdas y los pasos clic a clic, más un teardown manual.
-- [docs/03 — Arquitectura](docs/03-arquitectura.md): diagramas y flujos del mismo camino híbrido.
-- [docs/04 — Ejemplos locales paso a paso](docs/04-ejemplos-local-paso-a-paso.md): guía copy-paste para operar y extender el stack en local — ciclo de vida (levantar/apagar/reanudar) + 20 ejemplos progresivos (5 básicos, 5 intermedios, 5 avanzados, 5 recontra ultra: streaming, incremental idempotente, Pandas UDF, AQE, testing con pytest).
+- [Índice y estado de implementación](docs/README.md): distingue lo implementado, lo pendiente de prueba y el roadmap.
+- [docs/01 — Docker Compose explicado](docs/01-docker-compose-explicado-mejorado.md): anatomía del stack local.
+- [docs/02 — Producción en AWS](docs/02-produccion-aws-dataops-operativa-v3.md): camino híbrido con Terraform; todavía no validado de extremo a extremo en AWS.
+- [docs/02b — Producción por consola](docs/02b-produccion-aws-consola-mejorado.md): alternativa manual de referencia.
+- [docs/03 — Arquitectura](docs/03-arquitectura-mejorada.md): arquitectura implementada y evolución planificada.
+- [docs/04 — Ejemplos locales](docs/04-ejemplos-local-paso-a-paso-mejorado.md): tutorial progresivo del stack local.
+- [docs/05 — Production readiness](docs/05-production-readiness-checklist.md): checklist y evidencias exigidas antes del primer despliegue.
 - [ANALISIS_FALLOS.md](ANALISIS_FALLOS.md): registro histórico de fallos del stack y sus fixes.
 
 ## Seguridad
 
-- Los secretos del `docker-compose.yml` están parametrizados (`${VAR:-default}`): en local usan defaults; en producción se sobreescriben vía `.env` o AWS SSM / Secrets Manager (ver docs/02).
+- Los secretos locales tienen defaults deliberados. El Compose de producción exige valores explícitos y `scripts/load-secrets.sh` los materializa desde AWS SSM.
 - `.env`, estados de Terraform y `alertmanager.yml` están en `.gitignore`. Nunca subir secretos reales.

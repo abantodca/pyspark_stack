@@ -8,6 +8,7 @@ Para no depender de que exista un archivo previo en HDFS, el script primero
 escribe un texto de ejemplo en HDFS, luego lo lee y cuenta las palabras,
 escribiendo el resultado de vuelta en HDFS.
 """
+
 from pyspark.sql import SparkSession
 
 HDFS = "hdfs://hdfs-namenode:9000"
@@ -16,10 +17,11 @@ OUTPUT_PATH = f"{HDFS}/wordcount/output"
 
 
 def main():
-    spark = SparkSession.builder \
-        .appName("WordCountHDFS") \
-        .master("spark://spark-master:7077") \
+    spark = (
+        SparkSession.builder.appName("WordCountHDFS")
+        .master("spark://spark-master:7077")
         .getOrCreate()
+    )
 
     sc = spark.sparkContext
 
@@ -30,8 +32,9 @@ def main():
         "airflow dag spark etl etl",
     ]
     # Escribimos vía DataFrame para poder usar mode("overwrite")
-    spark.createDataFrame([(line,) for line in sample], ["line"]) \
-        .write.mode("overwrite").text(INPUT_PATH)
+    spark.createDataFrame([(line,) for line in sample], ["line"]).write.mode(
+        "overwrite"
+    ).text(INPUT_PATH)
 
     # 2) Leer desde HDFS y contar
     counts = (
@@ -46,9 +49,9 @@ def main():
         print(f"{word}\t{count}")
 
     # 3) Persistir el resultado en HDFS
-    counts.map(lambda kv: f"{kv[0]}\t{kv[1]}") \
-        .coalesce(1) \
-        .saveAsTextFile(OUTPUT_PATH) if _path_absent(sc, OUTPUT_PATH) else None
+    counts.map(lambda kv: f"{kv[0]}\t{kv[1]}").coalesce(1).saveAsTextFile(
+        OUTPUT_PATH
+    ) if _path_absent(sc, OUTPUT_PATH) else None
 
     spark.stop()
 

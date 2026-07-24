@@ -1,6 +1,7 @@
-from pyspark.sql import SparkSession
 import sys
-import os
+
+from pyspark.sql import SparkSession
+
 
 def main(env, run_date, hdfs_input, hdfs_output):
     print(f"[INFO] env = {env}")
@@ -8,10 +9,11 @@ def main(env, run_date, hdfs_input, hdfs_output):
     print(f"[INFO] hdfs_input = {hdfs_input}")
     print(f"[INFO] hdfs_output = {hdfs_output}")
 
-    spark = SparkSession.builder \
-        .appName("CustomerLoyaltyETL") \
-        .master("spark://spark-master:7077") \
+    spark = (
+        SparkSession.builder.appName("CustomerLoyaltyETL")
+        .master("spark://spark-master:7077")
         .getOrCreate()
+    )
 
     df_orders = spark.read.option("header", True).csv(
         f"hdfs://hdfs-namenode:9000{hdfs_input}/orders.csv"
