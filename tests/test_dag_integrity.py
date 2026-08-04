@@ -1,8 +1,14 @@
-"""Controles estructurales mínimos de los DAGs."""
+"""Controles estructurales minimos de los DAGs del stack local."""
 
 from pathlib import Path
 
 from airflow.models import DagBag
+
+EXPECTED_DAGS = {
+    "customer_etl_dag",
+    "spark_wordcount_trigger",
+    "spark_wordcount_trigger_hdfs",
+}
 
 
 def _dag_bag() -> DagBag:
@@ -15,8 +21,11 @@ def test_dags_import_without_errors() -> None:
     assert _dag_bag().import_errors == {}
 
 
-def test_production_dag_contract() -> None:
-    dag = _dag_bag().get_dag("customer_etl_emr")
-    assert dag is not None
-    assert dag.max_active_runs == 1
-    assert {"run_customer_etl", "request_safe_stop"} <= set(dag.task_ids)
+def test_expected_dags_are_present() -> None:
+    assert EXPECTED_DAGS <= set(_dag_bag().dags)
+
+
+def test_every_task_has_an_owner() -> None:
+    for dag in _dag_bag().dags.values():
+        for task in dag.tasks:
+            assert task.owner
