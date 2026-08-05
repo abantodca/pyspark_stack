@@ -43,7 +43,7 @@ notebooks/       notebooks de práctica y del pipeline
 tests/           controles de integridad de los DAGs
 hadoop-config/   core-site.xml del cliente HDFS
 spark-events/    configuración de eventLog de Spark
-scripts/         utilidades del repositorio
+scripts/         utilidades: prod-env.sh (contexto de producción) y validadores de las guías
 docs/            documentación: stack local, arquitectura y producción en AWS
 ```
 
@@ -51,6 +51,11 @@ Este repositorio contiene **solo el proyecto local**. La infraestructura de prod
 Compose de producción, Lambdas, workflows de CI/CD y jobs de EMR Serverless— no se versiona acá: se
 crea paso a paso siguiendo [docs/02](docs/02-produccion-aws-terraform.md), que incluye el contenido
 completo de cada archivo.
+
+La excepción es `scripts/prod-env.sh`: sí se versiona, porque corre en **tu** máquina. Convierte los
+outputs de Terraform en variables de entorno, y es lo que hace que cada comando de las guías se
+copie y funcione tal cual, sin editar IDs, IPs ni nombres de bucket
+([contrato completo](docs/02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-leelo-antes-de-copiar-cualquier-comando)).
 
 ## Documentación
 

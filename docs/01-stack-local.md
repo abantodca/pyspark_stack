@@ -199,6 +199,13 @@ contenedor (PID 1 terminado → `Exited(0)`). La solución es arrancar la clase 
 - **`profiles: ["dev"]`:** Jupyter es una herramienta de desarrollo. Un `docker compose up` pelado no
   lo levanta: hace falta `COMPOSE_PROFILES=dev` en el `.env` (así viene en `.env.example`) o
   `docker compose --profile dev up`.
+
+  > **Es la primera vez que hace falta un `.env`.** Si todavía no lo creaste, alcanza con
+  > `cp .env.example .env` para seguir leyendo: el resto del Compose usa `${VAR:-default}`, así que
+  > el stack levanta igual sin él. Los valores fuertes —y el `JUPYTER_TOKEN` de acá abajo— se
+  > completan en [§8.1](#81-secretos-en-un-env), que es donde el `.env` local queda cerrado.
+  > A diferencia del `.env` de producción (guía 02 §13.4), este es un solo archivo escrito a mano:
+  > no se genera ni crece por secciones.
 - **`Dockerfile.jupyter` se construye sobre `apache/spark:4.0.3`**, no sobre la clásica
   `jupyter/pyspark-notebook`, que solo llega a Spark 3.5. Así el driver corre exactamente el mismo
   Spark que el cluster; encima se agregan JupyterLab y Python 3.12.
@@ -349,14 +356,8 @@ JUPYTER_TOKEN=<token largo>
 En vez de tocar el Compose base, usá un override que Compose fusiona: el desarrollo queda intacto y
 se añaden `restart`, rotación de logs, healthchecks y límites de memoria.
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml up -d
-```
-
-> Este override endurece el **stack local completo**, útil si querés correrlo así en una sola
-> máquina. No confundir con producción: el Compose de producción de la
-> [guía 02 §14.1](02-produccion-aws-terraform.md) **no levanta** HDFS ni Spark —en la EC2 solo corren
-> Airflow, Postgres y el monitoreo— porque el cómputo va a EMR Serverless y el storage a S3.
+**Primero creá el archivo** en la raíz del repo (no está versionado; el `up -d` de más abajo lo
+necesita):
 
 ```yaml
 # docker-compose.local-hardened.yml — límites y healthchecks para el laboratorio local
@@ -414,6 +415,17 @@ services:
 
 Jupyter no aparece: vive bajo el perfil `dev` y no se endurece para producción, donde directamente no
 corre.
+
+**Con el archivo creado, levantá el stack endurecido:**
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml up -d
+```
+
+> Este override endurece el **stack local completo**, útil si querés correrlo así en una sola
+> máquina. No confundir con producción: el Compose de producción de la
+> [guía 02 §14.1](02-produccion-aws-terraform.md) **no levanta** HDFS ni Spark —en la EC2 solo corren
+> Airflow, Postgres y el monitoreo— porque el cómputo va a EMR Serverless y el storage a S3.
 
 ### 8.3 Secretos parametrizados en el Compose base
 

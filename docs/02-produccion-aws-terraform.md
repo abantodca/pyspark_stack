@@ -22,13 +22,20 @@ administra la infraestructura y GitHub Actions entrega el código con OIDC, sin 
   proteger, controlar costos y recuperar el servicio.
 - Cada bloque indica **dónde corre**, **qué resuelve** y **qué resultado esperar**. Dentro del código
   solo quedan las advertencias que evitan una ejecución peligrosa o incorrecta.
+- **Los comandos no se editan.** Ningún bloque `bash` de esta guía tiene un ID, una IP, un account
+  id ni un nombre de bucket escrito adentro: todos leen variables de entorno que produce Terraform.
+  Antes de copiar el primer comando, leé el [contrato de variables de entorno
+  (§3.1)](#31-contrato-de-variables-de-entorno-leelo-antes-de-copiar-cualquier-comando) — es lo que
+  hace que el mismo bloque funcione en tu cuenta, en otra región y en la máquina de otra persona.
+  Si ves un `<algo-entre-ángulos>`, es un valor que solo vos podés elegir (un dominio, un job id
+  puntual), nunca algo que Terraform ya sepa.
 - Sustituí `pyspark-stack` únicamente si también cambiás `var.name_prefix`.
 
 ## Índice
 
 1. [Panorama de la arquitectura](#1-panorama-de-la-arquitectura)
 2. [Costo](#2-costo)
-3. [Prerrequisitos](#3-prerrequisitos)
+3. [Prerrequisitos](#3-prerrequisitos) · [3.1 Contrato de variables de entorno](#31-contrato-de-variables-de-entorno-leelo-antes-de-copiar-cualquier-comando)
 4. [Fundamentos: backend Terraform](#4-fundamentos-backend-terraform)
 5. [Núcleo: EC2 con Docker](#5-núcleo-ec2-con-docker)
 6. [Data lake en S3](#6-data-lake-en-s3)
@@ -36,7 +43,7 @@ administra la infraestructura y GitHub Actions entrega el código con OIDC, sin 
 8. [Operación diaria y diagnóstico](#8-operación-diaria-y-diagnóstico)
 9. [Patrones de tareas DataOps](#9-patrones-de-tareas-dataops)
 10. [Flujo de desarrollo y despliegue](#10-flujo-de-desarrollo-y-despliegue)
-11. [CI/CD con GitHub Actions y OIDC](#11-cicd-con-github-actions-y-oidc)
+11. [CI/CD con GitHub Actions y OIDC](#11-cicd-con-github-actions-y-oidc) · [11.5 El mismo contrato en CI](#115-el-mismo-contrato-en-ci-sembrar-las-vars-desde-los-outputs)
 12. [Observabilidad e incidentes](#12-observabilidad-e-incidentes)
 13. [Hardening y secretos](#13-hardening-y-secretos)
 14. [Compose canónico de producción](#14-compose-canónico-de-producción)
@@ -198,6 +205,107 @@ CLI. Si necesitás el camino manual completo, está en la [guía 02b](02b-produc
 **Terraform es la fuente de verdad**: reproducible, versionado y con `terraform destroy` limpio. No
 mezcles los dos caminos para el mismo recurso — si algo ya lo creaste a mano y querés pasarlo a
 Terraform, primero `terraform import`; si no, el `apply` duplica o falla por nombre ocupado.
+
+### 3.1 Contrato de variables de entorno (leelo antes de copiar cualquier comando)
+
+Ningún comando de esta guía lleva un ID, una IP, un account id ni un nombre de bucket escrito
+adentro. Todos leen variables de entorno, y esas variables las produce **Terraform**, no vos. La
+razón no es estética:
+
+- Un `i-0abc…` o un `203.0.113.10` pegado en un comando **caduca**: la instancia se recrea, la IP
+  cambia, el account id es otro en la cuenta de un compañero. El comando pasa a estar mal y nadie
+  se entera hasta que falla.
+- Un `<acct>` o un `<tu-elastic-ip>` sin reemplazar es peor: no falla, **ejecuta contra el lugar
+  equivocado** (o abre un Security Group a una IP que no existe y te deja sin SSH).
+- Con el contrato, el mismo bloque copiado tal cual funciona en tu cuenta, en otra región, con otro
+  `name_prefix` y en la máquina de otra persona, sin editar una letra.
+
+**La regla, en una línea:** *si un valor lo decide AWS o Terraform, se publica como `output`; si lo
+decide tu máquina (rutas locales), tiene default overridable en el cargador.*
+
+#### La cadena completa
+
+```text
+recurso .tf  ──►  output en outputs.tf  ──►  scripts/prod-env.sh  ──►  $VARIABLE en el comando
+ (§5…§18)          nombre snake_case          exporta TODO           copy-paste sin editar
+                                              en MAYÚSCULAS
+```
+
+#### El cargador: `scripts/prod-env.sh`
+
+El contrato lo materializa un script que convierte los outputs en variables de entorno. Su motor es
+un bucle genérico: no tiene una lista de variables, exporta todo lo que `terraform output -json`
+devuelva. Por eso agregar un recurso nuevo nunca obliga a editarlo.
+
+**El archivo se crea en [§5.5](#55-desplegar-subir-código-y-túnel-ssh), no acá.** A esta altura
+todavía no existe `infra/prod`, ni el backend, ni un solo `.tf`: sin state que leer, el script no
+tendría nada que exportar y no podrías ni probarlo. Se escribe junto al resto de los archivos de
+esa sección (Paso 0c), justo antes del `terraform apply` que produce los primeros outputs.
+
+Lo que sigue en esta sección es la regla que hay que tener en la cabeza **antes** de copiar el
+primer comando; el cómo llega cuando hay algo que cargar.
+
+#### Escalabilidad: qué agregar y **dónde**, cada vez que la infra crece
+
+Este es el punto que hace que la guía siga siendo copy-paste en la sección 18 igual que en la 5.
+Cuando agregues un recurso operable, tocás **dos lugares y ninguno más**:
+
+| Paso | Archivo | Qué agregás | Ejemplo |
+|---|---|---|---|
+| 1 | el `.tf` de su sección | el recurso | `aws_sqs_queue.trigger_events` (§7.3) |
+| 2 | `infra/prod/outputs.tf` | **un `output` por cada valor que un comando vaya a necesitar** | `output "sqs_trigger_queue_url" { value = aws_sqs_queue.trigger_events.url }` |
+| — | `scripts/prod-env.sh` | **nada**: el bucle lo exporta solo | queda disponible como `$SQS_TRIGGER_QUEUE_URL` |
+| 3 | tu comando | usás la variable | `aws sqs get-queue-attributes --queue-url "$SQS_TRIGGER_QUEUE_URL"` |
+
+Convenciones que hacen que esto no se degrade:
+
+- **`snake_case` en el output → `SCREAMING_SNAKE_CASE` en la shell.** Es una traducción mecánica;
+  no inventes nombres distintos en cada lado.
+- **Sufijo por tipo de dato**, para que el nombre diga qué contiene y no haya que abrir el `.tf`:
+  `_id`, `_arn`, `_name`, `_url`, `_uri` (S3), `_bucket`, `_ip`.
+- **El output guarda el hecho; el cargador guarda la derivación.** `artifacts_bucket` es un output;
+  `s3://…/emr/logs` no lo es — sale de `EMR_LOGS_URI` en el script. Así un cambio de convención de
+  rutas se hace en un solo lugar y no en catorce `output`.
+- **Un output no es documentación, es una API.** Si lo renombrás, rompés los comandos de la guía y
+  los workflows de CI (§11). Renombrar = agregar el nuevo, migrar los usos, borrar el viejo.
+- **Nada de secretos en outputs.** Passwords y tokens viven en SSM Parameter Store (§13) y se leen
+  en el momento; un output los deja en texto plano dentro del state.
+- **La sección que crea el recurso es la que agrega su output**, en el mismo `apply`. No dejes
+  outputs "para después": un comando de una sección posterior va a asumir que existe. Esto no es
+  cosmético: la guía es incremental y se lee de arriba abajo, así que un output declarado más abajo
+  que su primer uso deja la variable **vacía** en el momento de copiar el bloque — y un
+  `aws s3 cp ... "s3:///raw/x"` no falla igual que un comando bien formado.
+
+#### Ejemplo completo: agregar un recurso operable
+
+El caso real más corto de la guía es la DLQ del trigger. **No copies nada de acá** —el código vive
+en [§18.1](#181-dlq-según-el-origen), y duplicarlo rompería el `apply`—; esto es solo el recorrido,
+para que veas las cuatro etapas de un vistazo:
+
+```text
+1. governance.tf   resource "aws_sqs_queue" "trigger_airflow_dlq" { ... }
+                   └─ el recurso, en el .tf de la sección que lo introduce (§18.1)
+
+2. outputs.tf      output "sqs_trigger_dlq_url" { value = ....url }
+                   └─ inmediatamente, en la MISMA sección: nunca "para después"
+
+3. terraform apply      +  PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+                   └─ el apply publica el output; el refresh lo trae a tu terminal
+
+4. aws sqs get-queue-attributes --queue-url "$SQS_TRIGGER_DLQ_URL" ...
+                   └─ ya es usable, sin haber tocado prod-env.sh ni una línea
+```
+
+`PROD_ENV_REFRESH=1` en el paso 3 no es opcional: el cargador cachea el state 15 minutos, así que
+sin él la variable nueva no aparece y el comando del paso 4 corre con la URL vacía. Cada vez que
+esta guía hace un `apply` que agrega outputs, el bloque siguiente recarga con `--refresh`.
+
+#### Por qué no un `.env` a mano
+
+Un `.env.prod` escrito a mano es la misma trampa que el valor pegado en el comando, solo que
+centralizada: se desincroniza en silencio en cuanto Terraform recrea algo. El state **ya es** el
+inventario real de la infra; `prod-env.sh` lo lee, no lo duplica. El único archivo a mano es
+`infra/prod/prod.env`, y solo para lo que Terraform no puede saber (tu clave SSH, tu perfil de AWS).
 
 ---
 
@@ -499,6 +607,22 @@ resource "aws_security_group" "pyspark" {
 }
 ```
 
+**Primer `outputs.tf`.** Acá nace el archivo del contrato de §3.1, con lo creado hasta esta
+subsección. Cada sección siguiente le agrega los suyos; el orden importa, porque un comando solo
+puede usar una variable después de que su output exista:
+
+```hcl
+# infra/prod/outputs.tf
+# Identidad del stack: sin esto, cada comando tendría que asumir el prefijo y la región,
+# y repetir `aws sts get-caller-identity` para el account id.
+output "name_prefix" { value = var.name_prefix }
+output "aws_region"  { value = var.aws_region }
+output "account_id"  { value = local.account_id }
+
+# Lo consume scripts/update-sg-ip.sh (más abajo, Opción B), para no buscar el SG por nombre.
+output "security_group_id" { value = aws_security_group.pyspark.id }
+```
+
 <details>
 <summary>🖱️ A mano en la consola AWS — security group</summary>
 
@@ -520,12 +644,15 @@ resource "aws_security_group" "pyspark" {
 >
 > Para refrescar ese `/32` **elegí una de las dos opciones de abajo, no las dos**: son excluyentes.
 >
+> ⚠️ **Las dos son mantenimiento, no un paso de esta sección.** Se usan cuando el stack ya está
+> desplegado y tu IP cambió. Acá todavía no existe `infra/prod/terraform.tfvars` —se genera en
+> [§5.5](#55-desplegar-subir-código-y-túnel-ssh)— ni corriste el primer `apply`, así que no hay SG
+> que actualizar. Leelas ahora para saber que existen; volvé cuando las necesites.
+>
 > **Opción A — Terraform lo sigue gestionando (recomendada).** Actualizá **`terraform.tfvars`** con tu
-> IP actual y aplicá. Si es la primera vez que corrés Terraform contra `infra/prod` en esta máquina
-> (hasta acá solo inicializaste `infra/bootstrap`, §4), primero `init`:
+> IP actual y aplicá:
 >
 > ```bash
-> terraform -chdir=infra/prod init
 > MY_IP="$(curl -s https://checkip.amazonaws.com)"
 > if grep -q '^my_ip_cidr' infra/prod/terraform.tfvars 2>/dev/null; then
 >   sed -i "s#^my_ip_cidr .*#my_ip_cidr     = \"${MY_IP}/32\"#" infra/prod/terraform.tfvars
@@ -567,28 +694,39 @@ Corré esto desde tu máquina cuando cambie tu IP (o por cron local). Actualiza 
 y 443 sin tocar sus IDs, y salta el 443 si no lo expusiste. Recordá el `ignore_changes` y los permisos
 de arriba: sin eso, el próximo `apply` pisa el cambio.
 
+**Igual que la Opción A, es mantenimiento posterior.** Depende de dos cosas que llegan en §5.5: el
+cargador `scripts/prod-env.sh` (Paso 0c) y el output `security_group_id`, que no existe hasta el
+primer `apply`. Crealo cuando lo necesites, no ahora.
+
 ```bash
 #!/usr/bin/env bash
 # scripts/update-sg-ip.sh — pone tu IP de cliente actual en las reglas 22 y 443 del SG.
 set -euo pipefail
-REGION="${AWS_REGION:-us-east-1}"
-SG_NAME="pyspark-stack-sg"
+
+# Contexto de §3.1: de acá salen AWS_REGION y SECURITY_GROUP_ID, sin buscar el SG por
+# nombre. Buscarlo por nombre asume el prefijo "pyspark-stack" y falla en silencio (SG_ID
+# vacío) si cambiaste var.name_prefix o si hay otro SG homónimo en otra VPC.
+source "$(dirname "$0")/prod-env.sh"
+
 MYIP="$(curl -s https://checkip.amazonaws.com)/32"
-echo "IP actual: $MYIP"
-SG_ID=$(aws ec2 describe-security-groups --region "$REGION" \
-  --filters "Name=group-name,Values=$SG_NAME" \
-  --query 'SecurityGroups[0].GroupId' --output text)
+echo "IP actual: $MYIP  ·  SG: $SECURITY_GROUP_ID  ·  región: $AWS_REGION"
+
 for PORT in 22 443; do
-  RULE_ID=$(aws ec2 describe-security-group-rules --region "$REGION" \
-    --filters "Name=group-id,Values=$SG_ID" \
+  RULE_ID=$(aws ec2 describe-security-group-rules --region "$AWS_REGION" \
+    --filters "Name=group-id,Values=$SECURITY_GROUP_ID" \
     --query "SecurityGroupRules[?FromPort==\`$PORT\` && IsEgress==\`false\` && IpProtocol=='tcp'].SecurityGroupRuleId | [0]" \
     --output text)
   [ "$RULE_ID" = "None" ] || [ -z "$RULE_ID" ] && { echo "puerto $PORT: sin regla, salto"; continue; }
-  aws ec2 modify-security-group-rules --region "$REGION" --group-id "$SG_ID" \
+  aws ec2 modify-security-group-rules --region "$AWS_REGION" --group-id "$SECURITY_GROUP_ID" \
     --security-group-rules "SecurityGroupRuleId=$RULE_ID,SecurityGroupRule={IpProtocol=tcp,FromPort=$PORT,ToPort=$PORT,CidrIpv4=$MYIP,Description=auto-mi-ip}"
   echo "puerto $PORT: regla $RULE_ID -> $MYIP"
 done
 ```
+
+> Este script depende del output `security_group_id`, que se declara en `outputs.tf` en §5.5. Si lo
+> corrés antes de esa sección, `prod-env.sh` no lo va a exportar y vas a ver
+> `SECURITY_GROUP_ID: unbound variable` — es el error correcto: avisa temprano, en vez de
+> modificar el SG equivocado.
 
 </details>
 
@@ -1130,8 +1268,8 @@ El ciclo de stop/start conserva estas cuatro propiedades de diseño:
 > cero, no una degradación sostenida. La EC2, al no correr Spark, arranca sin warmup relevante.
 
 ```bash
-# comprobá (tras el apply de §5.5)
-aws lambda invoke --function-name pyspark-stack-startstop \
+# comprobá (tras el apply de §5.5, con el contexto cargado: source ./scripts/prod-env.sh)
+aws lambda invoke --function-name "$LAMBDA_STARTSTOP_NAME" \
   --cli-binary-format raw-in-base64-out --payload '{"action":"stop"}' /dev/stdout
 # debe listar tu instancia, no {"msg": "no instances tagged"} (revisá el tag AutoStartStop).
 # Nota: con el guard job-aware, si el chequeo SSM ve DAGs corriendo (o no puede verificar) devuelve
@@ -1140,19 +1278,46 @@ aws lambda invoke --function-name pyspark-stack-startstop \
 
 ### 5.5 Desplegar, subir código y túnel SSH
 
+Ampliá el `outputs.tf` que nació en §5.1 con lo creado en §5.3 y §5.4. **Agregá, no reemplaces**:
+los cuatro outputs de §5.1 siguen haciendo falta.
+
 ```hcl
-# infra/prod/outputs.tf
+# infra/prod/outputs.tf (continuación)
+# CONTRATO CON LA LÍNEA DE COMANDOS. scripts/prod-env.sh exporta cada uno de estos outputs
+# como variable en MAYÚSCULAS (public_ip → $PUBLIC_IP). Regla: si un comando de la guía lo
+# necesita, va acá. Nada de secretos: esos viven en SSM (§13).
+
+# ── Cómputo/red
 # public_ip sale de la EIP (estable entre stop/start), no de la IP efímera de la instancia.
-output "public_ip"   { value = aws_eip.pyspark.public_ip }
-output "instance_id" { value = aws_instance.pyspark.id }
+output "public_ip"         { value = aws_eip.pyspark.public_ip }
+output "instance_id"       { value = aws_instance.pyspark.id }
+output "availability_zone" { value = var.availability_zone }
+output "data_volume_id"    { value = aws_ebs_volume.data.id }   # lo usa el crecimiento online del disco (§12.4)
+
+# ── Automatización de §5.4: los comandos invocan por nombre, no por ARN.
+output "lambda_startstop_name" { value = aws_lambda_function.startstop.function_name }
+output "schedule_start_name"   { value = aws_scheduler_schedule.start.name }
+output "schedule_stop_name"    { value = aws_scheduler_schedule.stop.name }
+
+# ── Comodidad: comandos listos para pegar, ya resueltos con los valores reales.
 output "tunnel_command" {
   # Solo Airflow (8082). Spark ya no corre en la EC2 (EMR Serverless), así que no hay UI 8081/9870
   # que tunelear, y no hay Jupyter en prod (no se usa acá, §5.5). Si exponés la web por HTTPS (§5.6),
   # entrás directo a https://${var.airflow_domain} y este túnel a 8082 es opcional (y daría warning
   # de cert en localhost:8082, porque el api-server ya sirve TLS del FQDN).
+  #
+  # Asume la clave y el usuario por defecto: Terraform no conoce las rutas de tu máquina. Si
+  # cambiaste SSH_KEY o SSH_USER en prod.env, el comando canónico es el de §5.5 paso 6
+  # ($SSH -L 8082:localhost:8082 "$SSH_TARGET"), que sí los respeta. Este output es comodidad.
   value = "ssh -i ~/.ssh/pyspark_stack -L 8082:localhost:8082 ec2-user@${aws_eip.pyspark.public_ip}"
 }
 ```
+
+> **Por qué `name_prefix`, `aws_region` y `account_id` son outputs (§5.1) si ya son variables de
+> Terraform.** Porque el que corre los comandos es bash, no Terraform: sin publicarlos, cada bloque
+> tendría que repetir `aws sts get-caller-identity` y asumir `us-east-1`. Publicándolos, el `apply`
+> y la terminal comparten exactamente los mismos valores — si mañana cambiás la región en
+> `terraform.tfvars`, los comandos la siguen sin que toques nada.
 
 Antes del `apply`, definí las dos variables sin default (`my_ip_cidr`, `ssh_public_key`) en un
 `terraform.tfvars` — así el `apply` no las pide interactivamente y queda repetible. El archivo no se
@@ -1319,9 +1484,201 @@ networks:
   platform:
 ```
 
+**Paso 0c — creá `scripts/prod-env.sh`**, el cargador del contrato de §3.1. Va acá y no antes
+porque recién ahora hay algo que leer: el `apply` del Paso 1 es el que produce los primeros outputs.
+Se crea una sola vez y **no se vuelve a tocar en toda la guía** — las secciones siguientes le suman
+outputs, nunca código.
+
+Su motor es un bucle genérico: no tiene una lista de variables, exporta todo lo que
+`terraform output -json` devuelva.
+
+```bash
+#!/usr/bin/env bash
+# scripts/prod-env.sh — única fuente de verdad del contexto de producción.
+#
+#   source ./scripts/prod-env.sh              # modo terraform (por defecto)
+#   PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh   # sin state (guía 02b)
+#   ./scripts/prod-env.sh --check             # valida y muestra; NO exporta
+#   PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh         # ignora la caché
+set -uo pipefail
+
+__pe_sourced=0
+(return 0 2>/dev/null) && __pe_sourced=1
+__pe_die() { printf '\033[31mprod-env: %s\033[0m\n' "$*" >&2; return 1; }
+
+# Raíz del repo: el script funciona desde cualquier directorio, no solo desde la raíz.
+__pe_self="${BASH_SOURCE[0]:-$0}"
+PROD_ENV_ROOT="$(cd "$(dirname "$__pe_self")/.." && pwd)"
+export PROD_ENV_ROOT
+INFRA_DIR="${INFRA_DIR:-$PROD_ENV_ROOT/infra/prod}"
+
+# Overrides locales, opcionales y NO versionados (otra cuenta, otro perfil, otra clave).
+# shellcheck disable=SC1091
+[ -f "$INFRA_DIR/prod.env" ] && . "$INFRA_DIR/prod.env"
+
+# Lo que Terraform no puede saber porque es de TU máquina. Todo overridable.
+export SSH_KEY="${SSH_KEY:-$HOME/.ssh/pyspark_stack}"
+export SSH_USER="${SSH_USER:-ec2-user}"
+export REMOTE_DIR="${REMOTE_DIR:-/home/$SSH_USER/pyspark_stack}"
+export COMPOSE_PROD="${COMPOSE_PROD:-docker-compose.prod.yml}"
+export AWS_PAGER=""   # sin esto, cada `aws ... --output text` abre el pager
+
+PROD_ENV_SOURCE="${PROD_ENV_SOURCE:-terraform}"
+PROD_ENV_TTL="${PROD_ENV_TTL:-900}"   # segundos de caché; 0 = siempre fresco
+
+for __pe_bin in jq aws; do
+  command -v "$__pe_bin" >/dev/null 2>&1 || { __pe_die "falta '$__pe_bin' en el PATH"; return 1 2>/dev/null || exit 1; }
+done
+
+__pe_load_terraform() {
+  command -v terraform >/dev/null 2>&1 || { __pe_die "falta terraform; probá PROD_ENV_SOURCE=discover"; return 1; }
+  [ -d "$INFRA_DIR" ] || { __pe_die "no existe $INFRA_DIR (¿ya corriste §4-§5?)"; return 1; }
+
+  # Caché: `terraform output` baja el state de S3 en cada llamada (~1-2 s). Con 20 comandos
+  # por sesión eso se nota; el TTL lo evita sin quedar obsoleto.
+  local cache="${TMPDIR:-/tmp}/pyspark-stack-prod-env.$(id -u).json"
+  local fresh=0
+  if [ "$PROD_ENV_TTL" -gt 0 ] && [ -z "${PROD_ENV_REFRESH:-}" ] && [ -s "$cache" ]; then
+    local age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    [ "$age" -lt "$PROD_ENV_TTL" ] && fresh=1
+  fi
+
+  if [ "$fresh" -eq 0 ]; then
+    local json
+    json="$(terraform -chdir="$INFRA_DIR" output -json 2>/dev/null)" || {
+      __pe_die "terraform output falló; ¿corriste 'terraform -chdir=$INFRA_DIR init'?"; return 1; }
+    [ "$(printf '%s' "$json" | jq 'length')" -gt 0 ] || {
+      __pe_die "el state no tiene outputs; falta 'terraform apply' o falta outputs.tf"; return 1; }
+    printf '%s' "$json" > "$cache" && chmod 600 "$cache"
+    PROD_ENV_AGE=0
+  else
+    # Expuesto para que --check pueda avisar: un contexto leído de caché puede ser
+    # anterior al último `terraform apply` y no incluir los outputs nuevos.
+    PROD_ENV_AGE=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+  fi
+  export PROD_ENV_AGE
+
+  # EL MOTOR: cada output se vuelve una variable, sin lista que mantener.
+  # @sh cita el valor, así un nombre con espacios o comillas no rompe el eval.
+  local exports
+  exports="$(jq -r '
+    to_entries[]
+    | select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$"))
+    | .key as $k
+    | (if (.value.value | type) == "string" then .value.value else (.value.value | tojson) end) as $v
+    | "export \($k | ascii_upcase)=\($v | @sh)"
+  ' "$cache")" || { __pe_die "no pude parsear los outputs"; return 1; }
+  eval "$exports"
+
+  export AWS_REGION="${AWS_REGION:-us-east-1}"
+  export AWS_DEFAULT_REGION="$AWS_REGION"
+}
+
+__pe_load_discover() {   # sin Terraform: infra creada a mano (guía 02b). Mismos nombres de variable.
+  export AWS_REGION="${AWS_REGION:-us-east-1}"
+  export AWS_DEFAULT_REGION="$AWS_REGION"
+  export NAME_PREFIX="${NAME_PREFIX:-pyspark-stack}"
+  ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)" || {
+    __pe_die "sin credenciales AWS válidas (aws configure)"; return 1; }
+  export ACCOUNT_ID
+  export INSTANCE_ID="${INSTANCE_ID:-$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${NAME_PREFIX}-node" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null)}"
+  export PUBLIC_IP="${PUBLIC_IP:-$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null)}"
+  export SECURITY_GROUP_ID="${SECURITY_GROUP_ID:-$(aws ec2 describe-security-groups \
+    --filters "Name=group-name,Values=${NAME_PREFIX}-sg" \
+    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)}"
+  export DATALAKE_BUCKET="${NAME_PREFIX}-datalake-${ACCOUNT_ID}"
+  export ARTIFACTS_BUCKET="${NAME_PREFIX}-artifacts-${ACCOUNT_ID}"
+  export EMR_JOB_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${NAME_PREFIX}-emr-serverless-job"
+  export EMR_APP_ID="${EMR_APP_ID:-$(aws emr-serverless list-applications \
+    --query "applications[?name=='${NAME_PREFIX}-spark'].id | [0]" --output text 2>/dev/null)}"
+  export SQS_TRIGGER_QUEUE_URL="${SQS_TRIGGER_QUEUE_URL:-$(aws sqs get-queue-url \
+    --queue-name "${NAME_PREFIX}-trigger-events" --query QueueUrl --output text 2>/dev/null)}"
+  export LAMBDA_STARTSTOP_NAME="${NAME_PREFIX}-startstop"
+  export LAMBDA_TRIGGER_NAME="${NAME_PREFIX}-trigger-airflow"
+  export GLUE_DATABASE="${NAME_PREFIX//-/_}_analytics"
+  export ATHENA_WORKGROUP="${NAME_PREFIX}-analytics"
+}
+
+case "$PROD_ENV_SOURCE" in
+  terraform) __pe_load_terraform || { [ "$__pe_sourced" -eq 1 ] && return 1 || exit 1; } ;;
+  discover)  __pe_load_discover  || { [ "$__pe_sourced" -eq 1 ] && return 1 || exit 1; } ;;
+  *)         __pe_die "PROD_ENV_SOURCE debe ser 'terraform' o 'discover'"; [ "$__pe_sourced" -eq 1 ] && return 1 || exit 1 ;;
+esac
+
+# Derivadas: se calculan UNA vez acá, no en cada comando. Solo si su base existe,
+# para no fabricar rutas rotas tipo "s3:///emr/" cuando la sección todavía no se aplicó.
+[ -n "${ARTIFACTS_BUCKET:-}" ] && {
+  export EMR_ENTRYPOINTS_URI="s3://${ARTIFACTS_BUCKET}/emr"
+  export EMR_LOGS_URI="s3://${ARTIFACTS_BUCKET}/emr/logs"
+  export ATHENA_RESULTS_URI="s3://${ARTIFACTS_BUCKET}/athena-results"
+}
+[ -n "${DATALAKE_BUCKET:-}" ] && {
+  export RAW_URI="s3://${DATALAKE_BUCKET}/raw"
+  export CURATED_URI="s3://${DATALAKE_BUCKET}/curated"
+}
+[ -n "${PUBLIC_IP:-}" ] && {
+  export SSH_TARGET="${SSH_USER}@${PUBLIC_IP}"
+  export SSH="ssh -i $SSH_KEY"      # un solo lugar define las opciones de SSH
+  export RSYNC_SSH="ssh -i $SSH_KEY"
+}
+
+# La lista de obligatorias crece con la guía: una variable pasa a REQUIRED recién
+# cuando la sección que crea su recurso ya se aplicó. Por eso avisa, no aborta.
+prod_env_check() {
+  local required="AWS_REGION NAME_PREFIX ACCOUNT_ID INSTANCE_ID PUBLIC_IP"
+  local optional="DATALAKE_BUCKET ARTIFACTS_BUCKET EMR_APP_ID SQS_TRIGGER_QUEUE_URL AIRFLOW_URL"
+  local missing="" v
+  for v in $required; do
+    [ -n "${!v:-}" ] && [ "${!v}" != "None" ] || missing="$missing $v"
+  done
+  local origen="lectura fresca del state"
+  if [ "${PROD_ENV_AGE:-0}" -gt 0 ]; then
+    origen="caché de hace ${PROD_ENV_AGE}s — si aplicaste después, recargá con PROD_ENV_REFRESH=1"
+  fi
+  printf '\033[1mContexto de producción\033[0m  (fuente: %s · región: %s)\n' "$PROD_ENV_SOURCE" "$AWS_REGION"
+  [ "$PROD_ENV_SOURCE" = "terraform" ] && printf '  \033[2m%s\033[0m\n' "$origen"
+  for v in $required $optional; do
+    printf '  %-24s %s\n' "$v" "${!v:-— (sin definir aún: falta su sección)}"
+  done
+  [ -f "$SSH_KEY" ] || printf '\n\033[33m  aviso: no existe la clave SSH %s (definila con SSH_KEY=...)\033[0m\n' "$SSH_KEY"
+  if [ -n "$missing" ]; then
+    printf '\n\033[31m  faltan obligatorias:%s\033[0m\n' "$missing"; return 1
+  fi
+  printf '\n\033[32m  ok: contexto completo\033[0m\n'
+}
+
+if [ "$__pe_sourced" -eq 0 ] || [ "${1:-}" = "--check" ]; then
+  prod_env_check
+fi
+
+unset __pe_self __pe_bin __pe_sourced
+```
+
+```bash
+chmod +x scripts/prod-env.sh
+```
+
+**Cómo se usa:** una vez por terminal, desde cualquier directorio del repo. `source` es
+obligatorio — ejecutado como `./scripts/prod-env.sh`, los `export` mueren con el proceso y solo
+verías el `--check`. Si abrís una terminal nueva a mitad de la guía, volvé a sourcearlo: es lo único
+que hay que recordar.
+
+```bash
+source ./scripts/prod-env.sh     # exporta el contexto en la shell actual
+./scripts/prod-env.sh --check    # qué hay definido y qué falta (no exporta nada)
+```
+
+Todavía va a fallar con «no existe infra/prod»: es lo esperado, el Paso 1 lo crea. Si querés que se
+cargue solo al entrar al repo, `echo 'source ./scripts/prod-env.sh' > .envrc` (con direnv, opcional).
+
 Con eso creado, siguen los 6 pasos de infra/deploy. **Corrélos desde la raíz del repo** (no hace
-falta entrar a `infra/prod`: el `-chdir` de Terraform se encarga). El paso 2 define `$IP`, que usan
-del 3 al 6 — si abrís una terminal nueva a mitad de camino, volvé a definirla.
+falta entrar a `infra/prod`: el `-chdir` de Terraform se encarga). El paso 2 carga el contexto de
+§3.1 con `source ./scripts/prod-env.sh`, y del 3 al 6 ya no aparece ni un valor escrito a mano —
+si abrís una terminal nueva a mitad de camino, volvé a sourcear ese script y seguí donde estabas.
 
 ```bash
 # ─── 1. Crear la infra ──────────────────────────────────────── (~3-4 min) ───
@@ -1329,13 +1686,20 @@ del 3 al 6 — si abrís una terminal nueva a mitad de camino, volvé a definirl
 terraform -chdir=infra/prod init
 terraform -chdir=infra/prod apply
 
-# ─── 2. Esperar el primer boot ──────────────────────────────── (~2-5 min) ───
+# ─── 2. Cargar el contexto y esperar el primer boot ─────────── (~2-5 min) ───
+# Primer uso real del contrato de §3.1: una sola lectura del state deja $PUBLIC_IP,
+# $INSTANCE_ID, $SSH_TARGET, $SSH y $REMOTE_DIR listos para los pasos 3-6.
+# REFRESH obligatorio: si en §5.1 corriste update-sg-ip.sh, ya hay caché de hace
+# menos de 15 min —de ANTES de que existiera la EC2—, y un `source` pelado te
+# devolvería ese contexto viejo, sin PUBLIC_IP. El rsync del paso 3 fallaría
+# intentando conectar a "ec2-user@" sin host.
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+./scripts/prod-env.sh --check     # confirmá qué quedó definido antes de seguir
+
 # La instancia aparece como "running" mucho antes de terminar el user_data. Este wait
 # corta recién cuando pasa los status checks; sin él, el rsync del paso 3 falla por
 # "connection refused" (sshd todavía no levantó).
-IP=$(terraform -chdir=infra/prod output -raw public_ip)
-aws ec2 wait instance-status-ok \
-  --instance-ids "$(terraform -chdir=infra/prod output -raw instance_id)"
+aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
 
 # La EIP (public_ip) es estable entre stop/start, PERO si el `apply` del paso 1 reemplazó la
 # instancia (-/+ en el plan: pasa con cambios al SG, al user_data, a la AMI...) la EC2 nueva
@@ -1343,35 +1707,51 @@ aws ec2 wait instance-status-ok \
 # misma IP → rsync y ssh fallan con "Host key verification failed" o el warning de "REMOTE HOST
 # IDENTIFICATION HAS CHANGED". Limpiala siempre acá, sin preguntar (si no hubo reemplazo, esto
 # no hace nada):
-ssh-keygen -f ~/.ssh/known_hosts -R "$IP" >/dev/null 2>&1 || true
+ssh-keygen -f ~/.ssh/known_hosts -R "$PUBLIC_IP" >/dev/null 2>&1 || true
 
 # ─── 3. Subir el código ──────────────────────────────────────────────────────
 # --exclude '.env': el .env local (dev) no debe pisar el de prod, que lo genera
 # load-secrets.sh en la EC2 desde SSM (§13.1). 'infra' tampoco viaja: vive en tu máquina.
 # docker-compose.prod.yml (Paso 0) SÍ viaja: no tiene --exclude.
 rsync -avz --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
-  -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@$IP:/home/ec2-user/pyspark_stack/
+  -e "$RSYNC_SSH" ./ "$SSH_TARGET:$REMOTE_DIR/"
 
 # ─── 4. Confirmar que el user_data terminó ───────────────────────────────────
 # Espera a cloud-init y verifica las dos cosas que instala: Compose y /data montado.
 # Si /data no aparece, el boot falló: mirá /var/log/cloud-init-output.log en la EC2.
-ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
+$SSH "$SSH_TARGET" \
   'cloud-init status --wait && docker compose version && df -h /data | tail -1'
 
 # ─── 5. Levantar el stack (sin Spark/HDFS: no hacen falta en la EC2) ─────────
 # (la 1ª vez tarda un par de minutos: instala los providers de requirements.txt; con
 # Dockerfile.airflow.prod ya NO baja JDK/Spark/Hadoop, así que no depende de archive.apache.org) ───
-ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
-  'cd pyspark_stack && docker compose -f docker-compose.prod.yml up -d --build'
+$SSH "$SSH_TARGET" \
+  "cd $REMOTE_DIR && docker compose -f $COMPOSE_PROD up -d --build"
 
 # ─── 6. Abrir el túnel a las UIs ───────── (deja la terminal ocupada: es así) ───
-# Es exactamente el output tunnel_command. Abrí las UIs en otra terminal/navegador.
-ssh -i ~/.ssh/pyspark_stack -L 8082:localhost:8082 ec2-user@$IP
+# Equivale al output tunnel_command, pero respetando tu $SSH_KEY y tu $SSH_USER.
+$SSH -L 8082:localhost:8082 "$SSH_TARGET"
 ```
+
+> **Sobre `$SSH` y las comillas.** `$SSH` (`ssh -i <tu-clave>`) se expande en varias palabras a
+> propósito: es un prefijo de comando, no un argumento. El comando remoto sí va entre comillas.
+> Ojo con cuáles: comillas **simples** cuando querés que la expansión ocurra en la EC2, **dobles**
+> cuando el valor tiene que resolverse en tu máquina antes de viajar — por eso el paso 4 usa
+> simples y el 5 dobles (necesita el valor local de `$REMOTE_DIR` y `$COMPOSE_PROD`).
+
+> **`.env` — qué necesita esta sección.** Nada todavía. El `docker-compose.prod.yml` del Paso 0
+> declara `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `AIRFLOW_JWT_SECRET`,
+> `AIRFLOW_ADMIN_USER` y `AIRFLOW_ADMIN_PASSWORD` con la forma `${VAR:-default}`, así que el stack
+> levanta sin `.env` usando credenciales débiles de arranque. Es deliberado: te deja ver Airflow
+> funcionando antes de montar SSM.
+>
+> Esas mismas seis pasan a ser **obligatorias** en el Compose canónico de §14.1 (ahí se declaran con
+> `:?`), y sus valores fuertes se crean en §13.2. El inventario completo del `.env`, con qué sección
+> publica cada variable, está en [§13.4](#134-materializar-env).
 
 UIs (con el túnel abierto): Airflow `localhost:8082` — o, si exponés la web por HTTPS (§5.6),
 directo en `https://airflow.midominio.com` sin túnel. Spark ya no corre en la EC2 (los jobs van a
-EMR Serverless — su UI de Spark y sus logs se ven desde la consola de EMR / CloudWatch / S3, §12.8).
+EMR Serverless — su UI de Spark y sus logs se ven desde la consola de EMR / CloudWatch / S3, §12.1).
 No hay Jupyter en prod (§5.5): la exploración interactiva queda para el stack local (`docs/01`).
 
 > **Esto es orientación sobre lo que viene, no un paso para ejecutar ahora** — seguí con §5.6 abajo.
@@ -1547,33 +1927,33 @@ define el 2, así que corrélos en la misma terminal.
 # en esa zona (lo necesita el desafío DNS-01 del paso 4).
 terraform -chdir=infra/prod apply
 
-# ─── 2. Leer los datos del state ─────────────────────────────────────────────
-# Todo sale de terraform output: nada se escribe a mano, nada se desincroniza.
-DOMAIN=$(terraform -chdir=infra/prod output -raw airflow_domain)
-EMAIL=$(terraform -chdir=infra/prod output -raw letsencrypt_email)
-IP=$(terraform -chdir=infra/prod output -raw public_ip)
+# ─── 2. Recargar el contexto ─────────────────────────────────────────────────
+# El apply de arriba agregó outputs nuevos (airflow_domain, airflow_url,
+# letsencrypt_email): --refresh salta la caché para que aparezcan ya mismo.
+# Todo sale del state: nada se escribe a mano, nada se desincroniza.
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
 
 # ─── 3. Verificar el DNS antes de pedir el cert ──────────────────────────────
-# Tiene que imprimir la EIP. Si sale vacío, el A record todavía no propagó:
-# esperá un minuto y repetí. Pedir el cert antes de que resuelva lo hace fallar
-# y Let's Encrypt limita los reintentos (5 fallos por hora por dominio).
-dig +short "$DOMAIN"
+# Tiene que imprimir la EIP ($PUBLIC_IP). Si sale vacío, el A record todavía no
+# propagó: esperá un minuto y repetí. Pedir el cert antes de que resuelva lo hace
+# fallar y Let's Encrypt limita los reintentos (5 fallos por hora por dominio).
+dig +short "$AIRFLOW_DOMAIN"
 
 # ─── 4. Emitir el cert (una sola vez) ────────────────────────────────────────
 # Desafío DNS-01: certbot crea un registro TXT temporal usando el rol de la EC2
 # vía IMDS (sin access keys) y lo borra al terminar. No abre el puerto 80, así
 # que el SG sigue cerrado salvo tu IP.
-ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP" "
+$SSH "$SSH_TARGET" "
   sudo docker run --rm -v /data/certs:/etc/letsencrypt certbot/dns-route53 certonly \
-    --dns-route53 -d '$DOMAIN' -m '$EMAIL' --agree-tos -n &&
+    --dns-route53 -d '$AIRFLOW_DOMAIN' -m '$LETSENCRYPT_EMAIL' --agree-tos -n &&
   sudo chmod -R g+rX /data/certs
 "
 # El chmod es necesario: el api-server corre con gid 0 (grupo root), y sin el
 # permiso de grupo no puede leer privkey.pem — el contenedor arranca y muere.
 ```
 
-El cert queda en `/data/certs/live/$DOMAIN/{fullchain.pem,privkey.pem}` (en el EBS, sobrevive al
-stop/start de la EC2).
+El cert queda en `/data/certs/live/$AIRFLOW_DOMAIN/{fullchain.pem,privkey.pem}` (en el EBS,
+sobrevive al stop/start de la EC2).
 
 **Variables HTTPS.** El FQDN viaja como `AIRFLOW_DOMAIN` (no es secreto), junto con cuatro
 variables derivadas: `AIRFLOW_BASE_URL`, `AIRFLOW_EXECUTION_API_URL`, `AIRFLOW_SSL_CERT` y
@@ -1581,14 +1961,13 @@ variables derivadas: `AIRFLOW_BASE_URL`, `AIRFLOW_EXECUTION_API_URL`, `AIRFLOW_S
 
 ```bash
 # EN TU MÁQUINA (repo local) — misma terminal donde corriste terraform: infra/ y su state
-# viven acá, no en la EC2 (§5.5).
-DOMAIN=$(terraform -chdir=infra/prod output -raw airflow_domain)
+# viven acá, no en la EC2 (§5.5). $AIRFLOW_DOMAIN ya está cargado por prod-env.sh.
 {
-  echo "AIRFLOW_DOMAIN=$DOMAIN"
-  echo "AIRFLOW_BASE_URL=https://$DOMAIN"
-  echo "AIRFLOW_EXECUTION_API_URL=https://$DOMAIN:8080/execution/"
-  echo "AIRFLOW_SSL_CERT=/opt/airflow/certs/live/$DOMAIN/fullchain.pem"
-  echo "AIRFLOW_SSL_KEY=/opt/airflow/certs/live/$DOMAIN/privkey.pem"
+  echo "AIRFLOW_DOMAIN=$AIRFLOW_DOMAIN"
+  echo "AIRFLOW_BASE_URL=https://$AIRFLOW_DOMAIN"
+  echo "AIRFLOW_EXECUTION_API_URL=https://$AIRFLOW_DOMAIN:8080/execution/"
+  echo "AIRFLOW_SSL_CERT=/opt/airflow/certs/live/$AIRFLOW_DOMAIN/fullchain.pem"
+  echo "AIRFLOW_SSL_KEY=/opt/airflow/certs/live/$AIRFLOW_DOMAIN/privkey.pem"
 }
 ```
 
@@ -1602,20 +1981,63 @@ la EC2. Cargalas allí por uno de estos dos caminos:
   por `ssh`):
 
   ```bash
-  IP=$(terraform -chdir=infra/prod output -raw public_ip)
-  ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP" "cd pyspark_stack && \
+  $SSH "$SSH_TARGET" "cd $REMOTE_DIR && \
     touch .env && \
     sed -i '/^AIRFLOW_\\(DOMAIN\\|BASE_URL\\|EXECUTION_API_URL\\|SSL_CERT\\|SSL_KEY\\)=/d' .env && \
     printf '%s\n' \
-      'AIRFLOW_DOMAIN=$DOMAIN' \
-      'AIRFLOW_BASE_URL=https://$DOMAIN' \
-      'AIRFLOW_EXECUTION_API_URL=https://$DOMAIN:8080/execution/' \
-      'AIRFLOW_SSL_CERT=/opt/airflow/certs/live/$DOMAIN/fullchain.pem' \
-      'AIRFLOW_SSL_KEY=/opt/airflow/certs/live/$DOMAIN/privkey.pem' >> .env"
+      'AIRFLOW_DOMAIN=$AIRFLOW_DOMAIN' \
+      'AIRFLOW_BASE_URL=https://$AIRFLOW_DOMAIN' \
+      'AIRFLOW_EXECUTION_API_URL=https://$AIRFLOW_DOMAIN:8080/execution/' \
+      'AIRFLOW_SSL_CERT=/opt/airflow/certs/live/$AIRFLOW_DOMAIN/fullchain.pem' \
+      'AIRFLOW_SSL_KEY=/opt/airflow/certs/live/$AIRFLOW_DOMAIN/privkey.pem' >> .env"
   ```
 
 El `sed` elimina valores anteriores antes de agregar los actuales, de modo que repetir el comando
 no deja definiciones duplicadas.
+
+> ⚠️ **El camino directo, solo, no sobrevive a §13.4.** `load-secrets.sh` genera el `.env` **desde
+> cero** (`> .env`, no `>>`): la primera vez que corra —en §13.4, §14.1 o el runbook de §15— borra
+> estas cinco líneas escritas a mano. Y como el override HTTPS las declara con `:?`, el
+> `docker compose ... up -d` siguiente **aborta** con `AIRFLOW_SSL_CERT requerido para HTTPS`.
+>
+> Por eso el bloque de abajo no es opcional si vas a seguir hasta §13: publica las cinco en
+> Parameter Store, que es la fuente que `load-secrets.sh` lee. Hecho esto, el camino directo pasa a
+> ser solo un atajo para probar HTTPS ahora mismo, y el `.env` se regenera igual en cada deploy.
+
+**Terraform — publicá las cinco en SSM (agregá a `infra/prod/dns.tf`)**. Las deriva Terraform del
+mismo `var.airflow_domain` que ya usa el A record, así que no hay un segundo lugar donde el dominio
+pueda quedar desincronizado:
+
+```hcl
+# infra/prod/dns.tf — las 5 variables HTTPS del .env, publicadas para la EC2.
+# Con airflow_domain vacío el mapa queda vacío y for_each no crea ninguno: sin dominio
+# no hay override HTTPS que alimentar, y publicar parámetros vacíos solo ensucia el .env.
+locals {
+  airflow_https_env = var.airflow_domain == "" ? {} : {
+    airflow_domain            = var.airflow_domain
+    airflow_base_url          = "https://${var.airflow_domain}"
+    airflow_execution_api_url = "https://${var.airflow_domain}:8080/execution/"
+    airflow_ssl_cert          = "/opt/airflow/certs/live/${var.airflow_domain}/fullchain.pem"
+    airflow_ssl_key           = "/opt/airflow/certs/live/${var.airflow_domain}/privkey.pem"
+  }
+}
+
+resource "aws_ssm_parameter" "airflow_https" {
+  for_each = local.airflow_https_env
+  name     = "/${var.name_prefix}/config/${each.key}"
+  type     = "String"
+  value    = each.value
+}
+```
+
+```bash
+terraform -chdir=infra/prod apply
+aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" --recursive \
+  --query 'Parameters[].Name' --output text     # deben aparecer las 5 airflow_*
+```
+
+Es la misma regla que el contrato de §3.1, aplicada al `.env`: **la sección que introduce una
+variable de entorno es la que la publica**. El inventario completo está en §13.4.
 
 **Compose — crear el override.** Recién ahora, en la raíz de tu repo **local**, crea
 `docker-compose.prod.https.yml`:
@@ -1646,7 +2068,7 @@ montaje de certificados y el alias interno. Se monta `/data/certs` completo porq
 falle de inmediato si falta una variable; así nunca publica HTTP plano accidentalmente en 443.
 
 **Renovación automática (una vez, EN LA EC2 — pegalo en la sesión `ssh` que ya tenés abierta, o
-mandalo en un solo `ssh ec2-user@$IP '...'` desde tu máquina).** `certbot renew` es no-op si faltan
+mandalo en un solo `$SSH "$SSH_TARGET" '...'` desde tu máquina).** `certbot renew` es no-op si faltan
 >30 días; corre semanal y recarga el cert reiniciando el api-server:
 
 ```bash
@@ -1658,7 +2080,7 @@ echo '0 3 * * 1 root docker run --rm -v /data/certs:/etc/letsencrypt certbot/dns
 > que `docker compose config` se detiene con un mensaje claro si falta alguna. También comprobá que
 > los archivos del certificado son legibles antes de arrancar:
 > ```bash
-> ssh -i ~/.ssh/pyspark_stack ec2-user@"$(terraform -chdir=infra/prod output -raw public_ip)" \
+> $SSH "$SSH_TARGET" \
 >   'cd ~/pyspark_stack &&
 >    grep -E "^AIRFLOW_(DOMAIN|BASE_URL|EXECUTION_API_URL|SSL_CERT|SSL_KEY)=" .env &&
 >    DOMAIN=$(sed -n "s/^AIRFLOW_DOMAIN=//p" .env | tail -1) &&
@@ -1670,23 +2092,22 @@ echo '0 3 * * 1 root docker run --rm -v /data/certs:/etc/letsencrypt certbot/dns
 
 ```bash
 # 1) EN TU MÁQUINA: subir el override creado localmente y desplegarlo junto al compose base.
-IP=$(terraform -chdir=infra/prod output -raw public_ip)
 rsync -avz --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
-  -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@$IP:/home/ec2-user/pyspark_stack/
-ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
-  'cd pyspark_stack &&
-   docker compose -f docker-compose.prod.yml -f docker-compose.prod.https.yml config --quiet &&
-   docker compose -f docker-compose.prod.yml -f docker-compose.prod.https.yml up -d'
+  -e "$RSYNC_SSH" ./ "$SSH_TARGET:$REMOTE_DIR/"
+$SSH "$SSH_TARGET" \
+  "cd $REMOTE_DIR &&
+   docker compose -f $COMPOSE_PROD -f docker-compose.prod.https.yml config --quiet &&
+   docker compose -f $COMPOSE_PROD -f docker-compose.prod.https.yml up -d"
 # El `up -d` reimprime el progreso de cada contenedor a medida que arranca; vas a ver
 # "Container airflow-init Exited" (varias veces, es el redraw del spinner, no 4 corridas
 # distintas) — es intencional: airflow-init es one-shot (migra + crea el admin y sale, ver
 # comentario en el compose más arriba), termina en exit 0 y se queda "Exited" para siempre,
 # a diferencia de apiserver/scheduler/dag-processor/triggerer que quedan "Running". Si en vez
 # de eso el que aparece en "Exited" es **apiserver**, ahí sí mirá los logs:
-#   ssh -i ~/.ssh/pyspark_stack ec2-user@$IP docker logs airflow-apiserver --tail 50
+#   $SSH "$SSH_TARGET" docker logs airflow-apiserver --tail 50
 
 # 2) EN TU MÁQUINA: verificar desde afuera (el SG solo deja pasar 443 a tu IP):
-curl -sSfI "https://$(terraform -chdir=infra/prod output -raw airflow_domain)/" | head -1  # 200/302 desde tu IP
+curl -sSfI "$AIRFLOW_URL/" | head -1     # 200/302 desde tu IP; $AIRFLOW_URL es el output de §5.6
 # Desde OTRA IP debe cortar (timeout): el SG solo deja 443 a var.my_ip_cidr.
 ```
 
@@ -1704,7 +2125,7 @@ Entrás a `https://airflow.midominio.com` con el usuario **admin** y la password
 > **Consecuencia en el túnel SSH (§5.5).** Con el TLS activo ya **no tuneleás Airflow**: entrás por la
 > URL pública. El `-L 8082` del `tunnel_command` deja de aplicar para Airflow (si igual lo abrís,
 > `localhost:8082` sirve HTTPS con el cert del FQDN → warning de nombre; usá la URL pública). El túnel
-> sigue siendo para Grafana/Prometheus/Loki (`-L 9090 -L 3000 -L 9093 -L 3100`, §12.8). Es decir:
+> sigue siendo para Grafana/Prometheus/Loki (`-L 9090 -L 3000 -L 9093 -L 3100`, §12.3). Es decir:
 > la web de Airflow por 443, el resto por túnel.
 
 <details>
@@ -1838,6 +2259,11 @@ resource "aws_s3_bucket_lifecycle_configuration" "datalake" {
   }
 }
 
+# ── Agregá a infra/prod/outputs.tf (§3.1). Los nombres de bucket llevan el account id
+#    adentro: publicarlos evita que cada comando repita `aws sts get-caller-identity`
+#    y que alguien pegue el bucket de otra cuenta. De acá salen $DATALAKE_BUCKET y
+#    $ARTIFACTS_BUCKET, y de ellos prod-env.sh deriva $RAW_URI, $CURATED_URI,
+#    $EMR_ENTRYPOINTS_URI, $EMR_LOGS_URI y $ATHENA_RESULTS_URI.
 output "datalake_bucket"  { value = aws_s3_bucket.datalake.id }
 output "artifacts_bucket" { value = aws_s3_bucket.artifacts.id }
 ```
@@ -1861,13 +2287,49 @@ output "artifacts_bucket" { value = aws_s3_bucket.artifacts.id }
 ```bash
 # comprobá
 terraform -chdir=infra/prod apply          # crea los recursos nuevos de esta sección
-aws s3 ls | grep pyspark-stack             # datalake + artifacts (2 buckets, además del tfstate)
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh   # publica datalake_bucket y artifacts_bucket
+
+# Los dos buckets por su nombre real, sin filtrar por un prefijo asumido:
+aws s3api head-bucket --bucket "$DATALAKE_BUCKET"  && echo "datalake  ok"
+aws s3api head-bucket --bucket "$ARTIFACTS_BUCKET" && echo "artifacts ok"
 ```
+
+**`.env` — esta sección agrega `DATALAKE_BUCKET` y `ARTIFACTS_BUCKET`.** El Compose canónico (§14.1)
+los expone al DAG de §9.4 como `AIRFLOW_VAR_DATALAKE` y `AIRFLOW_VAR_ARTIFACTS`. Como la EC2 no
+puede leer el state de Terraform (§13.3b explica por qué), los valores viajan por Parameter Store.
+Se publican **acá, donde se crean los buckets**, no en una sección posterior:
+
+```hcl
+# infra/prod/s3.tf — agregá al final. Cada variable del .env se publica en la sección
+# que crea su recurso: así el nombre del bucket sale del propio aws_s3_bucket y no de
+# una convención repetida en otro archivo.
+resource "aws_ssm_parameter" "datalake_bucket" {
+  name  = "/${var.name_prefix}/config/datalake_bucket"
+  type  = "String"
+  value = aws_s3_bucket.datalake.id
+}
+
+resource "aws_ssm_parameter" "artifacts_bucket" {
+  name  = "/${var.name_prefix}/config/artifacts_bucket"
+  type  = "String"
+  value = aws_s3_bucket.artifacts.id
+}
+```
+
+```bash
+terraform -chdir=infra/prod apply
+# El último segmento del path es el nombre de la variable en el .env:
+#   /pyspark-stack/config/datalake_bucket  →  DATALAKE_BUCKET
+aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" \
+  --query 'Parameters[].[Name,Value]' --output text
+```
+
+El inventario acumulado del `.env` está en [§13.4](#134-materializar-env).
 
 ### 6.2 IAM: permitir s3a a la EC2 (sin keys)
 
 Se agrega una política al **rol de la EC2** (`aws_iam_role.ec2`, definido antes) para que las tasks
-de Python puro de Airflow (pandas/`s3fs`, §9.0) lean y escriban en S3 con el *instance profile*, sin keys.
+de Python puro de Airflow (pandas/`s3fs`, §9.4) lean y escriban en S3 con el *instance profile*, sin keys.
 Los jobs Spark **no** usan este rol: corren en EMR Serverless con **su propio** rol de ejecución
 (§6.4). El permiso para que Airflow *dispare* esos jobs (`emr-serverless:StartJobRun` + `PassRole`)
 también se agrega al rol de la EC2, en §6.4.
@@ -1918,10 +2380,15 @@ el instance profile de la EC2):
 ```bash
 # comprobá
 terraform -chdir=infra/prod apply   # crea la policy ec2-s3a de arriba — sin esto el s3 cp de abajo da AccessDenied
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-# desde la EC2, para probar el instance profile (no tus keys locales)
-ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP" \
-  'aws s3 cp /etc/hostname "s3://pyspark-stack-datalake-'"$ACCT"'/raw/smoke-iam.txt"'
+
+# El apply acaba de publicar los outputs de los buckets (§6.1): recargá el contexto
+# saltando la caché para que $RAW_URI exista en esta terminal.
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+
+# desde la EC2, para probar el instance profile (no tus keys locales). Comillas dobles:
+# $RAW_URI tiene que resolverse acá y viajar ya expandido.
+$SSH "$SSH_TARGET" \
+  "aws s3 cp /etc/hostname '$RAW_URI/smoke-iam.txt'"
 ```
 
 ### 6.3 Backups: snapshots EBS automáticos (DLM)
@@ -2000,7 +2467,7 @@ Spark **salió de la EC2**. Los jobs corren en **EMR Serverless**: una aplicaci�
 que arranca sola cuando llega un job, escala a cero cuando queda idle y **paga solo mientras
 computa** (vCPU-seg + GB-seg). El *cold start* es ~1–2 min; a cambio, no hay cluster que mantener ni
 instancia siempre encendida. Airflow (en la EC2) dispara cada job con `EmrServerlessStartJobOperator` y lo
-pollea con `EmrServerlessJobSensor` (patrón de DAG en §9.0) — nunca corre `spark-submit` local.
+pollea con `EmrServerlessJobSensor` (patrón de DAG en §9.4) — nunca corre `spark-submit` local.
 
 **A) La aplicación EMR Serverless — `infra/prod/emr.tf` (archivo nuevo):**
 
@@ -2105,7 +2572,7 @@ resource "aws_glue_catalog_database" "analytics" {
 }
 ```
 
-**Config Iceberg del job (mismos `sparkSubmitParameters` de §9.0/§10.2, agregale estas líneas):**
+**Config Iceberg del job (mismos `sparkSubmitParameters` del DAG de §9.4, agregale estas líneas):**
 el runtime `emr-7.5.0` trae el conector Iceberg embebido — no hay que instalar nada, solo
 declarar el catálogo apuntando a Glue:
 
@@ -2119,7 +2586,7 @@ declarar el catálogo apuntando a Glue:
 
 Con eso, el job escribe con `df.writeTo("glue_catalog.pyspark_stack_analytics.ventas").createOrReplace()`
 (primera vez) o `.append()`/`.overwritePartitions()` (corridas siguientes) en vez de
-`df.write.mode("overwrite").parquet(...)` — reemplaza el patrón de escritura de §9.0, no lo suma.
+`df.write.mode("overwrite").parquet(...)` — reemplaza el patrón de escritura de §9.4, no lo suma.
 
 **C) Extensión del rol de la EC2 — `infra/prod/iam.tf` (agregar, junto al rol de la EC2):** permite que
 Airflow (en la EC2) **envíe y consulte** jobs, y que **pase** el rol de ejecución a EMR Serverless. El
@@ -2184,9 +2651,40 @@ resource "aws_iam_role_policy" "ec2_invoke_startstop" {
   policy = data.aws_iam_policy_document.ec2_invoke_startstop.json
 }
 
-# Outputs que consumen los DAGs (los cargás como Airflow Variables o env AIRFLOW_VAR_*, §9.0/§14.1):
+# ── Agregá a infra/prod/outputs.tf (§3.1). Doble consumidor: los DAGs (como Airflow
+#    Variables o env AIRFLOW_VAR_*, §9.4/§14.1) y la línea de comandos, vía
+#    $EMR_APP_ID / $EMR_JOB_ROLE_ARN. Un solo valor, una sola fuente, los dos lados
+#    siempre de acuerdo.
 output "emr_app_id"       { value = aws_emrserverless_application.spark.id }
 output "emr_job_role_arn" { value = aws_iam_role.emr_job.arn }
+output "emr_log_group"    { value = aws_cloudwatch_log_group.emr.name }
+```
+
+**`.env` — esta sección agrega `EMR_APP_ID` y `EMR_JOB_ROLE_ARN`.** Son los dos valores que el DAG
+de §9.4 pasa a `EmrServerlessStartJobOperator`, vía `AIRFLOW_VAR_*` en el Compose (§14.1). El output
+de arriba sirve a tu terminal; este bloque sirve a la EC2, que no tiene state. Mismo valor, mismo
+recurso, dos consumidores:
+
+```hcl
+# infra/prod/emr.tf — agregá al final, junto a los outputs.
+resource "aws_ssm_parameter" "emr_app_id" {
+  name  = "/${var.name_prefix}/config/emr_app_id"
+  type  = "String"
+  value = aws_emrserverless_application.spark.id
+}
+
+resource "aws_ssm_parameter" "emr_job_role_arn" {
+  name  = "/${var.name_prefix}/config/emr_job_role_arn"
+  type  = "String"
+  value = aws_iam_role.emr_job.arn
+}
+```
+
+```bash
+terraform -chdir=infra/prod apply
+aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" \
+  --query 'Parameters[?ends_with(Name, `emr_app_id`) || ends_with(Name, `emr_job_role_arn`)].[Name,Value]' \
+  --output text
 ```
 
 **D) Los entrypoints PySpark (archivos nuevos, copy-paste).** Antes de poder probar el submit del
@@ -2196,7 +2694,7 @@ en el repo (no existe todavía) con estos dos archivos. Son *self-contained*: no
 Spark viaja por-job en `sparkSubmitParameters` — no hay `spark-defaults.conf` local que los toque.
 El CI/CD sincroniza `spark-apps/emr/` a `s3://<artifacts>/emr/` en cada deploy (§11.3) — solo estos
 entrypoints EMR, no el resto de `spark-apps/` (que es dev local) — y desde ahí los lanza el
-`EmrServerlessStartJobOperator` de los DAGs (§10.2).
+`EmrServerlessStartJobOperator` de los DAGs (§9.4).
 
 `spark-apps/emr/customer_etl.py` — ETL de fidelidad de clientes: lee `raw/` (CSV/JSON), calcula el
 segmento de lealtad y escribe Parquet particionado por fecha en `curated/`:
@@ -2205,7 +2703,7 @@ segmento de lealtad y escribe Parquet particionado por fecha en `curated/`:
 """customer_etl para EMR Serverless — S3 in/out, sin HDFS, sin master hardcodeado.
 
 Se sube a s3://<artifacts>/emr/customer_etl.py (deploy, §11.3) y lo ejecuta
-EmrServerlessStartJobOperator (dags/customer_etl_emr_dag.py, §9/§10.2).
+EmrServerlessStartJobOperator (dags/customer_etl_emr_dag.py, §9.4).
 
 Args: 1) datalake_bucket (sin s3://)   2) run_date (YYYY-MM-DD, para particionar).
 """
@@ -2319,38 +2817,45 @@ if __name__ == "__main__":
 mano ahora mismo:
 
 ```bash
-aws s3 sync spark-apps/emr/ "s3://pyspark-stack-artifacts-$(aws sts get-caller-identity --query Account --output text)/emr/"
+# Recargá el contexto: el apply de esta sección publicó emr_app_id y emr_job_role_arn.
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+
+aws s3 sync spark-apps/emr/ "$EMR_ENTRYPOINTS_URI/"
 ```
 
-Los logs del job van a `s3://<artifacts>/emr/logs/`. Un `StartJobRun` (así lo arma por vos el
-operator de Airflow; equivalente CLI para probar a mano):
+Los logs del job van a `$EMR_LOGS_URI`. Un `StartJobRun` (así lo arma por vos el operator de
+Airflow; equivalente CLI para probar a mano). **No tiene un solo valor escrito a mano**: el
+account id, los buckets y los dos identificadores de EMR salen del contexto, así que el bloque se
+copia tal cual:
 
 ```bash
 aws emr-serverless start-job-run \
-  --application-id "$(terraform -chdir=infra/prod output -raw emr_app_id)" \
-  --execution-role-arn "$(terraform -chdir=infra/prod output -raw emr_job_role_arn)" \
-  --job-driver '{
-    "sparkSubmit": {
-      "entryPoint": "s3://pyspark-stack-artifacts-<acct>/emr/customer_etl.py",
-      "entryPointArguments": ["pyspark-stack-datalake-<acct>", "2026-07-16"],
-      "sparkSubmitParameters": "--conf spark.executor.cores=2 --conf spark.executor.memory=4g --conf spark.executor.instances=2"
-    }
-  }' \
-  --configuration-overrides '{
-    "monitoringConfiguration": {
-      "s3MonitoringConfiguration": { "logUri": "s3://pyspark-stack-artifacts-<acct>/emr/logs/" }
-    }
-  }'
+  --application-id "$EMR_APP_ID" \
+  --execution-role-arn "$EMR_JOB_ROLE_ARN" \
+  --job-driver "$(jq -nc \
+      --arg entry "$EMR_ENTRYPOINTS_URI/wordcount.py" \
+      --arg bucket "$DATALAKE_BUCKET" \
+      '{sparkSubmit: {
+          entryPoint: $entry,
+          entryPointArguments: [$bucket, "2026-07-16"],
+          sparkSubmitParameters: "--conf spark.executor.cores=2 --conf spark.executor.memory=4g --conf spark.executor.instances=2"
+        }}')" \
+  --configuration-overrides "$(jq -nc \
+      --arg logs "$EMR_LOGS_URI/" \
+      '{monitoringConfiguration: {s3MonitoringConfiguration: {logUri: $logs}}}')"
 ```
 
-> ⚠️ **`<acct>` es un placeholder, no lo dejes literal.** Reemplazalo por tu Account ID real en
-> **las tres apariciones** (`entryPoint`, `entryPointArguments` y `logUri`) — por ejemplo con
-> `$(aws sts get-caller-identity --query Account --output text)`. Si lo copiás tal cual del bloque
-> de arriba, `logUri` queda como una ruta S3 inválida y el job falla en seco con
-> `Unable to push logs ... Parameter validation failed`, sin llegar a correr una línea de Spark.
-> `customer_etl.py` además necesita datos ya subidos en `raw/customer_etl/` (`orders.csv`,
-> `products.json`, `customers.csv`) dentro del bucket datalake — para el primer smoke test es más
-> simple apuntar el `entryPoint` a `wordcount.py`, que no depende de datos.
+> **Por qué `jq -nc` y no un JSON pegado.** Dentro de comillas simples bash no expande nada, así que
+> un `'{"entryPoint": "$EMR_ENTRYPOINTS_URI/..."}'` viaja con el `$` literal; y con comillas dobles
+> hay que escapar cada `"` del JSON. `jq -nc --arg` arma el JSON con los valores ya resueltos y
+> correctamente escapados. Esta es la razón por la que la versión anterior de esta guía usaba un
+> placeholder `<acct>`: dejarlo sin reemplazar producía un `logUri` inválido y el job moría con
+> `Unable to push logs ... Parameter validation failed` sin ejecutar una línea de Spark. Con el
+> contexto cargado, ese error ya no es posible.
+>
+> El `entryPoint` apunta a `wordcount.py` a propósito: no depende de datos previos, así que sirve
+> como primer smoke test. Para `customer_etl.py` primero tienen que existir `orders.csv`,
+> `products.json` y `customers.csv` en `$RAW_URI/customer_etl/`.
 
 La config de Spark va **por-job** (en `sparkSubmitParameters`), no en un `spark-defaults.conf` local:
 en EMR Serverless no hay una instancia donde montarlo. EMR escribe los logs a S3 (`emr/logs/`) y a CloudWatch
@@ -2386,9 +2891,14 @@ en EMR Serverless no hay una instancia donde montarlo. EMR escribe los logs a S3
 ```bash
 # comprobá
 terraform -chdir=infra/prod apply
-aws emr-serverless list-applications --query 'applications[?name==`pyspark-stack-spark`].[id,state]'
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+
+# La app por su id real, no filtrando por un nombre asumido:
+aws emr-serverless get-application --application-id "$EMR_APP_ID" \
+  --query 'application.{id:applicationId,name:name,state:state}'
+
 # subir los entrypoints y lanzar un job de prueba (ver el start-job-run de arriba)
-aws s3 sync spark-apps/emr/ "s3://pyspark-stack-artifacts-$(aws sts get-caller-identity --query Account --output text)/emr/"
+aws s3 sync spark-apps/emr/ "$EMR_ENTRYPOINTS_URI/"
 ```
 
 ### 6.5 S3 VPC Gateway Endpoint
@@ -2434,7 +2944,11 @@ resource "aws_vpc_endpoint" "s3" {
 ```bash
 # comprobá
 terraform -chdir=infra/prod apply   # crea el gateway endpoint de arriba
-aws ec2 describe-vpc-endpoints --query 'VpcEndpoints[?ServiceName==`com.amazonaws.us-east-1.s3`].[VpcEndpointId,State]'
+# El nombre del servicio lleva la región adentro: con $AWS_REGION esto sigue funcionando
+# si mañana movés el stack a otra región.
+aws ec2 describe-vpc-endpoints \
+  --filters "Name=service-name,Values=com.amazonaws.${AWS_REGION}.s3" \
+  --query 'VpcEndpoints[].[VpcEndpointId,State]' --output table
 ```
 
 ---
@@ -2676,19 +3190,27 @@ resource "aws_lambda_function" "trigger_airflow" {
   # archivos a la vez dispara hasta 50 invocaciones en paralelo, cada una intentando un
   # EmrServerlessStartJobOperator contra un `maximum_capacity` de 16 vCPU (§6.4). Con el límite en 2,
   # SQS deja el resto de los mensajes en cola (no los pierde, no los reintenta antes de tiempo) y se
-  # van procesando de a poco. Complementa —no reemplaza— el `max_active_runs=1` del DAG (§10.4).
+  # van procesando de a poco. Complementa —no reemplaza— el `max_active_runs=1` del DAG (§9.4).
   reserved_concurrent_executions = 2
   environment {
     variables = {
       INSTANCE_ID = aws_instance.pyspark.id
-      DEFAULT_DAG = "customer_etl_emr" # el DAG de producción (EMR Serverless, §10.2) — no el flujo dev local
+      DEFAULT_DAG = "customer_etl_emr" # el DAG de producción (EMR Serverless, §9.4) — no el flujo dev local
     }
   }
-  # DLQ (dead_letter_config) todavía NO va acá: aws_sqs_queue.trigger_airflow_dlq recién se crea
-  # en §18.1, que la engancha agregando este bloque a este mismo resource (sin duplicarlo). Si lo
-  # ponés ahora, el `apply` de esta sección falla con "Reference to undeclared resource".
+  # dead_letter_config todavía NO va acá: la cola aws_sqs_queue.trigger_airflow_dlq se declara
+  # en §18.1, y §18.1 te hace volver a ESTE resource para agregarle el bloque (sin duplicarlo).
+  # Ponerlo ahora rompe el `apply` con "Reference to undeclared resource".
   depends_on = [aws_cloudwatch_log_group.trigger_airflow]
 }
+```
+
+**Terraform — output (agregá a `infra/prod/outputs.tf`)**. Es la sección que crea el recurso, así
+que es la sección que publica su output (regla de §3.1); todos los `lambda invoke` de §7, §8 y §15
+lo consumen como `$LAMBDA_TRIGGER_NAME`:
+
+```hcl
+output "lambda_trigger_name" { value = aws_lambda_function.trigger_airflow.function_name }
 ```
 
 <details>
@@ -2699,7 +3221,7 @@ resource "aws_lambda_function" "trigger_airflow" {
    (*Runtime settings → Edit*; el código define `def handler`, no `lambda_handler`).
    *Configuration → General*: timeout **60 s**.
 2. *Environment variables*: `INSTANCE_ID=<i-xxxxxxxx>` (tu instancia) y
-   `DEFAULT_DAG=customer_etl_emr` (el DAG de producción, §10.2).
+   `DEFAULT_DAG=customer_etl_emr` (el DAG de producción, §9.4).
 3. Al rol de ejecución (*Permissions*) agregale una inline policy JSON con los statements del
    Terraform: `ssm:SendCommand` **solo** sobre el ARN de tu instancia y sobre
    `arn:aws:ssm:us-east-1::document/AWS-RunShellScript`, más
@@ -2713,10 +3235,13 @@ resource "aws_lambda_function" "trigger_airflow" {
 ```bash
 # comprobá
 terraform -chdir=infra/prod apply   # crea la Lambda trigger-airflow + su rol de arriba
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh   # publica lambda_trigger_name
+
 # el agente SSM Online es prerrequisito de toda la §7
-ID=$(terraform -chdir=infra/prod output -raw instance_id)
-aws ssm describe-instance-information --query "InstanceInformationList[?InstanceId=='$ID'].PingStatus"  # ["Online"]
-aws lambda invoke --function-name pyspark-stack-trigger-airflow \
+aws ssm describe-instance-information \
+  --query "InstanceInformationList[?InstanceId=='$INSTANCE_ID'].PingStatus"   # ["Online"]
+
+aws lambda invoke --function-name "$LAMBDA_TRIGGER_NAME" \
   --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_emr"}' /dev/stdout
 # en la EC2: dag_id posicional (en Airflow 3 no existe -d)
 docker compose exec -T airflow-scheduler airflow dags list-runs customer_etl_emr
@@ -2724,9 +3249,9 @@ docker compose exec -T airflow-scheduler airflow dags list-runs customer_etl_emr
 
 > **`dags/customer_etl_emr_dag.py` todavía no existe en la EC2 acá.** El `lambda invoke` de arriba
 > devuelve 200 igual (SSM `SendCommand` es fire-and-forget, §7.1 no confirma el resultado), pero el
-> `list-runs` va a fallar con `DAG customer_etl_emr not found`: el DAG recién se escribe y se sube al
-> servidor en §10.2. Es esperable en esta primera pasada — repetí este mismo chequeo después de §10.2
-> para validarlo de punta a punta.
+> `list-runs` va a fallar con `DAG customer_etl_emr not found`: el DAG recién se escribe en §9.4 y
+> llega a la EC2 con el deploy de §10 u §11. Es esperable en esta primera pasada — repetí este mismo
+> chequeo después de §9.4 para validarlo de punta a punta.
 
 ### 7.2 Disparo por cron (EventBridge Scheduler)
 
@@ -2762,7 +3287,7 @@ resource "aws_scheduler_schedule" "daily_etl" {
   target {
     arn      = aws_lambda_function.trigger_airflow.arn
     role_arn = aws_iam_role.sched_etl.arn
-    input    = jsonencode({ dag = "customer_etl_emr" }) # DAG de producción (§10.2)
+    input    = jsonencode({ dag = "customer_etl_emr" }) # DAG de producción (§9.4)
   }
 }
 ```
@@ -2779,10 +3304,22 @@ resource "aws_scheduler_schedule" "daily_etl" {
 
 </details>
 
+**Terraform — output (agregá a `infra/prod/outputs.tf`)**:
+
+```hcl
+output "schedule_daily_etl_name" { value = aws_scheduler_schedule.daily_etl.name }
+```
+
 ```bash
 # comprobá
 terraform -chdir=infra/prod apply   # crea el schedule + su rol de invocación de arriba
-aws scheduler list-schedules --query 'Schedules[].Name'   # aparece pyspark-stack-daily-etl
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+
+# Los tres schedules del stack (start/stop de §5.4 + este), consultados por su nombre real:
+for S in "$SCHEDULE_START_NAME" "$SCHEDULE_STOP_NAME" "$SCHEDULE_DAILY_ETL_NAME"; do
+  aws scheduler get-schedule --name "$S" \
+    --query '{name:Name,state:State,cron:ScheduleExpression}' --output text
+done
 ```
 
 ### 7.3 Disparo por evento (archivo nuevo en S3, vía SQS)
@@ -2804,9 +3341,9 @@ haga nada.
 resource "aws_sqs_queue" "trigger_events" {
   name                       = "${var.name_prefix}-trigger-events"
   visibility_timeout_seconds = 360
-  # redrive_policy (hacia aws_sqs_queue.trigger_airflow_dlq) todavía NO va acá: esa cola recién
-  # se crea en §18.1, que la engancha agregando este bloque a este mismo resource. Ponerlo ahora
-  # rompe el `apply` de esta sección con "Reference to undeclared resource".
+  # redrive_policy todavía NO va acá: la cola aws_sqs_queue.trigger_airflow_dlq se declara en
+  # §18.1, y §18.1 te hace volver a ESTE resource para agregarle el bloque. Ponerlo ahora rompe
+  # el `apply` de esta sección con "Reference to undeclared resource".
 }
 
 # Permite que S3 (y SOLO el bucket datalake) escriba en la cola.
@@ -2880,16 +3417,28 @@ queda creado pero en estado `Disabled` y los mensajes se acumulan sin que nadie 
 </details>
 
 > Los dos disparadores (cron y evento S3) apuntan al DAG de producción `customer_etl_emr`
-> (§10.2) — no al `customer_etl_dag` dev-local, que usa el Spark/HDFS deshabilitado en prod.
+> (§9.4) — no al `customer_etl_dag` dev-local, que usa el Spark/HDFS deshabilitado en prod.
 > Tal como viene, `customer_etl_emr` tampoco lee `dag_run.conf` (procesa por `{{ ds }}`):
 > dispararlo por evento S3 lo corre, pero ignora el archivo puntual que llegó. Para el camino
 > event-driven real, hacé que lea `{{ dag_run.conf['bucket'] }}` / `{{ dag_run.conf['key'] }}`
-> y los pase como `entryPointArguments` del `EmrServerlessStartJobOperator` (patrón de §9.0);
+> y los pase como `entryPointArguments` del `EmrServerlessStartJobOperator` (patrón de §9.4);
 > el job Spark en EMR Serverless lee entonces justo ese objeto de `s3a://`.
+
+**Terraform — output (agregá a `infra/prod/outputs.tf`)**. La URL de la cola no se puede componer a
+mano de forma confiable (lleva región y account id): publicala y olvidate.
+
+```hcl
+output "sqs_trigger_queue_url" { value = aws_sqs_queue.trigger_events.url }
+output "sqs_trigger_queue_arn" { value = aws_sqs_queue.trigger_events.arn }
+```
 
 ```bash
 # comprobá
 terraform -chdir=infra/prod apply   # crea la cola SQS + la notificación S3 de arriba
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+
+aws sqs get-queue-attributes --queue-url "$SQS_TRIGGER_QUEUE_URL" \
+  --attribute-names ApproximateNumberOfMessages VisibilityTimeout
 ```
 
 > Verificá el retry: apagá la EC2 a mano (`aws ec2 stop-instances`), subí un archivo a `raw/`, y
@@ -2913,27 +3462,54 @@ offline o si el scheduler no está sano.
 
 ### 8.1 Cargar el contexto de producción
 
-**Dónde:** terminal local, desde la raíz del repositorio.
+**Dónde:** terminal local, desde cualquier directorio del repositorio.
 
-**Objetivo:** evitar copiar IDs, IP y nombres manualmente.
+**Objetivo:** evitar copiar IDs, IP y nombres manualmente. A esta altura ya está todo aplicado
+(§4–§7), así que el contrato de §3.1 está completo: un solo comando deja el contexto entero.
 
 ```bash
-export AWS_REGION="${AWS_REGION:-us-east-1}"
-export NAME_PREFIX="${NAME_PREFIX:-pyspark-stack}"
-export INSTANCE_ID="$(terraform -chdir=infra/prod output -raw instance_id)"
-export PUBLIC_IP="$(terraform -chdir=infra/prod output -raw public_ip)"
-export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-export DATALAKE_BUCKET="${NAME_PREFIX}-datalake-${ACCOUNT_ID}"
-export ARTIFACTS_BUCKET="${NAME_PREFIX}-artifacts-${ACCOUNT_ID}"
-export EMR_APP_ID="$(terraform -chdir=infra/prod output -raw emr_app_id)"
+source ./scripts/prod-env.sh
 ```
 
-Comprobá la cuenta antes de continuar:
+Comprobá antes de continuar. `--check` lista lo que quedó definido y marca lo que falta; el
+`get-caller-identity` confirma que estás operando **en la cuenta que creés**:
 
 ```bash
+./scripts/prod-env.sh --check
 aws sts get-caller-identity
-printf 'EC2=%s\nIP=%s\nEMR=%s\n' "$INSTANCE_ID" "$PUBLIC_IP" "$EMR_APP_ID"
 ```
+
+Salida esperada (con §4–§7 aplicadas, todas las obligatorias con valor):
+
+```text
+Contexto de producción  (fuente: terraform · región: us-east-1)
+  lectura fresca del state
+  AWS_REGION               us-east-1
+  NAME_PREFIX              pyspark-stack
+  ACCOUNT_ID               123456789012
+  INSTANCE_ID              i-0a1b2c3d4e5f67890
+  PUBLIC_IP                203.0.113.10
+  DATALAKE_BUCKET          pyspark-stack-datalake-123456789012
+  ARTIFACTS_BUCKET         pyspark-stack-artifacts-123456789012
+  EMR_APP_ID               00fabc123def4gh5
+  SQS_TRIGGER_QUEUE_URL    https://sqs.us-east-1.amazonaws.com/123456789012/pyspark-stack-trigger-events
+  AIRFLOW_URL              https://airflow.midominio.com
+
+  ok: contexto completo
+```
+
+Si alguna aparece como `— (sin definir aún: falta su sección)`, no es un error del script: es que
+todavía no aplicaste la sección que crea ese recurso (`AIRFLOW_URL` → §5.6, `EMR_APP_ID` → §6.4,
+`SQS_TRIGGER_QUEUE_URL` → §7.3). Aplicá esa sección y volvé a sourcear con
+`PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh`.
+
+La segunda línea dice de dónde salió el contexto. Si en vez de `lectura fresca del state` muestra
+`caché de hace Ns`, el contexto puede ser anterior a tu último `apply`: recargá con
+`PROD_ENV_REFRESH=1` antes de operar. Es la única forma de que una variable quede desactualizada.
+
+> **De acá en adelante, todos los comandos de la guía asumen este contexto cargado.** Si abrís una
+> terminal nueva, sourcealo de nuevo. Si un comando falla con `X: unbound variable` o con un
+> argumento vacío, eso es lo primero que hay que revisar — no el comando.
 
 ### 8.2 Smoke test después de un cambio
 
@@ -2967,13 +3543,15 @@ Resultado esperado:
 Ahora validá el host mediante SSM. Esto prueba el mismo canal que usan las automatizaciones:
 
 ```bash
-PARAMS='{"commands":[
-  "cd /home/ec2-user/pyspark_stack",
+# jq arma el JSON con $REMOTE_DIR y $COMPOSE_PROD ya resueltos: dentro de comillas simples
+# bash no expandiría nada, y con dobles habría que escapar cada comilla del JSON.
+PARAMS="$(jq -nc --arg dir "$REMOTE_DIR" --arg compose "$COMPOSE_PROD" '{commands: [
+  "cd \($dir)",
   "mountpoint /data",
-  "docker compose -f docker-compose.prod.yml config --quiet",
-  "docker compose -f docker-compose.prod.yml ps",
-  "docker compose -f docker-compose.prod.yml exec -T airflow-scheduler airflow dags list-import-errors --output json"
-]}'
+  "docker compose -f \($compose) config --quiet",
+  "docker compose -f \($compose) ps",
+  "docker compose -f \($compose) exec -T airflow-scheduler airflow dags list-import-errors --output json"
+]}')"
 
 COMMAND_ID="$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
@@ -3007,7 +3585,7 @@ El comando debe finalizar con `Success`. La lista JSON de errores de importació
 
 ```bash
 aws lambda invoke \
-  --function-name "${NAME_PREFIX}-trigger-airflow" \
+  --function-name "$LAMBDA_TRIGGER_NAME" \
   --cli-binary-format raw-in-base64-out \
   --payload '{"dag":"customer_etl_emr","conf":{"source":"manual-smoke"}}' \
   /tmp/trigger-response.json
@@ -3043,13 +3621,10 @@ aws emr-serverless list-job-runs \
 Para validar el camino por archivo:
 
 ```bash
-SMOKE_KEY="raw/_smoke/$(date -u +%Y%m%dT%H%M%SZ)/_SUCCESS"
-printf 'ready\n' | aws s3 cp - "s3://${DATALAKE_BUCKET}/${SMOKE_KEY}"
+printf 'ready\n' | aws s3 cp - "$RAW_URI/_smoke/$(date -u +%Y%m%dT%H%M%SZ)/_SUCCESS"
 
 aws sqs get-queue-attributes \
-  --queue-url "$(aws sqs get-queue-url \
-    --queue-name "${NAME_PREFIX}-trigger-events" \
-    --query QueueUrl --output text)" \
+  --queue-url "$SQS_TRIGGER_QUEUE_URL" \
   --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
 ```
 
@@ -3075,13 +3650,13 @@ Invocaciones manuales:
 
 ```bash
 aws lambda invoke \
-  --function-name "${NAME_PREFIX}-startstop" \
+  --function-name "$LAMBDA_STARTSTOP_NAME" \
   --cli-binary-format raw-in-base64-out \
   --payload '{"action":"start"}' \
   /dev/stdout
 
 aws lambda invoke \
-  --function-name "${NAME_PREFIX}-trigger-airflow" \
+  --function-name "$LAMBDA_TRIGGER_NAME" \
   --cli-binary-format raw-in-base64-out \
   --payload '{"dag":"customer_etl_emr"}' \
   /dev/stdout
@@ -3109,16 +3684,21 @@ directamente contra producción.
 Para un job EMR fallido:
 
 ```bash
-JOB_ID="<job-id>"
+# El último job corrido, sin copiar un id a mano (el id es lo único que no puede salir
+# de un output: cambia en cada corrida). Para uno puntual: JOB_ID="<job-id>".
+JOB_ID="$(aws emr-serverless list-job-runs --application-id "$EMR_APP_ID" \
+  --query 'sort_by(jobRuns, &createdAt)[-1].id' --output text)"
 
 aws emr-serverless get-job-run \
   --application-id "$EMR_APP_ID" \
   --job-run-id "$JOB_ID" \
   --query 'jobRun.{state:state,detail:stateDetails,driver:jobDriver}'
 
-aws logs tail /aws/emr-serverless \
-  --since 30m \
-  --follow
+# $EMR_LOG_GROUP es el output de §6.4: el nombre lleva el name_prefix adentro.
+aws logs tail "$EMR_LOG_GROUP" --since 30m --follow
+
+# Los logs completos del driver/executors van a S3, no a CloudWatch:
+aws s3 ls "$EMR_LOGS_URI/applications/$EMR_APP_ID/jobs/$JOB_ID/" --recursive | head
 ```
 
 ---
@@ -3278,24 +3858,26 @@ feature branch → CI → revisión → merge a main → OIDC → S3 → SSM →
 #!/usr/bin/env bash
 set -euo pipefail
 
-IP="$(terraform -chdir=infra/prod output -raw public_ip)"
-KEY="${SSH_KEY:-$HOME/.ssh/pyspark_stack}"
+# Un script no hereda el `source` de tu terminal: se lo carga él mismo. Así corre
+# igual desde tu shell, desde cron o desde un Makefile, y siempre con los valores
+# reales del state — nunca con una IP vieja pegada en el archivo.
+source "$(dirname "$0")/prod-env.sh"
 
 rsync -az --delete \
   --exclude __pycache__ \
-  -e "ssh -i $KEY" \
+  -e "$RSYNC_SSH" \
   dags spark-apps \
-  "ec2-user@${IP}:/home/ec2-user/pyspark_stack/"
+  "$SSH_TARGET:$REMOTE_DIR/"
 
-ssh -i "$KEY" "ec2-user@${IP}" \
-  "cd /home/ec2-user/pyspark_stack &&
-   docker compose -f docker-compose.prod.yml exec -T airflow-dag-processor airflow dags reserialize &&
-   docker compose -f docker-compose.prod.yml exec -T airflow-scheduler airflow dags list-import-errors --output json"
+$SSH "$SSH_TARGET" \
+  "cd $REMOTE_DIR &&
+   docker compose -f $COMPOSE_PROD exec -T airflow-dag-processor airflow dags reserialize &&
+   docker compose -f $COMPOSE_PROD exec -T airflow-scheduler airflow dags list-import-errors --output json"
 ```
 
 ```bash
 chmod +x scripts/deploy-dev.sh
-./scripts/deploy-dev.sh          # desde tu máquina; resuelve la IP con terraform output
+./scripts/deploy-dev.sh          # desde tu máquina; resuelve todo solo, sin argumentos
 ```
 
 Usalo solo para desarrollo: sincroniza `dags/` y `spark-apps/` sin pasar por git ni por CI, así que
@@ -3321,9 +3903,9 @@ Si el cambio modificó dependencias o Compose:
 git revert COMMIT_SHA
 git push origin main
 
-ssh -i ~/.ssh/pyspark_stack "ec2-user@${PUBLIC_IP}" \
-  "cd /home/ec2-user/pyspark_stack &&
-   docker compose -f docker-compose.prod.yml up -d --build"
+$SSH "$SSH_TARGET" \
+  "cd $REMOTE_DIR &&
+   docker compose -f $COMPOSE_PROD up -d --build"
 ```
 
 ---
@@ -3520,9 +4102,11 @@ jobs:
 
       - name: Resolver EC2
         id: ec2
+        env:
+          NAME_PREFIX: ${{ vars.NAME_PREFIX }}
         run: |
           ID="$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=pyspark-stack-node" \
+            --filters "Name=tag:Name,Values=${NAME_PREFIX}-node" \
                       "Name=instance-state-name,Values=running" \
             --query 'Reservations[0].Instances[0].InstanceId' \
             --output text)"
@@ -3564,6 +4148,35 @@ jobs:
 
 Si la EC2 está apagada, el código queda publicado en S3. El script de arranque debe sincronizar
 `deploy/dags/` antes de levantar Airflow.
+
+### 11.5 El mismo contrato en CI: sembrar las `vars` desde los outputs
+
+El workflow no puede sourcear `prod-env.sh`: no tiene el state ni credenciales de Terraform, solo
+el rol OIDC. Su equivalente son las **Repository variables** de GitHub — y esas también se cargan
+desde los outputs, nunca a mano. Un valor tipeado en la UI de GitHub es la misma trampa que un
+valor pegado en un comando, con el agravante de que nadie lo ve en un diff.
+
+Corré esto una vez, y de nuevo cada vez que agregues una variable que el CI necesite:
+
+```bash
+source ./scripts/prod-env.sh
+
+# `gh variable set` es idempotente: crea o actualiza. Repetirlo no rompe nada.
+gh variable set NAME_PREFIX      --body "$NAME_PREFIX"
+gh variable set AWS_REGION       --body "$AWS_REGION"
+gh variable set ARTIFACTS_BUCKET --body "$ARTIFACTS_BUCKET"
+gh variable set DATALAKE_BUCKET  --body "$DATALAKE_BUCKET"
+gh variable set EMR_APP_ID       --body "$EMR_APP_ID"
+
+gh variable list      # confirmá que quedaron los valores de ESTA cuenta
+```
+
+`AWS_DEPLOY_ROLE_ARN` sale del mismo lugar en cuanto §11.2 lo publique como output
+(`output "deploy_role_arn"`), con `gh variable set AWS_DEPLOY_ROLE_ARN --body "$DEPLOY_ROLE_ARN"`.
+
+> **Regla derivada de §3.1:** el output es la fuente; `prod-env.sh` lo lleva a tu terminal y
+> `gh variable set` lo lleva a CI. Dos consumidores, un solo origen. Si algún día CI y tu terminal
+> discrepan, el arreglo es volver a correr este bloque, no editar el workflow.
 
 ---
 
@@ -3653,13 +4266,13 @@ regla; el mapping puede cambiar según la versión de Airflow.
 Los puertos locales se enlazan a `127.0.0.1` en Compose. Accedé mediante un túnel:
 
 ```bash
-ssh -i ~/.ssh/pyspark_stack \
+$SSH \
   -L 8082:127.0.0.1:8082 \
   -L 3000:127.0.0.1:3000 \
   -L 9090:127.0.0.1:9090 \
   -L 9093:127.0.0.1:9093 \
   -L 3100:127.0.0.1:3100 \
-  "ec2-user@${PUBLIC_IP}"
+  "$SSH_TARGET"
 ```
 
 Comprobá salud desde otra terminal:
@@ -3715,7 +4328,8 @@ curl -fsS http://127.0.0.1:3100/ready
 **Dónde:** terminal administrativa, una sola vez.
 
 ```bash
-PREFIX="/pyspark-stack"
+source ./scripts/prod-env.sh          # de acá sale $NAME_PREFIX: el path sigue al prefijo real
+PREFIX="/${NAME_PREFIX}"
 
 put_secret() {
   aws ssm put-parameter \
@@ -3762,48 +4376,165 @@ resource "aws_iam_role_policy" "ec2_parameters" {
 Agregá `kms:Decrypt` únicamente si usás una KMS administrada por el cliente, y limitá el recurso a
 esa clave.
 
+### 13.3b Cerrar la configuración no secreta en SSM
+
+Hay un límite estructural en §3.1: **la EC2 no puede sourcear `prod-env.sh`**. No tiene Terraform,
+ni el state, ni permiso para leerlo — y darle ese permiso sería exactamente lo que el diseño evita.
+Pero necesita los mismos valores (`EMR_APP_ID`, los buckets, el ARN del rol del job).
+
+Reconstruirlos por convención dentro de la EC2 (`"pyspark-stack-datalake-${ACCOUNT_ID}"`,
+`list-applications | ?name=='pyspark-stack-spark'`) es volver a hardcodear el prefijo en otro
+lugar: el día que cambies `var.name_prefix`, el `.env` de producción queda apuntando a buckets que
+no existen y Airflow falla en runtime, no en el `apply`.
+
+La solución es la misma idea, con otro transporte: **Terraform escribe los valores en SSM Parameter
+Store**, y la EC2 los lee con el instance profile que ya tiene (§13.3 acaba de conceder
+`GetParametersByPath` sobre `/${var.name_prefix}/*`).
+
+**La mayor parte ya está publicada.** Cada sección fue agregando la suya donde creaba el recurso, que
+es la regla del contrato:
+
+| Ya publicado | Sección | Archivo |
+|---|---|---|
+| `airflow_domain` + las otras 4 de HTTPS | §5.6 | `dns.tf` |
+| `datalake_bucket`, `artifacts_bucket` | §6.1 | `s3.tf` |
+| `emr_app_id`, `emr_job_role_arn` | §6.4 | `emr.tf` |
+
+Acá se cierra el inventario con los dos que no pertenecen a ningún recurso en particular, sino al
+stack entero:
+
+```hcl
+# infra/prod/secrets.tf — los últimos dos valores no secretos del .env.
+# Los de recursos concretos NO van acá: viven en el .tf de su sección (tabla de arriba).
+# Duplicarlos daría dos aws_ssm_parameter con el mismo `name` y el apply fallaría.
+# Nunca pongas secretos acá: para eso está SecureString (§13.2).
+resource "aws_ssm_parameter" "config_aws_region" {
+  name  = "/${var.name_prefix}/config/aws_region"
+  type  = "String"
+  value = var.aws_region
+}
+
+resource "aws_ssm_parameter" "config_name_prefix" {
+  name  = "/${var.name_prefix}/config/name_prefix"
+  type  = "String"
+  value = var.name_prefix
+}
+```
+
+```bash
+terraform -chdir=infra/prod apply
+
+# El inventario completo, tal como lo va a leer load-secrets.sh:
+aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" --recursive \
+  --query 'Parameters[].{name:Name,value:Value}' --output table
+```
+
+**Para agregar una variable nueva al `.env` de acá en adelante:** un `aws_ssm_parameter` en el `.tf`
+de la sección que introduce el valor, con `name = "/${var.name_prefix}/config/<nombre_en_minúsculas>"`.
+Ni este archivo, ni `load-secrets.sh`, ni el Compose cambian — es la misma propiedad de escalabilidad
+que el bucle de `prod-env.sh` (§3.1).
+
 ### 13.4 Materializar `.env`
+
+#### Inventario del `.env` de producción
+
+El `.env` de la EC2 **no se escribe a mano en ningún momento**: se genera desde SSM. Pero cada
+variable entra al inventario en la sección que la necesita por primera vez, no todas juntas acá.
+Esta tabla es el mapa completo — la columna *Se publica en* dice dónde está el copy-paste que la
+agrega:
+
+| Variable | Origen | Se publica en | Quién la consume | Sin ella |
+|---|---|---|---|---|
+| `POSTGRES_USER` · `POSTGRES_DB` · `AIRFLOW_ADMIN_USER` | literal | el propio `load-secrets.sh` (abajo) | Postgres, `airflow-init` | Compose aborta (`:?`, §14.1) |
+| `POSTGRES_PASSWORD` | SSM `SecureString` | §13.2 | Postgres, Airflow | Compose aborta |
+| `AIRFLOW_JWT_SECRET` | SSM `SecureString` | §13.2 | API de Airflow | Compose aborta |
+| `AIRFLOW_ADMIN_PASSWORD` | SSM `SecureString` | §13.2 | `airflow-init` | admin sin password |
+| `GRAFANA_ADMIN_PASSWORD` | SSM `SecureString` | §13.2 | Grafana (§14.2) | Compose aborta con el override |
+| `EMR_APP_ID` · `EMR_JOB_ROLE_ARN` | SSM `String` | §6.4 — `emr.tf` | DAG de §9.4 | Compose aborta |
+| `DATALAKE_BUCKET` · `ARTIFACTS_BUCKET` | SSM `String` | §6.1 — `s3.tf` | DAG y jobs Spark | Compose aborta |
+| `AIRFLOW_DOMAIN` · `AIRFLOW_BASE_URL` · `AIRFLOW_EXECUTION_API_URL` · `AIRFLOW_SSL_CERT` · `AIRFLOW_SSL_KEY` | SSM `String` | §5.6 — `dns.tf` | override HTTPS | Compose aborta con el override |
+| `AWS_REGION` · `NAME_PREFIX` | SSM `String` | §13.3b — `secrets.tf` | scripts en la EC2 | caen a defaults |
+| `AIRFLOW_STATSD_ON` | opcional | — (default `False`) | métricas a StatsD (§14.2) | métricas apagadas |
+
+Dos propiedades que hacen que esto escale sin volver a tocar el script:
+
+- **Cada variable se publica en la sección que la introduce, no acá.** Un secreto nuevo es un
+  `put_secret` más en §13.2; un valor derivado de la infra es un `aws_ssm_parameter` en el `.tf` de
+  su propia sección — como §6.1 con los buckets, §6.4 con EMR y §5.6 con las cinco de HTTPS. Esta
+  tabla solo las inventaría.
+- **El nombre en SSM determina el nombre en el `.env`.** El último segmento del path pasa a
+  mayúsculas: `/pyspark-stack/config/emr_app_id` → `EMR_APP_ID`. No hay una lista que mantener en
+  paralelo, así que no puede desincronizarse.
+
+> **Regla, en una línea:** todo lo que el Compose interpole tiene que estar en esta tabla. Si
+> agregás una variable al Compose y no a SSM, el `:?` de §14.1 corta el arranque con el nombre
+> exacto que falta — falla al levantar, no en la primera corrida del DAG.
+
+#### El script
 
 **Archivo:** `scripts/load-secrets.sh`, ejecutado en la EC2.
 
 ```bash
 #!/usr/bin/env bash
+# scripts/load-secrets.sh — genera el .env de la EC2 desde SSM. Corre EN LA EC2.
+#
+# Es el gemelo de prod-env.sh para el host: mismo principio (una sola fuente, un bucle
+# genérico), distinto transporte (SSM en vez del state, porque acá no hay Terraform).
+# Un parámetro nuevo bajo /<prefix>/ aparece solo en el .env: este script no se toca.
 set -euo pipefail
 umask 077
 
+# El prefijo es el ÚNICO dato que el host necesita saber de antemano. Lo inyecta el
+# user_data (§5.3) o se pasa a mano; el default cubre el caso normal.
 PREFIX="${PARAMETER_PREFIX:-/pyspark-stack}"
-REGION="${AWS_REGION:-us-east-1}"
 
-get_secret() {
-  aws ssm get-parameter \
-    --name "${PREFIX}/$1" \
-    --with-decryption \
-    --query Parameter.Value \
-    --output text \
-    --region "$REGION"
+# La región sale de IMDSv2, no de un default: si movés el stack de región, el host
+# se entera solo. IMDSv2 exige token (§13.1 lo hace obligatorio).
+IMDS_TOKEN="$(curl -sX PUT http://169.254.169.254/latest/api/token \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')"
+export AWS_REGION="${AWS_REGION:-$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/region)}"
+
+# EL MOTOR: todo lo que cuelgue del prefijo se vuelve una línea del .env.
+#   /pyspark-stack/postgres_password      (SecureString, §13.2) → POSTGRES_PASSWORD=...
+#   /pyspark-stack/config/emr_app_id      (String, §13.3b)      → EMR_APP_ID=...
+# Solo el último segmento del path define el nombre, así que secrets y config conviven
+# sin colisionar mientras no repitas basename. --with-decryption resuelve los SecureString.
+render_params() {
+  aws ssm get-parameters-by-path \
+    --path "$PREFIX" --recursive --with-decryption \
+    --query 'Parameters[].[Name,Value]' --output text |
+  while IFS=$'\t' read -r name value; do
+    key="${name##*/}"                       # basename del path
+    key="$(printf '%s' "$key" | tr '[:lower:]-' '[:upper:]_')"
+    printf '%s=%s\n' "$key" "$value"
+  done
 }
 
-ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-EMR_APP_ID="$(aws emr-serverless list-applications \
-  --query "applications[?name=='pyspark-stack-spark'].id | [0]" \
-  --output text \
-  --region "$REGION")"
+PARAMS="$(render_params)"
+[ -n "$PARAMS" ] || { echo "load-secrets: SSM no devolvió nada bajo $PREFIX" >&2; exit 1; }
 
-cat > .env <<EOF
-POSTGRES_USER=airflow
-POSTGRES_DB=airflow
-POSTGRES_PASSWORD=$(get_secret postgres_password)
-AIRFLOW_JWT_SECRET=$(get_secret airflow_jwt_secret)
-AIRFLOW_ADMIN_USER=admin
-AIRFLOW_ADMIN_PASSWORD=$(get_secret airflow_admin_password)
-GRAFANA_ADMIN_PASSWORD=$(get_secret grafana_admin_password)
-EMR_APP_ID=${EMR_APP_ID}
-EMR_JOB_ROLE_ARN=arn:aws:iam::${ACCOUNT_ID}:role/pyspark-stack-emr-serverless-job
-DATALAKE_BUCKET=pyspark-stack-datalake-${ACCOUNT_ID}
-ARTIFACTS_BUCKET=pyspark-stack-artifacts-${ACCOUNT_ID}
-EOF
+{
+  # Constantes que no son ni secreto ni infra: no justifican un parámetro en SSM.
+  echo "POSTGRES_USER=airflow"
+  echo "POSTGRES_DB=airflow"
+  echo "AIRFLOW_ADMIN_USER=admin"
+  echo "$PARAMS"
+} > .env
 
 chmod 600 .env
+
+# Falla temprano y explícito si falta algo que el Compose necesita, en vez de dejar que
+# Airflow arranque con EMR_APP_ID vacío y falle recién en la primera corrida del DAG.
+# AIRFLOW_ADMIN_PASSWORD va en esta lista aunque el Compose no la declare con `:?`: en
+# airflow-init se usa como `$${AIRFLOW_ADMIN_PASSWORD}`, que expande la shell DEL CONTENEDOR,
+# no Compose. Si falta, `airflow users create --password` se queda sin valor y el admin queda
+# sin password, sin un solo error. Este guard es su única defensa.
+for required in POSTGRES_PASSWORD AIRFLOW_JWT_SECRET AIRFLOW_ADMIN_PASSWORD \
+                EMR_APP_ID DATALAKE_BUCKET ARTIFACTS_BUCKET; do
+  grep -q "^${required}=." .env || { echo "load-secrets: falta $required en $PREFIX" >&2; exit 1; }
+done
+echo "load-secrets: .env generado con $(grep -c '=' .env) variables"
 ```
 
 `.env` es un archivo efímero con secretos. Debe estar en `.gitignore`, no copiarse mediante rsync
@@ -3817,13 +4548,12 @@ permisos o —peor— te deja los secretos de producción en un `.env` local. Co
 ```bash
 # EN TU MÁQUINA, desde la raíz del repo
 chmod +x scripts/load-secrets.sh          # rsync -a preserva el bit; sin esto, "Permission denied" en la EC2
-IP=$(terraform -chdir=infra/prod output -raw public_ip)
 rsync -avz --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
-  -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@"$IP":/home/ec2-user/pyspark_stack/
+  -e "$RSYNC_SSH" ./ "$SSH_TARGET:$REMOTE_DIR/"
 
 # comprobá, YA EN LA EC2
-ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP" \
-  'cd pyspark_stack && ./scripts/load-secrets.sh && ls -l .env'
+$SSH "$SSH_TARGET" \
+  "cd $REMOTE_DIR && ./scripts/load-secrets.sh && ls -l .env"
 # .env debe salir con permisos -rw------- (0600) y sin líneas vacías a la derecha del '='
 ```
 
@@ -3871,11 +4601,14 @@ x-airflow-common: &airflow-common
   environment: &airflow-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@airflow-db:5432/${POSTGRES_DB}
+    # `:?` en vez de `${VAR}` pelado: si load-secrets.sh no corrió o falta un parámetro en SSM,
+    # Compose ABORTA con el nombre de la variable. Con la forma pelada sustituye string vacío y
+    # el stack arranca con Postgres sin password y el JWT en blanco, sin un solo error visible.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:?falta en .env, literal de §13.4}:${POSTGRES_PASSWORD:?falta en .env, se publica en §13.2}@airflow-db:5432/${POSTGRES_DB:?falta en .env, literal de §13.4}
     AIRFLOW__CORE__LOAD_EXAMPLES: "False"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
-    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?falta en .env, se publica en §13.2}
     AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
     # StatsD: `statsd-exporter` vive en el override de monitoreo (§14.2). Con STATSD_ON en True y
     # el override apagado, Airflow emite métricas por UDP a un host que no resuelve: UDP no falla,
@@ -3884,10 +4617,12 @@ x-airflow-common: &airflow-common
     AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
     AIRFLOW__METRICS__STATSD_PORT: "9125"
     AIRFLOW__METRICS__STATSD_PREFIX: airflow
-    AIRFLOW_VAR_EMR_APP_ID: ${EMR_APP_ID}
-    AIRFLOW_VAR_EMR_JOB_ROLE_ARN: ${EMR_JOB_ROLE_ARN}
-    AIRFLOW_VAR_DATALAKE: ${DATALAKE_BUCKET}
-    AIRFLOW_VAR_ARTIFACTS: ${ARTIFACTS_BUCKET}
+    # Vacías, el DAG de §9.4 fallaría recién en la primera corrida (ValidationException de EMR),
+    # no al levantar el stack. `:?` adelanta el error al `docker compose config`.
+    AIRFLOW_VAR_EMR_APP_ID: ${EMR_APP_ID:?falta en .env, se publica en §6.4}
+    AIRFLOW_VAR_EMR_JOB_ROLE_ARN: ${EMR_JOB_ROLE_ARN:?falta en .env, se publica en §6.4}
+    AIRFLOW_VAR_DATALAKE: ${DATALAKE_BUCKET:?falta en .env, se publica en §6.1}
+    AIRFLOW_VAR_ARTIFACTS: ${ARTIFACTS_BUCKET:?falta en .env, se publica en §6.1}
   volumes:
     - ./dags:/opt/airflow/dags:ro
   restart: unless-stopped
@@ -3916,9 +4651,9 @@ services:
     restart: unless-stopped
     <<: *common-logging
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?falta en .env, literal de §13.4}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?falta en .env, se publica en §13.2}
+      POSTGRES_DB: ${POSTGRES_DB:?falta en .env, literal de §13.4}
     volumes:
       - /data/postgres:/var/lib/postgresql/data
     healthcheck:
@@ -4004,12 +4739,14 @@ el resto, **en la EC2**:
 
 ```bash
 # ─── EN TU MÁQUINA ───────────────────────────────────────────────────────────
-IP=$(terraform -chdir=infra/prod output -raw public_ip)
+source ./scripts/prod-env.sh
 rsync -avz --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
-  -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@"$IP":/home/ec2-user/pyspark_stack/
+  -e "$RSYNC_SSH" ./ "$SSH_TARGET:$REMOTE_DIR/"
 
 # ─── EN LA EC2 ───────────────────────────────────────────────────────────────
-ssh -i ~/.ssh/pyspark_stack ec2-user@"$IP"
+# Este ssh abre una sesión interactiva: los comandos de abajo se tipean YA DENTRO
+# de la EC2, donde $REMOTE_DIR y $COMPOSE_PROD no existen (viven en tu máquina).
+$SSH "$SSH_TARGET"
 cd pyspark_stack
 ./scripts/load-secrets.sh                                   # regenera .env desde SSM (§13.4)
 docker compose -f docker-compose.prod.yml config --quiet    # falla acá si falta alguna variable
@@ -4028,6 +4765,27 @@ viejas de pip.
 > apuntan a rutas inexistentes.
 
 **Archivo:** `docker-compose.prod.monitoring.yml`.
+
+**`.env` — este override agrega dos variables** (inventario en [§13.4](#134-materializar-env)):
+
+- `GRAFANA_ADMIN_PASSWORD`, declarada con `:?`: sin ella el `config` aborta en vez de dejar Grafana
+  con la password por defecto. Ya la creaste en §13.2 (`put_secret grafana_admin_password`), así que
+  `load-secrets.sh` la trae sola — no hay nada que agregar acá.
+- `AIRFLOW_STATSD_ON`, la única opcional del stack: su default es `False` (§14.1). Airflow solo
+  emite métricas cuando este override está activo, porque `statsd-exporter` vive acá. Activala en el
+  mismo momento en que aplicás el override:
+
+```bash
+# EN LA EC2, después de load-secrets.sh: el .env se regenera de cero en cada corrida,
+# así que esta línea va DESPUÉS, no antes (si no, la próxima regeneración la borra).
+echo 'AIRFLOW_STATSD_ON=True' >> .env
+docker compose -f docker-compose.prod.yml -f docker-compose.prod.monitoring.yml config --quiet
+```
+
+> Si preferís que sobreviva sola a cada `load-secrets.sh`, publicala como parámetro en vez de
+> agregarla a mano — un `aws_ssm_parameter` con
+> `name = "/${var.name_prefix}/config/airflow_statsd_on"` y `value = "True"`, siguiendo la regla de
+> §13.3b. Es lo recomendable en cuanto el monitoreo deje de ser roadmap.
 
 El ancla `&common-logging` se redeclara acá: las anclas YAML se resuelven **por archivo**, no se
 heredan del `-f` anterior. Referenciar la del archivo base daría `undefined alias` al hacer `config`.
@@ -4082,7 +4840,7 @@ services:
     <<: *common-logging
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?falta en .env, se publica en §13.2}
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -4176,13 +4934,16 @@ security group.
 ### Paso 1 — Validar localmente
 
 ```bash
+source ./scripts/prod-env.sh
+./scripts/prod-env.sh --check      # el runbook arranca confirmando CONTRA QUÉ vas a aplicar
 aws sts get-caller-identity
+
 terraform -chdir=infra/prod fmt -check -recursive
 terraform -chdir=infra/prod init
 terraform -chdir=infra/prod validate
 terraform -chdir=infra/prod plan -out=tfplan
 terraform -chdir=infra/prod show tfplan
-docker compose -f docker-compose.prod.yml config --quiet
+docker compose -f "$COMPOSE_PROD" config --quiet
 pytest -q
 ```
 
@@ -4192,6 +4953,10 @@ No apliques si el plan reemplaza la EC2, EBS o buckets sin que ese sea el objeti
 
 ```bash
 terraform -chdir=infra/prod apply tfplan
+
+# El apply pudo cambiar la IP, recrear la instancia o publicar outputs nuevos:
+# recargá el contexto ANTES de los pasos 3-5, o vas a operar contra el host viejo.
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
 ```
 
 ### Paso 3 — Preparar el host
@@ -4199,7 +4964,7 @@ terraform -chdir=infra/prod apply tfplan
 ```bash
 aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
 
-ssh -i ~/.ssh/pyspark_stack "ec2-user@${PUBLIC_IP}" \
+$SSH "$SSH_TARGET" \
   "cloud-init status --wait &&
    mountpoint /data &&
    systemctl is-active docker"
@@ -4212,19 +4977,19 @@ rsync -az \
   --exclude .git \
   --exclude .env \
   --exclude infra \
-  -e "ssh -i ~/.ssh/pyspark_stack" \
-  ./ "ec2-user@${PUBLIC_IP}:/home/ec2-user/pyspark_stack/"
+  -e "$RSYNC_SSH" \
+  ./ "$SSH_TARGET:$REMOTE_DIR/"
 
-ssh -i ~/.ssh/pyspark_stack "ec2-user@${PUBLIC_IP}" \
-  "cd /home/ec2-user/pyspark_stack &&
+$SSH "$SSH_TARGET" \
+  "cd $REMOTE_DIR &&
    ./scripts/load-secrets.sh &&
-   docker compose -f docker-compose.prod.yml up -d --build"
+   docker compose -f $COMPOSE_PROD up -d --build"
 ```
 
 ### Paso 5 — Publicar entrypoints EMR
 
 ```bash
-aws s3 sync spark-apps/emr/ "s3://${ARTIFACTS_BUCKET}/emr/" --delete
+aws s3 sync spark-apps/emr/ "$EMR_ENTRYPOINTS_URI/" --delete
 ```
 
 ### Paso 6 — Validar
@@ -4273,10 +5038,41 @@ resource "aws_athena_workgroup" "analytics" {
 }
 ```
 
+**Terraform — outputs (agregá a `infra/prod/outputs.tf`)**. El nombre de la base de Glue no es el
+`name_prefix` tal cual (Glue no acepta guiones, §6.4 lo convierte con `replace`): justamente por eso
+tiene que salir de un output y no reescribirse a mano en cada consulta.
+
+```hcl
+output "athena_workgroup" { value = aws_athena_workgroup.analytics.name }
+output "glue_database"    { value = aws_glue_catalog_database.analytics.name }
+```
+
 El corte de 10 GiB evita una consulta accidentalmente costosa. Ajusta el valor al tamaño real de
 las tablas.
 
 ### 16.2 Consultas operativas
+
+Las consultas de abajo se muestran en SQL plano por legibilidad. Para ejecutarlas sin escribir el
+workgroup ni la base a mano, usá este runner — el `--query-string` recibe la base ya interpolada:
+
+```bash
+source ./scripts/prod-env.sh
+
+athena() {   # uso: athena "SELECT ... FROM ${GLUE_DATABASE}.customer ..."
+  local qid
+  qid="$(aws athena start-query-execution \
+    --work-group "$ATHENA_WORKGROUP" \
+    --query-execution-context "Database=$GLUE_DATABASE" \
+    --query-string "$1" \
+    --query QueryExecutionId --output text)"
+  aws athena get-query-execution --query-execution-id "$qid" \
+    --query 'QueryExecution.Status.State' --output text
+  aws athena get-query-results --query-execution-id "$qid" --output table
+}
+
+athena "SELECT dt, count(*) AS filas FROM ${GLUE_DATABASE}.customer
+        WHERE dt >= current_date - interval '7' day GROUP BY dt ORDER BY dt DESC"
+```
 
 ```sql
 SELECT dt, count(*) AS filas
@@ -4377,14 +5173,72 @@ No existe una DLQ universal:
 | EventBridge Scheduler → Lambda | `dead_letter_config` y `retry_policy` del schedule |
 | Invocación Lambda asíncrona directa | DLQ o destination de Lambda |
 
-**Camino S3 → SQS → Lambda.** `aws_sqs_queue.trigger_events` y su `redrive_policy` hacia
-`trigger_dlq` **ya quedaron creados en §7.3**; no los vuelvas a declarar acá o el `apply` falla con
-`Duplicate resource`. Verificá que la cola tenga el redrive apuntando a la DLQ:
+**Camino S3 → SQS → Lambda.** La cola primaria `aws_sqs_queue.trigger_events` ya existe (§7.3), pero
+**su DLQ no**: §7.1 y §7.3 dejaron anotado que se creaba acá, y acá es donde se crea. Son tres piezas
+que van juntas — la cola, el `redrive_policy` que la engancha, y el permiso para que la Lambda pueda
+escribirle su propia DLQ de invocación asíncrona:
+
+```hcl
+# infra/prod/governance.tf (archivo nuevo)
+resource "aws_sqs_queue" "trigger_airflow_dlq" {
+  name                      = "${var.name_prefix}-trigger-airflow-dlq"
+  message_retention_seconds = 1209600   # 14 días, el máximo
+}
+```
+
+Ahora **agregá** el `redrive_policy` dentro del `aws_sqs_queue.trigger_events` de §7.3 (no lo
+declares de nuevo: es el mismo recurso, con un bloque más). `maxReceiveCount = 5` da margen a los
+reintentos por EC2 apagada antes de dar el mensaje por muerto:
+
+```hcl
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.trigger_airflow_dlq.arn
+    maxReceiveCount     = 5
+  })
+```
+
+Y el `dead_letter_config` dentro del `aws_lambda_function.trigger_airflow` de §7.1, que cubre el otro
+camino: la invocación **asíncrona** del cron, que no pasa por SQS y por lo tanto no tiene redrive:
+
+```hcl
+  dead_letter_config {
+    target_arn = aws_sqs_queue.trigger_airflow_dlq.arn
+  }
+```
+
+Sin este último permiso la Lambda no puede depositar el evento fallido y la DLQ queda vacía aunque
+todo falle — el mismo error silencioso que la DLQ del Scheduler más abajo:
+
+```hcl
+resource "aws_iam_role_policy" "trigger_airflow_dlq" {
+  name = "trigger-airflow-dlq"
+  role = aws_iam_role.trigger_airflow.id      # el rol de §7.1
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "sqs:SendMessage"
+      Resource = aws_sqs_queue.trigger_airflow_dlq.arn
+    }]
+  })
+}
+
+output "sqs_trigger_dlq_url" { value = aws_sqs_queue.trigger_airflow_dlq.url }
+```
 
 ```bash
+terraform -chdir=infra/prod apply
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+
+# El redrive tiene que aparecer en la cola primaria, apuntando a la DLQ:
 aws sqs get-queue-attributes \
-  --queue-url "$(aws sqs get-queue-url --queue-name pyspark-stack-trigger-events --query QueueUrl --output text)" \
+  --queue-url "$SQS_TRIGGER_QUEUE_URL" \
   --attribute-names RedrivePolicy
+
+# Y la DLQ debe existir y estar vacía en régimen normal:
+aws sqs get-queue-attributes \
+  --queue-url "$SQS_TRIGGER_DLQ_URL" \
+  --attribute-names ApproximateNumberOfMessages
 ```
 
 **Camino EventBridge Scheduler → Lambda.** Esta DLQ sí es nueva: los schedules de §5.4 y §7.2 no la
@@ -4427,10 +5281,20 @@ Con la cola ya declarada, agregá este bloque dentro del `target` de cada `aws_s
   }
 ```
 
+**Terraform — output (agregá a `infra/prod/outputs.tf`)**:
+
+```hcl
+output "sqs_scheduler_dlq_url" { value = aws_sqs_queue.scheduler_dlq.url }
+```
+
 ```bash
 # comprobá
 terraform -chdir=infra/prod apply
-aws sqs get-queue-url --queue-name pyspark-stack-scheduler-dlq   # debe existir
+PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+
+# Si hay mensajes acá, un schedule falló y el evento quedó guardado (14 días):
+aws sqs get-queue-attributes --queue-url "$SQS_SCHEDULER_DLQ_URL" \
+  --attribute-names ApproximateNumberOfMessages
 ```
 
 ### 18.2 Alarmas
@@ -4447,14 +5311,12 @@ Como mínimo:
 ### 18.3 Budget
 
 ```hcl
+# variable "alert_email" NO va acá: ya está declarada en variables.tf (§5.1), con default "".
+# Redeclararla aborta el `terraform validate` con "Duplicate variable declaration". Lo que sí
+# falta es el presupuesto, que no tiene default a propósito: obliga a elegir un número.
 variable "monthly_budget_usd" {
   type        = number
   description = "Presupuesto mensual de producción"
-}
-
-variable "alert_email" {
-  type        = string
-  description = "Destino de alertas operativas y de costo"
 }
 
 resource "aws_budgets_budget" "monthly" {

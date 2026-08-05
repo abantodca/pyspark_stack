@@ -18,7 +18,7 @@ puntual o para aprender AWS tocando cada servicio. A cambio:
 - **No hay estado ni reproducibilidad.** No existe `terraform plan`/`apply`/`destroy`: recrear todo
   en otra cuenta o región significa repetir cada clic.
 - **Teardown manual.** Para no dejar cargos colgando hay que borrar cada recurso a mano en orden
-  inverso (checklist en §15.3). No hay un botón «borrar todo».
+  inverso (checklist en §17.3). No hay un botón «borrar todo».
 - **Drift silencioso.** Un cambio a mano no queda versionado; a los tres meses nadie sabe por qué el
   security group tiene esa regla.
 - **No mezcles las dos vías** para el mismo recurso. Si algo lo creaste acá y después querés pasarlo
@@ -29,6 +29,7 @@ puntual o para aprender AWS tocando cada servicio. A cambio:
 1. [Panorama y orden de creación](#1-panorama-y-orden-de-creación)
 2. [Costo](#2-costo)
 3. [Prerrequisitos](#3-prerrequisitos)
+   - 3.1 [Contexto para los comandos: modo `discover`](#31-contexto-para-los-comandos-modo-discover)
 4. [Núcleo: EC2 con Docker](#4-núcleo-ec2-con-docker)
    - 4.1 [Security group (SSH + web de Airflow a tu IP)](#41-security-group)
    - 4.2 [Key pair + rol IAM de la EC2](#42-key-pair--rol-iam-de-la-ec2)
@@ -106,7 +107,7 @@ que sigue la guía, y por qué:
 | 10 | Lambda trigger-airflow + schedules + evento S3 (§6) | EC2, bucket datalake |
 | 11 | Secretos en SSM + permisos EC2 (§7) | rol EC2 |
 | 12 | OIDC + rol de GitHub Actions (§8) | bucket artifacts |
-| 13 | (En la EC2) subir repo, generar `.env`, `docker compose up` (§15) | todo lo anterior |
+| 13 | (En la EC2) subir repo, generar `.env`, `docker compose up` (§11.1) | todo lo anterior |
 
 > Los nombres son fijos en toda la guía: región **`us-east-1`**, prefijo **`pyspark-stack`**,
 > `<acct>` = tu **Account ID** (arriba a la derecha en la consola, o *IAM → Dashboard*). Donde veas
@@ -179,6 +180,42 @@ dags/                       # + los DAGs de producción EMR (§12)
 .github/workflows/          # ci.yml + deploy.yml (§8)
 ```
 
+### 3.1 Contexto para los comandos: modo `discover`
+
+Los pasos de **creación** de esta guía son clics en la consola, así que ahí los nombres literales
+son lo correcto: es lo que vas a tipear en un formulario. Pero los bloques de **verificación y
+operación** son CLI, y ahí valen las mismas razones que en la
+[guía 02 §3.1](02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-leelo-antes-de-copiar-cualquier-comando):
+una IP o un account id pegado a mano caduca o apunta a la cuenta equivocada.
+
+Acá no hay state de Terraform del cual leer, así que `scripts/prod-env.sh` corre en su segundo
+modo: **`discover`**, que descubre los mismos valores con el AWS CLI (por tag `Name`, por nombre de
+aplicación EMR y por convención de bucket) y exporta **exactamente las mismas variables**.
+
+Es el mismo archivo en las dos guías: **copialo de la
+[guía 02 §5.5, Paso 0c](02-produccion-aws-terraform.md#55-desplegar-subir-código-y-túnel-ssh)**
+(allá se crea junto al `terraform apply` que lo alimenta; acá lo alimenta el AWS CLI). No hace falta
+que leas nada más de esa sección: el archivo es autocontenido y `chmod +x scripts/prod-env.sh` lo
+deja listo.
+
+```bash
+export PROD_ENV_SOURCE=discover
+source ./scripts/prod-env.sh
+./scripts/prod-env.sh --check     # confirmá qué encontró antes de operar
+```
+
+**Cuándo sourcearlo.** `discover` descubre lo que ya existe, así que ahora mismo solo encontraría el
+account id y la región: todavía no creaste nada. La primera vez que sirve de verdad es en
+[§4.3](#43-ec2--ebs--user_data--elastic-ip), en cuanto la EC2 esté corriendo. A partir de ahí,
+volvé a sourcearlo **cada vez que crees recursos nuevos** en la consola, para que los descubra —
+por eso los bloques de verificación de las secciones siguientes lo repiten.
+
+Si `--check` muestra `INSTANCE_ID` vacío después de §4.3, revisá que la EC2 tenga el tag
+`Name=pyspark-stack-node`: el modo `discover` busca por ese tag.
+
+> Si cambiaste el prefijo al crear los recursos, exportá `NAME_PREFIX` antes de sourcear:
+> `NAME_PREFIX=mi-stack PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh`.
+
 ---
 
 ## 4. Núcleo: EC2 con Docker
@@ -215,17 +252,23 @@ Consola: **VPC → Security groups → Create security group**.
 > actualiza el `/32` de las reglas 22 y 443 **sin tocar sus IDs** (usa `modify-security-group-rules`,
 > idempotente), y salta el 443 si no lo expusiste.
 >
+> ⚠️ **Es mantenimiento posterior, no un paso de esta sección.** Necesita `scripts/prod-env.sh`, que
+> se copia en §3.1, y tiene sentido recién con el stack desplegado. Leelo ahora para saber que
+> existe; volvé cuando tu IP cambie.
+>
 > ```bash
 > #!/usr/bin/env bash
 > # scripts/update-sg-ip.sh — pone tu IP de cliente actual en las reglas 22 y 443 del SG.
 > set -euo pipefail
-> REGION="${AWS_REGION:-us-east-1}"
-> SG_NAME="pyspark-stack-sg"
+>
+> # El modo discover resuelve $SECURITY_GROUP_ID y $AWS_REGION: no hay que repetir el
+> # nombre del SG acá ni asumir la región.
+> PROD_ENV_SOURCE=discover source "$(dirname "$0")/prod-env.sh"
+>
 > MYIP="$(curl -s https://checkip.amazonaws.com)/32"
-> echo "IP actual: $MYIP"
-> SG_ID=$(aws ec2 describe-security-groups --region "$REGION" \
->   --filters "Name=group-name,Values=$SG_NAME" \
->   --query 'SecurityGroups[0].GroupId' --output text)
+> echo "IP actual: $MYIP  ·  SG: $SECURITY_GROUP_ID"
+> SG_ID="$SECURITY_GROUP_ID"
+> REGION="$AWS_REGION"
 > for PORT in 22 443; do
 >   RULE_ID=$(aws ec2 describe-security-group-rules --region "$REGION" \
 >     --filters "Name=group-id,Values=$SG_ID" \
@@ -345,12 +388,23 @@ NVMe”, porque el orden puede cambiar entre reinicios.
 **Elastic IP** (sin ella, cada stop/start del ahorro cambiaría la IP pública y romperían los túneles)
 — Consola: **EC2 → Elastic IPs → Allocate Elastic IP address** → **Allocate**. Luego, con la EIP
 seleccionada: **Actions → Associate Elastic IP address** → *Instance* `pyspark-stack-node` →
-**Associate**. Anotá la IP: es tu `IP` para todos los `ssh`/`rsync` de la guía.
+**Associate**.
+
+**No anotes la IP.** Con la EC2 ya creada y etiquetada, el modo `discover` de §3.1 la descubre solo:
+es el primer momento de la guía en que el contexto sirve de verdad. De acá en adelante, todos los
+`ssh` y `rsync` salen de `$SSH_TARGET`, no de una IP copiada a mano —que además cambiaría si algún
+día reasignás la EIP—:
+
+```bash
+PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh
+./scripts/prod-env.sh --check     # INSTANCE_ID y PUBLIC_IP ya deben tener valor
+```
 
 > Verificá (CLI, opcional): la instancia queda `running` con IMDSv2 `required` y el agente SSM
 > `Online` a los pocos minutos:
 > ```bash
-> aws ec2 describe-instances --filters Name=tag:Name,Values=pyspark-stack-node \
+> PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh   # encuentra la EC2 por su tag Name
+> aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
 >   --query 'Reservations[].Instances[].{estado:State.Name,imdsv2:MetadataOptions.HttpTokens}'
 > ```
 
@@ -442,7 +496,18 @@ def handler(event, context):
 
 **Paso 3 — Permisos (IAM inline policy en el rol de ejecución de la Lambda).** *Configuration →
 Permissions* → clic en el **Role name** (te lleva a IAM) → **Add permissions → Create inline policy →
-JSON** → pegá (reemplazá `<acct>` y el `i-xxxx` de tu instancia):
+JSON** → pegá el JSON de abajo, reemplazando `<acct>` por tu Account ID y `i-xxxx` por el id de tu
+instancia.
+
+Un formulario de la consola necesita los ARNs escritos, así que acá el reemplazo es inevitable —
+pero no hace falta que los busques a mano. Este comando imprime las dos líneas ya resueltas, listas
+para copiar:
+
+```bash
+PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh
+printf 'instancia: arn:aws:ec2:%s:%s:instance/%s\ndocumento: arn:aws:ssm:%s::document/AWS-RunShellScript\n' \
+  "$AWS_REGION" "$ACCOUNT_ID" "$INSTANCE_ID" "$AWS_REGION"
+```
 
 ```json
 {
@@ -617,23 +682,27 @@ networks:
 ```
 
 ```bash
-IP="<tu-elastic-ip>"
-INSTANCE_ID="<i-xxxxxxxx>"
+# La EC2 ya existe y está tagueada: `discover` encuentra su id y su IP sola.
+# Nada de "<tu-elastic-ip>" pegado a mano — es el placeholder que más veces se
+# queda sin reemplazar, y el rsync termina intentando conectar a un host inexistente.
+export PROD_ENV_SOURCE=discover
+source ./scripts/prod-env.sh
+./scripts/prod-env.sh --check
 
 aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
 
 # Subir el proyecto (docker-compose.prod.yml creado arriba incluido).
 # --exclude '.env': el .env local (dev) no debe pisar el de prod,
 rsync -avz --exclude '.git' --exclude '.env' --exclude '__pycache__' \
-  -e "ssh -i ~/.ssh/pyspark_stack" ./ ec2-user@$IP:/home/ec2-user/pyspark_stack/
+  -e "$RSYNC_SSH" ./ "$SSH_TARGET:$REMOTE_DIR/"
 
-ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
+$SSH "$SSH_TARGET" \
   'cloud-init status --wait && docker compose version && df -h /data | tail -1'
 
-ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
-  'cd pyspark_stack && docker compose -f docker-compose.prod.yml up -d --build'
+$SSH "$SSH_TARGET" \
+  "cd $REMOTE_DIR && docker compose -f $COMPOSE_PROD up -d --build"
 
-ssh -i ~/.ssh/pyspark_stack -L 8082:localhost:8082 ec2-user@$IP
+$SSH -L 8082:localhost:8082 "$SSH_TARGET"
 ```
 
 UIs (con el túnel abierto): Airflow `localhost:8082` — o, si exponés la web por HTTPS (§4.6), directo
@@ -644,7 +713,7 @@ prod: la exploración interactiva queda para el stack local (`docs/01`).
 > Esto es el núcleo, no el final: la infra se arma incrementalmente. Seguí con S3 (§5), orquestación
 > (§6), secretos (§7) y monitoreo (§9); cada una te da una versión más completa de
 > `docker-compose.prod.yml` para reemplazar el creado arriba (Spark/HDFS/Jupyter nunca estuvieron en
-> el archivo). El arranque **real** de producción es el runbook de §15:
+> el archivo). El arranque **real** de producción es §11.1:
 > `./scripts/load-secrets.sh && docker compose -f docker-compose.prod.yml up -d`.
 
 > **Sin CLI en tu máquina** podés hacer el rsync igual (solo necesitás `ssh`/`rsync`, que no son AWS
@@ -707,7 +776,7 @@ DOMAIN="airflow.midominio.com"
 EMAIL="tu@email.com"
 dig +short "$DOMAIN"     # debe devolver la EIP (el A record ya está)
 
-ssh -i ~/.ssh/pyspark_stack ec2-user@$IP "
+$SSH "$SSH_TARGET" "
   sudo docker run --rm -v /data/certs:/etc/letsencrypt certbot/dns-route53 certonly \
     --dns-route53 -d '$DOMAIN' -m '$EMAIL' --agree-tos -n &&
   sudo chmod -R g+rX /data/certs   # el api-server corre con gid 0 (grupo root): así lee el privkey
@@ -718,8 +787,24 @@ El cert queda en `/data/certs/live/$DOMAIN/{fullchain.pem,privkey.pem}` (en el E
 stop/start).
 
 **Paso 4 — Editá el `airflow-apiserver` de tu `docker-compose.prod.yml` directamente** (es un solo
-archivo, no hay nada que fusionar). El FQDN viaja como `AIRFLOW_DOMAIN` (no es secreto). Agregalo al
-`.env` en la EC2 (`echo "AIRFLOW_DOMAIN=airflow.midominio.com" >> .env`) y reemplazá el bloque
+archivo, no hay nada que fusionar).
+
+**`.env` — esta sección agrega `AIRFLOW_DOMAIN`.** El FQDN no es secreto, pero sí tiene que
+sobrevivir: `load-secrets.sh` (§7) genera el `.env` **desde cero** en cada corrida, así que un
+`echo ... >> .env` a mano se pierde en el próximo deploy y el `airflow-apiserver` queda sin TLS.
+Publicalo en Parameter Store, que es la fuente que ese script lee:
+
+```bash
+PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh
+aws ssm put-parameter --name "/${NAME_PREFIX}/config/airflow_domain" \
+  --type String --value "airflow.midominio.com" --overwrite
+```
+
+Para probar ahora mismo, antes de tener `load-secrets.sh`, alcanza con
+`echo "AIRFLOW_DOMAIN=airflow.midominio.com" >> .env` en la EC2 — pero el `put-parameter` de arriba
+es el que lo hace durable.
+
+Reemplazá el bloque
 `airflow-apiserver` por este — el `<<: *airflow-common-env` es el anchor **anidado** que ya tenés
 dentro de `x-airflow-common` (§11.1): permite sumar las 3 claves de TLS sin repetir el resto del
 environment a mano:
@@ -818,6 +903,23 @@ nombre del bucket en los dos ARN):
 
 > Verificá (CLI): `aws s3 ls | grep pyspark-stack` → los 2 buckets.
 
+**`.env` — esta sección agrega `DATALAKE_BUCKET` y `ARTIFACTS_BUCKET`.** El `.env` de la EC2 se
+genera desde Parameter Store (§7), así que cada variable se publica en la sección que crea su
+recurso, no todas juntas al final. Publicá estas dos ahora:
+
+```bash
+PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh
+
+aws ssm put-parameter --name "/${NAME_PREFIX}/config/datalake_bucket" \
+  --type String --value "$DATALAKE_BUCKET" --overwrite
+aws ssm put-parameter --name "/${NAME_PREFIX}/config/artifacts_bucket" \
+  --type String --value "$ARTIFACTS_BUCKET" --overwrite
+```
+
+Sin CLI: **Systems Manager → Parameter Store → Create parameter**, *Type* **String**, con esos dos
+nombres y el nombre real de cada bucket como valor. El inventario completo del `.env` está en la
+[guía 02 §13.4](02-produccion-aws-terraform.md#134-materializar-env).
+
 ### 5.2 IAM: permitir S3 a la EC2
 
 Para que las tasks Python puro de Airflow (pandas/`s3fs`) lean/escriban S3 con el instance profile,
@@ -849,8 +951,8 @@ contenedores toman las credenciales al instante.
 
 > Verificá (desde la EC2, para probar el instance profile y no tus keys locales):
 > ```bash
-> ssh -i ~/.ssh/pyspark_stack ec2-user@$IP \
->   'aws s3 cp /etc/hostname s3://pyspark-stack-datalake-<acct>/raw/smoke-iam.txt'
+> PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh   # $RAW_URI ya trae tu account id
+> $SSH "$SSH_TARGET" "aws s3 cp /etc/hostname '$RAW_URI/smoke-iam.txt'"
 > ```
 
 ### 5.3 Backups: snapshots EBS automáticos (DLM)
@@ -949,7 +1051,9 @@ launch application** (o **Applications → Create application**).
   - **Maximum capacity**: **16 vCPU / 64 GB** (techo de gasto).
   - **Network connections**: dejala **sin VPC** (los jobs solo tocan S3). Agregá VPC solo si el job
     accede a recursos privados de tu red (RDS privada, etc.).
-- **Create application**. Anotá el **Application ID** (`00xxxxxxxxxxxxxx`): lo usan los DAGs.
+- **Create application**. No hace falta que anotes el **Application ID**: `discover` lo encuentra
+  por el nombre de la aplicación y lo deja en `$EMR_APP_ID`, y el bloque del final de esta
+  sección lo publica en SSM para que los DAGs lo lean del `.env`.
 
 **Paso 4 — Extender el rol de la EC2** para que Airflow **envíe/pollee** jobs y **pase** el rol de
 ejecución a EMR. El `iam:PassRole` con `iam:PassedToService` es la barrera. Consola: **IAM → Roles →
@@ -1000,8 +1104,8 @@ inline policy en el mismo rol EC2:
 `s3://<artifacts>/emr/`:
 
 ```bash
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-aws s3 sync spark-apps/emr/ "s3://pyspark-stack-artifacts-$ACCT/emr/"
+PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh
+aws s3 sync spark-apps/emr/ "$EMR_ENTRYPOINTS_URI/"
 ```
 
 > Sin CLI: **S3 → bucket artifacts → Create folder `emr/` → Upload** y subís los `.py` a mano.
@@ -1009,29 +1113,49 @@ aws s3 sync spark-apps/emr/ "s3://pyspark-stack-artifacts-$ACCT/emr/"
 **Probar un job a mano (opcional).** Así lo arma el operator de Airflow; equivalente CLI:
 
 ```bash
+PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh
+
+# jq arma el JSON con los valores ya resueltos: dentro de comillas simples bash no
+# expandiría nada, y un "<acct>" sin reemplazar produce un logUri inválido que mata el
+# job con "Unable to push logs ... Parameter validation failed" sin correr una línea.
 aws emr-serverless start-job-run \
-  --application-id "<emr-app-id>" \
-  --execution-role-arn "arn:aws:iam::<acct>:role/pyspark-stack-emr-serverless-job" \
-  --job-driver '{
-    "sparkSubmit": {
-      "entryPoint": "s3://pyspark-stack-artifacts-<acct>/emr/customer_etl.py",
-      "entryPointArguments": ["pyspark-stack-datalake-<acct>", "2026-07-16"],
-      "sparkSubmitParameters": "--conf spark.executor.cores=2 --conf spark.executor.memory=4g --conf spark.executor.instances=2"
-    }
-  }' \
-  --configuration-overrides '{
-    "monitoringConfiguration": {
-      "s3MonitoringConfiguration": { "logUri": "s3://pyspark-stack-artifacts-<acct>/emr/logs/" }
-    }
-  }'
+  --application-id "$EMR_APP_ID" \
+  --execution-role-arn "$EMR_JOB_ROLE_ARN" \
+  --job-driver "$(jq -nc \
+      --arg entry "$EMR_ENTRYPOINTS_URI/wordcount.py" \
+      --arg bucket "$DATALAKE_BUCKET" \
+      '{sparkSubmit: {
+          entryPoint: $entry,
+          entryPointArguments: [$bucket, "2026-07-16"],
+          sparkSubmitParameters: "--conf spark.executor.cores=2 --conf spark.executor.memory=4g --conf spark.executor.instances=2"
+        }}')" \
+  --configuration-overrides "$(jq -nc \
+      --arg logs "$EMR_LOGS_URI/" \
+      '{monitoringConfiguration: {s3MonitoringConfiguration: {logUri: $logs}}}')"
 ```
+
+> `wordcount.py` no depende de datos previos: sirve como primer smoke test. Para
+> `customer_etl.py` primero tienen que existir `orders.csv`, `products.json` y `customers.csv`
+> en `$RAW_URI/customer_etl/`.
 
 La config de Spark va **por-job** (en `sparkSubmitParameters`), no en un `spark-defaults.conf`: en EMR
 Serverless no hay caja donde montarlo. EMR escribe los logs a S3 (`emr/logs/`) y a CloudWatch, y
 expone la Spark UI de cada corrida desde la consola de EMR.
 
-> Verificá (CLI):
-> `aws emr-serverless list-applications --query 'applications[?name==\`pyspark-stack-spark\`].[id,state]'`
+> Verificá (CLI): `aws emr-serverless get-application --application-id "$EMR_APP_ID"
+> --query 'application.state'` (con el contexto de §3.1 cargado).
+
+**`.env` — esta sección agrega `EMR_APP_ID` y `EMR_JOB_ROLE_ARN`.** Son los dos valores que el DAG
+de producción pasa al `EmrServerlessStartJobOperator`. Publicalos ahora, igual que los buckets:
+
+```bash
+PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh
+
+aws ssm put-parameter --name "/${NAME_PREFIX}/config/emr_app_id" \
+  --type String --value "$EMR_APP_ID" --overwrite
+aws ssm put-parameter --name "/${NAME_PREFIX}/config/emr_job_role_arn" \
+  --type String --value "$EMR_JOB_ROLE_ARN" --overwrite
+```
 
 ### 5.5 S3 VPC Gateway Endpoint
 
@@ -1242,8 +1366,10 @@ mecanismos según el transporte.
 
 > Verificá (CLI): el agente SSM `Online` es prerrequisito de toda la §6.
 > ```bash
-> aws ssm describe-instance-information --query "InstanceInformationList[?InstanceId=='<i-xxxx>'].PingStatus"  # ["Online"]
-> aws lambda invoke --function-name pyspark-stack-trigger-airflow \
+> PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh
+> aws ssm describe-instance-information \
+>   --query "InstanceInformationList[?InstanceId=='$INSTANCE_ID'].PingStatus"   # ["Online"]
+> aws lambda invoke --function-name "$LAMBDA_TRIGGER_NAME" \
 >   --cli-binary-format raw-in-base64-out --payload '{"dag":"customer_etl_emr"}' /dev/stdout
 > ```
 > O en la consola: **Lambda → `pyspark-stack-trigger-airflow` → Test** con evento
@@ -1364,41 +1490,60 @@ El **SMTP de Alertmanager** va aparte (nunca en git): creá también
 
 *Policy name* `ec2-secrets` → **Create policy**.
 
-**Paso 4 — Script que materializa el `.env` desde SSM** — `scripts/load-secrets.sh` (corre en la
-EC2):
+**Paso 3b — Cerrar la configuración NO secreta.** La EC2 necesita también valores que no son
+secretos (`EMR_APP_ID`, los buckets, el ARN del rol del job). Reconstruirlos dentro del host
+(`"pyspark-stack-datalake-${ACCT}"`, `list-applications | ?name=='pyspark-stack-spark'`) vuelve a
+hardcodear el prefijo en un tercer lugar y falla en runtime el día que algo cambie de nombre. Por eso
+van a Parameter Store como **String** (no son secreto), bajo `config/`.
+
+**La mayoría ya la publicaste** en la sección que creó cada recurso, que es la regla del contrato:
+
+| Ya publicado | Sección |
+|---|---|
+| `datalake_bucket`, `artifacts_bucket` | §5.1 |
+| `emr_app_id`, `emr_job_role_arn` | §5.4 |
+
+Acá se cierra el inventario con los dos que no pertenecen a ningún recurso, sino al stack entero:
 
 ```bash
-#!/usr/bin/env bash
-# Genera un .env efímero desde SSM antes de levantar el stack.
-set -euo pipefail
-PREFIX="/pyspark-stack"
-REGION="${AWS_REGION:-us-east-1}"
-get() { aws ssm get-parameter --name "$PREFIX/$1" --with-decryption \
-          --query Parameter.Value --output text --region "$REGION"; }
+PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh
 
-ACCT=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
-EMR_APP_ID=$(aws emr-serverless list-applications --region "$REGION" \
-  --query "applications[?name=='pyspark-stack-spark'].id | [0]" --output text)
-EMR_JOB_ROLE_ARN="arn:aws:iam::${ACCT}:role/pyspark-stack-emr-serverless-job"
-DATALAKE_BUCKET="pyspark-stack-datalake-${ACCT}"
-ARTIFACTS_BUCKET="pyspark-stack-artifacts-${ACCT}"
+put_config() { aws ssm put-parameter --name "/${NAME_PREFIX}/config/$1" \
+                 --type String --value "$2" --overwrite; }
 
-cat > .env <<EOF
-POSTGRES_USER=airflow
-POSTGRES_DB=airflow
-POSTGRES_PASSWORD=$(get postgres_password)
-AIRFLOW_JWT_SECRET=$(get airflow_jwt_secret)
-AIRFLOW_ADMIN_USER=admin
-AIRFLOW_ADMIN_PASSWORD=$(get airflow_admin_password)
-GRAFANA_ADMIN_PASSWORD=$(get grafana_admin_password)
-EMR_APP_ID=${EMR_APP_ID}
-EMR_JOB_ROLE_ARN=${EMR_JOB_ROLE_ARN}
-DATALAKE_BUCKET=${DATALAKE_BUCKET}
-ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET}
-EOF
-chmod 600 .env
-echo ".env generado desde SSM (+ EMR app id / job role arn + buckets datalake/artifacts)"
+put_config aws_region  "$AWS_REGION"
+put_config name_prefix "$NAME_PREFIX"
 ```
+
+Sin CLI: **Systems Manager → Parameter Store → Create parameter** (×2), *Type* **String**, nombres
+`/pyspark-stack/config/aws_region` y `/pyspark-stack/config/name_prefix`.
+
+Comprobá el inventario completo, que es exactamente lo que va a leer `load-secrets.sh`:
+
+```bash
+aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" --recursive \
+  --query 'Parameters[].[Name,Value]' --output text
+```
+
+La policy del Paso 3 ya cubre estos parámetros: `parameter/pyspark-stack/*` incluye `config/`.
+
+> Si expusiste la web por HTTPS (§4.6), `airflow_domain` ya lo publicaste ahí. Es la única variable
+> extra que necesita el TLS en esta guía: el compose de 02b deriva las rutas del cert del propio
+> `${AIRFLOW_DOMAIN}`, en vez de las cinco variables separadas que usa la
+> [guía 02 §5.6](02-produccion-aws-terraform.md#56-exponer-la-web-de-airflow-https-nativo-solo-tu-ip).
+
+**Paso 4 — Script que materializa el `.env` desde SSM** — `scripts/load-secrets.sh`, que corre
+**en la EC2**.
+
+El contenido está en la [guía 02 §13.4](02-produccion-aws-terraform.md#134-materializar-env) y no se
+reproduce acá a propósito: es un archivo del repositorio, y §11 de esta guía fija la regla de no
+mantener una segunda copia que pueda divergir. Copialo de allí tal cual — **funciona igual por
+consola que por Terraform**, porque no depende del state: lee todo lo que cuelga de
+`/pyspark-stack/` en Parameter Store y lo convierte en líneas del `.env`, tomando el nombre de la
+variable del último segmento del path (`/pyspark-stack/config/emr_app_id` → `EMR_APP_ID`).
+
+Esa propiedad es la que hace que el Paso 3b alcance: los parámetros que acabás de crear a mano
+aparecen solos en el `.env`, sin tocar el script.
 
 Uso en la EC2: `chmod +x scripts/load-secrets.sh && ./scripts/load-secrets.sh && docker compose -f
 docker-compose.prod.yml up -d`.
@@ -1735,8 +1880,12 @@ monitoring/
     └── dashboards/overview.json
 ```
 
-Los contenidos de estos archivos son exactamente los de la guía 02 §12.4–§12.7. Los dos más
-importantes de tener a mano:
+De estos archivos, `prometheus.yml` y `alerts.yml` están escritos en la [guía 02
+§12.2](02-produccion-aws-terraform.md#122-prometheus); el resto (`statsd_mapping.yml`,
+`loki-config.yml`, `promtail-config.yml` y el provisioning de Grafana) es **roadmap**: la guía 02
+lo declara así en §12 y todavía no trae su contenido. El override que los monta es la [guía 02
+§14.2](02-produccion-aws-terraform.md#142-docker-composeprodmonitoringyml--override-de-observabilidad).
+Los dos más importantes de tener a mano:
 
 **`monitoring/prometheus/alerts.yml`** (extracto — las alertas de negocio y EMR):
 
@@ -1794,13 +1943,15 @@ receivers:
         send_resolved: true
 ```
 
-El resto (`prometheus.yml`, `statsd_mapping.yml`, `loki-config.yml`, `promtail-config.yml`, los
-provisioning de Grafana y `overview.json`) copialos tal cual de la guía 02 §12.4–§12.7.
+`prometheus.yml` copialo tal cual de la [guía 02 §12.2](02-produccion-aws-terraform.md#122-prometheus).
+Los demás (`statsd_mapping.yml`, `loki-config.yml`, `promtail-config.yml`, el provisioning de
+Grafana y `overview.json`) todavía no están escritos en ninguna de las dos guías: hasta que existan,
+corré solo el Compose base, sin el override de monitoreo.
 
 **Acceso (por túnel SSH):**
 
 ```bash
-ssh -i ~/.ssh/pyspark_stack -L 3000:localhost:3000 -L 9090:localhost:9090 -L 9093:localhost:9093 -L 3100:localhost:3100 ec2-user@$IP
+$SSH -L 3000:localhost:3000 -L 9090:localhost:9090 -L 9093:localhost:9093 -L 3100:localhost:3100 "$SSH_TARGET"
 ```
 
 **Observabilidad de los jobs Spark (EMR Serverless)** — es *managed*, así que su telemetría vive en
@@ -1884,7 +2035,7 @@ WHEN NOT MATCHED THEN INSERT (pais, monto, dt) VALUES (s.pais, s.monto, s.dt);
 **Paso 3b — Mantenimiento: compactación y expiración de snapshots.** Sin esto,
 cada `MERGE` deja archivos chicos y un snapshot nuevo; después de meses de corridas 3x/semana el
 *planning time* de las queries se degrada solo, sin que nadie lo note hasta que ya molesta. Desde
-el mismo Query editor, o como task semanal de un DAG (`AthenaOperator`, guía 02 §16.1b):
+el mismo Query editor, o como task semanal de un DAG (`AthenaOperator`, guía 02 §16.3):
 
 ```sql
 -- Compacta archivos chicos en archivos más grandes
@@ -1896,7 +2047,7 @@ VACUUM pyspark_stack_analytics.ventas;
 
 > Verificá la sintaxis exacta contra tu versión de Athena engine — el soporte de mantenimiento de
 > Iceberg se fue agregando de forma incremental. El detalle completo (DAG semanal, por qué viernes
-> y no domingo por el auto start/stop) está en la [guía 02 §16.1b](02-produccion-aws-terraform.md#163-mantenimiento-iceberg).
+> y no domingo por el auto start/stop) está en la [guía 02 §16.3](02-produccion-aws-terraform.md#163-mantenimiento-iceberg).
 
 **Paso 4 — Permitir que un DAG consulte (rol de la EC2).** Consola: **IAM → Roles →
 `pyspark-stack-ec2-role` → Add permissions → Create inline policy → JSON**:
@@ -1937,15 +2088,15 @@ repositorio. Usa los artefactos canónicos de
 
 | Artefacto | Sección canónica |
 |---|---|
-| `docker-compose.prod.yml` | §14 |
-| `scripts/load-secrets.sh` | §13.4 |
-| DAG EMR Serverless | §9.4 |
-| Deploy de desarrollo | §10.1 |
-| Workflows CI/CD | §11 |
-| Prometheus y alertas | §12 |
-| Runbook de producción | §15 |
+| `docker-compose.prod.yml` | guía 02 §14 |
+| `scripts/load-secrets.sh` | guía 02 §13.4 |
+| DAG EMR Serverless | guía 02 §9.4 |
+| Deploy de desarrollo | guía 02 §10.1 |
+| Workflows CI/CD | guía 02 §11 |
+| Prometheus y alertas | guía 02 §12 |
+| Runbook de producción | guía 02 §15 |
 
-Este documento explica **dónde hacer clic** para crear AWS. La guía 02 v3 explica **qué ejecutar**
+Este documento explica **dónde hacer clic** para crear AWS. La guía 02 explica **qué ejecutar**
 para operar la plataforma.
 
 ### 11.1 Subir el repositorio
@@ -1953,14 +2104,15 @@ para operar la plataforma.
 **Dónde:** terminal local.
 
 ```bash
-export IP="<elastic-ip>"
+export PROD_ENV_SOURCE=discover
+source ./scripts/prod-env.sh
 
 rsync -az \
   --exclude .git \
   --exclude .env \
   --exclude infra \
-  -e "ssh -i ~/.ssh/pyspark_stack" \
-  ./ "ec2-user@${IP}:/home/ec2-user/pyspark_stack/"
+  -e "$RSYNC_SSH" \
+  ./ "$SSH_TARGET:$REMOTE_DIR/"
 ```
 
 Después, **en la EC2** (el `rsync` de arriba ya subió `scripts/`, `dags/` y el Compose):
@@ -1977,10 +2129,8 @@ docker compose -f docker-compose.prod.yml ps                 # todos 'running', 
 ### 11.2 Publicar entrypoints EMR
 
 ```bash
-ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-ARTIFACTS_BUCKET="pyspark-stack-artifacts-${ACCOUNT_ID}"
-
-aws s3 sync spark-apps/emr/ "s3://${ARTIFACTS_BUCKET}/emr/" --delete
+PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh
+aws s3 sync spark-apps/emr/ "$EMR_ENTRYPOINTS_URI/" --delete
 ```
 
 EMR Serverless lee esos archivos directamente desde S3; no los toma de la EC2.
@@ -2018,18 +2168,18 @@ El script `load-secrets.sh` de la guía 02 v3 genera esos valores en `.env`.
 
 ### 13.1 Preparar contexto
 
+Es el mismo paso que en la guía 02 §8.1, con el modo `discover` en vez del state:
+
 ```bash
-export AWS_REGION="${AWS_REGION:-us-east-1}"
-export NAME_PREFIX="pyspark-stack"
-export INSTANCE_ID="$(aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=${NAME_PREFIX}-node" \
-            "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-  --query 'Reservations[0].Instances[0].InstanceId' \
-  --output text)"
-export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-export DATALAKE_BUCKET="${NAME_PREFIX}-datalake-${ACCOUNT_ID}"
-export ARTIFACTS_BUCKET="${NAME_PREFIX}-artifacts-${ACCOUNT_ID}"
+export PROD_ENV_SOURCE=discover
+source ./scripts/prod-env.sh
+./scripts/prod-env.sh --check
 ```
+
+Eso deja `$INSTANCE_ID`, `$PUBLIC_IP`, `$ACCOUNT_ID`, `$DATALAKE_BUCKET`, `$ARTIFACTS_BUCKET`,
+`$EMR_APP_ID`, `$SQS_TRIGGER_QUEUE_URL`, `$LAMBDA_STARTSTOP_NAME`, `$LAMBDA_TRIGGER_NAME`,
+`$SSH_TARGET` y las rutas S3 derivadas. **De acá en adelante todos los comandos asumen esto
+cargado**; si abrís una terminal nueva, sourcealo otra vez.
 
 ### 13.2 Encender, disparar y apagar
 
@@ -2059,12 +2209,10 @@ revisar Airflow y EMR.
 ### 13.3 Revisar EMR
 
 ```bash
-APP_ID="$(aws emr-serverless list-applications \
-  --query "applications[?name=='${NAME_PREFIX}-spark'].id | [0]" \
-  --output text)"
-
+# $EMR_APP_ID ya lo resolvió el modo discover al sourcear prod-env.sh: no hace falta
+# repetir el list-applications acá ni en los bloques de abajo.
 aws emr-serverless list-job-runs \
-  --application-id "$APP_ID" \
+  --application-id "$EMR_APP_ID" \
   --max-results 10 \
   --query 'jobRuns[].{id:id,name:name,state:state,created:createdAt}' \
   --output table
@@ -2073,10 +2221,12 @@ aws emr-serverless list-job-runs \
 Para un fallo:
 
 ```bash
-JOB_ID="<job-id>"
+# El último job corrido; para uno puntual reemplazá por JOB_ID="<job-id>".
+JOB_ID="$(aws emr-serverless list-job-runs --application-id "$EMR_APP_ID" \
+  --query 'sort_by(jobRuns, &createdAt)[-1].id' --output text)"
 
 aws emr-serverless get-job-run \
-  --application-id "$APP_ID" \
+  --application-id "$EMR_APP_ID" \
   --job-run-id "$JOB_ID" \
   --query 'jobRun.{state:state,detail:stateDetails}'
 ```
@@ -2142,13 +2292,13 @@ ser idempotente.
 ### 14.4 Acceso a las UIs
 
 ```bash
-ssh -i ~/.ssh/pyspark_stack \
+$SSH \
   -L 8082:127.0.0.1:8082 \
   -L 3000:127.0.0.1:3000 \
   -L 9090:127.0.0.1:9090 \
   -L 9093:127.0.0.1:9093 \
   -L 3100:127.0.0.1:3100 \
-  "ec2-user@${IP}"
+  "$SSH_TARGET"
 ```
 
 Las UIs no se publican directamente en el security group.

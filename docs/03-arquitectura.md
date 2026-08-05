@@ -155,14 +155,15 @@ Spark UI vive en la consola de EMR Serverless, y en producción no hay Jupyter.
 | Lambda `startstop` | AWS | Prende y apaga la EC2 con guardia de DAGs activos |
 | DLQ | AWS | Redrive de SQS para eventos S3, DLQ de Scheduler para cron, destino async para Lambda |
 | Rol OIDC `dbt_ci` | AWS + GitHub | Slim CI de dbt por PR, acotado a una database Glue `_ci` aislada |
-| SNS `alerts` | AWS | Destino de las alarmas de gobierno (DLQ, Budgets, Cost Anomaly) |
+| SNS `alerts` | AWS | Destino único de las alarmas de CloudWatch — **roadmap**: la guía 02 §18.2 define qué alarmar, pero todavía no trae el topic ni las alarmas |
 | EventBridge Scheduler | AWS | Cron de ETL y de start/stop |
 | EC2 + EBS + Elastic IP + SG | AWS | Host del stack |
 | IAM roles | AWS | Permisos least-privilege |
 | S3 (tfstate) | AWS | Estado remoto de Terraform, con lock nativo (`use_lockfile`) |
 | GitHub Actions + OIDC | AWS + GitHub | CI/CD: valida en PRs y despliega DAGs |
 | Snapshots EBS (DLM) | AWS | Backups automáticos de `/data` |
-| SSM Parameter Store | AWS | Secretos fuera del `.env` |
+| SSM Parameter Store | AWS | Secretos (`SecureString`) y config no secreta (`config/`) que la EC2 lee sin acceso al state (guía 02 §13.3b) |
+| Outputs de Terraform + `scripts/prod-env.sh` | Repo | Contrato que convierte el state en variables de entorno: ningún comando lleva IDs ni IPs escritos (guía 02 §3.1) |
 | Budgets · Cost Anomaly Detection · Access Analyzer | AWS | Gobierno de costo y seguridad, sin costo (guía 02 §18) |
 
 > El Terraform de cada componente y los archivos Compose están, listos para copiar, en la
@@ -344,7 +345,7 @@ stack híbrido.
 
 **Cómo quedaría montado** (Terraform y SQL en la
 [guía 02 §16](02-produccion-aws-terraform.md#16-athena-e-iceberg) y
-[§6.4](02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless)):
+[guía 02 §6.4](02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless)):
 
 - El job Spark escribe con `df.writeTo("glue_catalog.<db>.<tabla>")` en vez de `.write.parquet(...)`,
   usando el conector Iceberg embebido en el runtime `emr-7.5.0` — no hay nada que instalar.
@@ -392,7 +393,10 @@ Cuatro piezas AWS-nativas que cierran huecos operativos. Detalle en la
 | **Cost Anomaly Detection** | Detecta picos fuera del patrón histórico, como un job de EMR escalando de más — sin costo |
 | **IAM Access Analyzer** | Detección temprana de recursos accesibles desde fuera de la cuenta — sin costo ni mantenimiento |
 
-Todas notifican al mismo tema **SNS `alerts`**, con un único email de destino (`var.alert_email`).
+Budgets y Cost Anomaly notifican **directo por email** a `var.alert_email` (guía 02 §18.3–§18.4);
+no pasan por SNS. Unificar todo en un topic **SNS `alerts`** —necesario para las alarmas de
+CloudWatch de la guía 02 §18.2, que hoy solo están enunciadas— es roadmap: requiere el topic, su suscripción
+y una `aws_cloudwatch_metric_alarm` por cada punto de la lista.
 
 ---
 

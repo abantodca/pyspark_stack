@@ -10,10 +10,17 @@ vencimiento y riesgo aceptado.
 
 ## 1. Repositorio
 
-- [ ] `python scripts/check-doc-links.py` termina sin errores.
+- [ ] `python3 scripts/check-doc-links.py` termina sin errores (enlaces, anclas y referencias `§`,
+      locales y cruzadas entre guías).
+- [ ] `python3 scripts/check-doc-env.py` termina sin errores (contrato de variables de entorno:
+      orden incremental, nombres, fences, sintaxis `bash -n` y ausencia de literales en los
+      comandos de las guías).
+- [ ] `./scripts/prod-env.sh --check` muestra todas las obligatorias con valor, y el `ACCOUNT_ID`
+      es el de la cuenta de producción esperada.
 - [ ] CI está verde sobre el commit candidato.
 - [ ] El árbol de trabajo está limpio y el commit está etiquetado.
-- [ ] No hay `.env`, `*.tfvars`, `*.tfstate`, claves ni certificados versionados.
+- [ ] No hay `.env`, `infra/prod/prod.env`, `*.tfvars`, `*.tfstate`, claves ni certificados
+      versionados (`git status --porcelain --ignored=no` limpio tras un `apply`).
 - [ ] Las imágenes y dependencias fueron revisadas y sus actualizaciones son deliberadas.
 
 ## 2. Configuración estática
@@ -31,7 +38,10 @@ vencimiento y riesgo aceptado.
 - [ ] La cuenta usa MFA y no se opera con el usuario root.
 - [ ] El backend de Terraform existe y tiene versionado, cifrado y bloqueo.
 - [ ] `my_ip_cidr` es `/32` y corresponde a la IP autorizada.
-- [ ] Los parámetros SSM existen y son `SecureString`.
+- [ ] Los secretos en SSM existen y son `SecureString`; la config no secreta bajo
+      `/<prefijo>/config/` existe y es `String` (inventario en guía 02 §13.4).
+- [ ] `aws ssm get-parameters-by-path --path /<prefijo>/config --recursive` devuelve todas las
+      variables que el Compose declara con `:?` — si falta una, el arranque aborta.
 - [ ] Ningún secreto productivo usa los valores de `.env.example`.
 - [ ] Se revisó el plan IAM, en particular `iam:PassRole`, SSM y el acceso a S3.
 - [ ] IMDSv2, cifrado EBS, bloqueo público de S3 y política TLS-only aparecen en el plan.
@@ -60,8 +70,11 @@ vencimiento y riesgo aceptado.
 
 - [ ] El DNS resuelve a la Elastic IP correcta.
 - [ ] El certificado y la clave existen bajo `/data/certs` y sus symlinks resuelven.
-- [ ] Están configuradas `AIRFLOW_DOMAIN`, `AIRFLOW_BASE_URL`, `AIRFLOW_EXECUTION_API_URL`,
-      `AIRFLOW_SSL_CERT` y `AIRFLOW_SSL_KEY`.
+- [ ] Las cinco variables HTTPS (`AIRFLOW_DOMAIN`, `AIRFLOW_BASE_URL`,
+      `AIRFLOW_EXECUTION_API_URL`, `AIRFLOW_SSL_CERT`, `AIRFLOW_SSL_KEY`) están **publicadas en
+      SSM**, no solo escritas a mano en el `.env` de la EC2: `load-secrets.sh` regenera ese
+      archivo desde cero y borraría las líneas manuales, dejando el arranque HTTPS roto
+      (guía 02 §5.6).
 - [ ] Se usa `docker-compose.prod.https.yml`.
 - [ ] El puerto 443 solo acepta la IP autorizada y el 8082 no está expuesto en el security group.
 
