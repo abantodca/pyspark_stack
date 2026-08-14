@@ -1,5 +1,44 @@
 # Ejemplos locales, de lo más simple a lo avanzado
 
+> **En este documento: EJECUTAR, de a un ejemplo por vez.** No se lee de corrido.
+> **Salís con**: haber tocado cada pieza del stack —DataFrames, `spark-submit`, HDFS,
+> joins, SQL, ventanas, streaming, UDFs vectorizadas, tuning y tests— con los datos
+> reales del repositorio.
+
+> [!TIP]
+> **Si es tu primera vez, no arranques por el ejemplo 1: arrancá por el PASO 0.**
+> Levantar, verificar que está sano, apagar y reanudar sin perder nada son las cuatro
+> operaciones que vas a repetir todos los días. Los ejemplos asumen el stack arriba y
+> sano; depurar un ejemplo contra un stack a medio levantar es perder el tiempo dos
+> veces.
+
+**Cómo está ordenado** — la progresión es real, no decorativa: cada nivel asume las
+técnicas del anterior.
+
+```mermaid
+flowchart LR
+    P0["PASO 0<br/><i>levantar · verificar<br/>apagar · reanudar</i>"]
+    B["BÁSICO · 1–5<br/><i>SparkSession, CSV,<br/>spark-submit, transformaciones, escritura</i>"]
+    I["INTERMEDIO · 6–10<br/><i>HDFS, joins, SQL,<br/>ventanas, parametrización</i>"]
+    A["AVANZADO · 11–15<br/><i>ETL completo, DAG de Airflow,<br/>entornos, rendimiento, schemas</i>"]
+    E["EXPERTO · 16–20<br/><i>streaming, reproceso idempotente,<br/>pandas UDF, tuning, pytest</i>"]
+    X["BONUS · 21<br/><i>Iceberg sin AWS</i>"]
+
+    P0 --> B --> I --> A --> E --> X
+
+    style P0 fill:#d1ecf1,stroke:#0c5460
+    style E fill:#d4edda,stroke:#155724
+```
+
+**Los dos que más rinden si tenés poco tiempo**: el **7** (el truco del JSON
+multilínea — es el incidente #1 del [historial](referencia/06-historial-de-incidentes.md), y te va
+a pasar) y el **20** (separar la lógica de transformación del I/O, que es lo que hace
+que tu código sobreviva al salto a EMR Serverless).
+
+> **Por qué el ejemplo 21 practica Iceberg sin AWS**: porque en producción Iceberg es
+> *roadmap* ([02 §16](02-produccion-aws-terraform.md#16-athena-e-iceberg)) y el job de referencia
+> todavía escribe Parquet. Practicarlo local es gratis; practicarlo en Athena, no.
+
 21 ejercicios para entender el stack pieza por pieza, todos con código listo para pegar: 5 básicos,
 5 intermedios, 5 avanzados, 5 de nivel experto y un bonus (ejemplo 21) que practica sin AWS la misma
 técnica que usa producción (Iceberg). Cada uno indica **dónde** ejecutarlo, el **código**, **qué

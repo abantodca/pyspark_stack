@@ -1,6 +1,6 @@
 # Producción en AWS, 100% por la consola
 
-Misma arquitectura y mismo objetivo que la [guía 02](02-produccion-aws-terraform.md) —una EC2 chica
+Misma arquitectura y mismo objetivo que la [guía 02](../02-produccion-aws-terraform.md) —una EC2 chica
 (`t3.large`) que corre solo el orquestador (Airflow + Postgres + monitoreo) en Docker, con Spark
 fuera de la caja en EMR Serverless, S3 como data lake, Lambda y EventBridge para disparar los DAGs y
 el auto start/stop, monitoreo completo y CI/CD— pero construida **enteramente a mano en la consola
@@ -9,8 +9,42 @@ web de AWS**. Cero Terraform: cada recurso se crea clic a clic, y todo lo que ha
 esta misma guía.
 
 > **Documento de referencia.** Esta variante manual todavía no fue ejecutada de extremo a extremo. La
-> ruta recomendada y mantenida como código es Terraform ([guía 02](02-produccion-aws-terraform.md));
+> ruta recomendada y mantenida como código es Terraform ([guía 02](../02-produccion-aws-terraform.md));
 > usá esta solo cuando haya una restricción explícita que impida IaC.
+
+> [!WARNING]
+> **Este NO es el camino recomendado, y además no fue ejecutado de extremo a extremo.**
+> La ruta mantenida como código es Terraform ([guía 02](../02-produccion-aws-terraform.md)).
+> Usá esta solo si hay una restricción explícita que impida IaC, o si querés
+> **entender** qué crea cada bloque de Terraform antes de aplicarlo. Todo lo que ganás en visibilidad lo perdés en
+> reproducibilidad: no hay `plan`, no hay `destroy`, y el teardown es una checklist de
+> clics en orden inverso que, si se saltea un paso, deja recursos facturando.
+
+> **En este documento: EJECUTAR clic a clic, ~4–6 h.** Es más lento que la guía 02, a
+> propósito: cada paso es visible.
+> **Salís con**: la misma plataforma que la guía 02 —EC2 orquestadora, data lake,
+> EMR Serverless, disparadores, CI/CD— pero sin estado versionado que la describa.
+
+> [!IMPORTANT]
+> **Aun por consola, los comandos siguen sin llevar valores escritos a mano.** Este
+> documento usa el mismo contrato de variables que la guía 02
+> ([§3.1 de la 02](../02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando)),
+> pero en **modo `discover`**: como acá no hay `terraform output`, el cargador
+> encuentra los recursos por sus tags.
+>
+> ```bash
+> PROD_ENV_SOURCE=discover source ./scripts/prod-env.sh   # EN TU MÁQUINA, una vez por terminal
+> ```
+>
+> Por eso **los tags no son cosmética**: son el único índice que tiene el cargador. Si
+> creás un recurso sin taguear, `discover` no lo encuentra y todos los comandos
+> siguientes corren con la variable vacía.
+
+**Convenciones** (las mismas de toda la documentación): los pasos marcados 🖱️ son
+clics en la consola; los bloques `bash` corren en **tu máquina** salvo que digan
+`# EN LA EC2`. Los tres contextos de ejecución —local, dentro de la instancia y
+GitHub Actions con OIDC— no son intercambiables: están explicados en
+[la guía 02, «Cómo leer esta guía»](../02-produccion-aws-terraform.md#cómo-leer-esta-guía).
 
 **¿Consola o Terraform?** La consola sirve para entender qué crea cada bloque, para un despliegue
 puntual o para aprender AWS tocando cada servicio. A cambio:
@@ -63,8 +97,14 @@ puntual o para aprender AWS tocando cada servicio. A cambio:
 
 ## 1. Panorama y orden de creación
 
+> **En esta sección: LEER, ~10 min. No creás nada todavía.**
+> **Salís con**: el orden de creación, que acá importa más que en la guía 02: sin
+> `terraform apply` que resuelva el grafo de dependencias, **el orden lo ponés vos**.
+> Crear un recurso antes que aquel del que depende no da un error claro: da un
+> desplegable vacío en la consola donde debería estar la opción que buscás.
+
 La arquitectura es **idéntica** a la de la guía 02 (el detalle conceptual y los diagramas están en
-[`docs/03-arquitectura.md`](03-arquitectura.md)). Una EC2 `t3.large` corre solo el orquestador en
+[`docs/03-arquitectura.md`](../03-arquitectura.md)). Una EC2 `t3.large` corre solo el orquestador en
 Docker; AWS *serverless* lo rodea para el cómputo Spark (EMR Serverless), storage durable (S3),
 disparo de DAGs (Lambda + EventBridge) y ahorro (auto start/stop).
 
@@ -117,6 +157,10 @@ que sigue la guía, y por qué:
 
 ## 2. Costo
 
+> **En esta sección: LEER, ~5 min.**
+> **Salís con**: qué vas a pagar. **La vía de creación no cambia el precio**: es el
+> mismo número que la guía 02.
+
 Idéntico a la guía 02 (la vía de creación no cambia el precio). Precios aproximados us-east-1,
 estimados en julio 2026
 (on-demand), sujetos a cambio — validá en [calculator.aws](https://calculator.aws). Escenario real:
@@ -140,6 +184,16 @@ en la guía 02 §2 — no cambia.
 ---
 
 ## 3. Prerrequisitos
+
+> **En esta sección: VERIFICAR, ~10 min.**
+> **Salís con**: la cuenta, el CLI y el par de claves listos.
+
+> [!IMPORTANT]
+> **Aunque construyas por consola, el AWS CLI no es opcional.** Las verificaciones de
+> cada sección, los smoke tests (§14) y la operación diaria (§13) van por CLI: la
+> consola es para *crear*, no para *comprobar*. Y sin CLI no podés cargar el contexto
+> en modo `discover`, que es lo que hace que los comandos de esta guía no lleven
+> valores escritos a mano.
 
 - **Cuenta AWS** con un usuario/rol que tenga permisos de administración (o al menos EC2, S3, IAM,
   Lambda, EMR Serverless, EventBridge, SSM, CloudWatch, Route 53). Para la consola alcanza con
@@ -185,7 +239,7 @@ dags/                       # + los DAGs de producción EMR (§12)
 Los pasos de **creación** de esta guía son clics en la consola, así que ahí los nombres literales
 son lo correcto: es lo que vas a tipear en un formulario. Pero los bloques de **verificación y
 operación** son CLI, y ahí valen las mismas razones que en la
-[guía 02 §3.1](02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-leelo-antes-de-copiar-cualquier-comando):
+[guía 02 §3.1](../02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando):
 una IP o un account id pegado a mano caduca o apunta a la cuenta equivocada.
 
 Acá no hay state de Terraform del cual leer, así que `scripts/prod-env.sh` corre en su segundo
@@ -193,7 +247,7 @@ modo: **`discover`**, que descubre los mismos valores con el AWS CLI (por tag `N
 aplicación EMR y por convención de bucket) y exporta **exactamente las mismas variables**.
 
 Es el mismo archivo en las dos guías: **copialo de la
-[guía 02 §5.5, Paso 0c](02-produccion-aws-terraform.md#55-desplegar-subir-código-y-túnel-ssh)**
+[guía 02 §5.5, Paso 0c](../02-produccion-aws-terraform.md#55-desplegar-subir-código-y-túnel-ssh)**
 (allá se crea junto al `terraform apply` que lo alimenta; acá lo alimenta el AWS CLI). No hace falta
 que leas nada más de esa sección: el archivo es autocontenido y `chmod +x scripts/prod-env.sh` lo
 deja listo.
@@ -219,6 +273,16 @@ Si `--check` muestra `INSTANCE_ID` vacío después de §4.3, revisá que la EC2 
 ---
 
 ## 4. Núcleo: EC2 con Docker
+
+> **En esta sección: CREAR en la consola, ~90 min.** Es la más larga.
+> **Salís con**: la EC2 corriendo Airflow y Postgres, con disco de datos aparte, IP
+> estable y apagado automático.
+
+> **Regla de esta sección: tagueá TODO lo que crees, sin excepción.** En la guía 02 los
+> tags son buena práctica; acá son **infraestructura crítica**: el modo `discover` de
+> `prod-env.sh` encuentra los recursos por tag, porque no hay `terraform output`. Un
+> recurso sin taguear es un recurso que ninguno de los comandos siguientes va a
+> encontrar — y la variable vacía no da error, da un comando que corre contra nada.
 
 La EC2 corre un `docker-compose.prod.yml` propio, standalone (§11) — no el mismo de local: solo el
 orquestador (Airflow + Postgres + monitoreo), sin Spark ni HDFS. Acceso por **túnel SSH** para todo,
@@ -418,72 +482,20 @@ anti-corte) y, si los hay, no apaga — así el apagado es *job-aware* (§12).
 
 - *Author from scratch* · *Function name* `pyspark-stack-startstop` · *Runtime* **Python 3.12** ·
   *Architecture* x86_64 → **Create function**.
-- En el editor de código, reemplazá `lambda_function.py` por el código de abajo (guardalo también en
-  el repo como `lambdas/startstop.py`). Luego **Deploy**.
+- En el editor de código, reemplazá `lambda_function.py` por el código que se indica abajo. Luego
+  **Deploy**.
 
-```python
-# lambdas/startstop.py
-import os
-import time
-import boto3
+El código es **el mismo** que el de la guía 02: no existe una versión "de consola". Copialo del
+bloque `startstop.py` de
+[guía 02 §5.4](../02-produccion-aws-terraform.md#54-automatización-eventbridge--lambda) —completo, con
+el guard job-aware y la rama `force`— y pegalo en el editor de la Lambda.
 
-ec2 = boto3.client("ec2")
-ssm = boto3.client("ssm")
+> **Por qué no está repetido acá.** Es la regla de §11: la consola crea infraestructura, no
+> mantiene una segunda copia de tus archivos. Cuando este documento traía su propio `startstop.py`,
+> la copia se quedó sin la evaluación multi-instancia ni el `force` que la guía 02 sí tiene.
 
-def _dags_activos(instance_id):
-    """Cuenta los DAG runs en estado 'running' DENTRO de la EC2, vía SSM SendCommand.
-    Guardia anti-corte: si hay alguno, NO apagamos. Ante cualquier duda (comando fallido,
-    salida no numérica) es conservador y devuelve >0 → no apagar."""
-    py = ("from airflow.models.dagrun import DagRun;"
-          "from airflow.utils.state import DagRunState;"
-          "print(len(DagRun.find(state=DagRunState.RUNNING)))")
-    cmd = f'docker exec airflow-scheduler python -c "{py}"'
-    resp = ssm.send_command(
-        InstanceIds=[instance_id],
-        DocumentName="AWS-RunShellScript",
-        Comment="startstop: chequeo de DAG runs activos",
-        Parameters={"commands": [cmd]},
-    )
-    cid = resp["Command"]["CommandId"]
-    inv = {"Status": "Pending"}
-    for _ in range(20):                       # espera hasta ~40s a que el comando termine
-        time.sleep(2)
-        inv = ssm.get_command_invocation(CommandId=cid, InstanceId=instance_id)
-        if inv["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
-            break
-    if inv["Status"] != "Success":
-        return 1                              # no pudimos verificar → conservador: no apagar
-    try:
-        return int(inv["StandardOutputContent"].strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        return 1
-
-def handler(event, context):
-    """Prende o apaga las EC2 marcadas con el tag AutoStartStop=true.
-    event = {"action": "start"} | {"action": "stop"}. El stop es JOB-AWARE."""
-    action   = event.get("action", "stop")
-    tag_key  = os.environ.get("TAG_KEY", "AutoStartStop")
-    tag_val  = os.environ.get("TAG_VALUE", "true")
-
-    states = ["stopped"] if action == "start" else ["running"]
-    resp = ec2.describe_instances(Filters=[
-        {"Name": f"tag:{tag_key}", "Values": [tag_val]},
-        {"Name": "instance-state-name", "Values": states},
-    ])
-    ids = [i["InstanceId"] for r in resp["Reservations"] for i in r["Instances"]]
-    if not ids:
-        return {"msg": "no instances tagged", "action": action}
-
-    if action == "start":
-        ec2.start_instances(InstanceIds=ids)
-    else:
-        activos = _dags_activos(ids[0])       # un solo nodo pyspark-stack-node
-        if activos > 0:
-            return {"msg": f"{activos} DAG run(s) activos, no apago", "instances": ids}
-        ec2.stop_instances(InstanceIds=ids)
-
-    return {"action": action, "instances": ids}
-```
+Guardalo también en tu repo. Acá vive en `lambdas/startstop.py`; en la guía 02 vive en
+`infra/lambdas/startstop.py` porque allá lo empaqueta Terraform. Es el mismo archivo.
 
 **Paso 2 — Handler, timeout y variables.**
 
@@ -582,104 +594,24 @@ hicieras `docker compose up` pelado a `docker-compose.yml` (el de dev), levantar
 y HDFS en esta EC2 orquestadora — justo lo que evita EMR Serverless (§1, guía 02 §6.4).
 
 Esta es la versión **mínima** (Airflow + Postgres); §7 (secretos) y §9 (monitoreo) van a pedirte que
-**reemplaces todo el archivo** por una versión más completa (la final está en §11.1) — no lo vayas
-parcheando a mano, cada sección te da el archivo entero de nuevo:
+**reemplaces todo el archivo** por una versión más completa — no lo vayas parcheando a mano, cada
+sección te remite al archivo entero de nuevo.
 
-```yaml
-# docker-compose.prod.yml — stack de PRODUCCIÓN, standalone (un solo archivo, sin merge).
-#   docker compose -f docker-compose.prod.yml up -d --build
-x-airflow-common: &airflow-common
-  image: pyspark_stack-airflow:3.2.2
-  build:
-    context: .
-    dockerfile: Dockerfile.airflow
-  environment: &airflow-common-env
-    AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow-db:5432/${POSTGRES_DB:-airflow}
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
-    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
-    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:-change-me-in-prod}'
-    AIRFLOW_UID: 50000
-  volumes:
-    - ./dags:/opt/airflow/dags
-  restart: unless-stopped
-  logging:
-    driver: json-file
-    options: { max-size: "10m", max-file: "3" }
-  networks:
-    - hadoopnet
+El archivo es **el mismo** que el de la guía 02, que ya lo trae completo y comentado:
 
-services:
-  airflow-db:
-    image: postgres:16
-    container_name: airflow-db
-    restart: unless-stopped
-    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
-    deploy: { resources: { limits: { memory: 512m } } }
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER:-airflow}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
-      - POSTGRES_DB=${POSTGRES_DB:-airflow}
-    volumes:
-      - /data/postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    networks:
-      - hadoopnet
+| Momento | De dónde lo copiás |
+|---|---|
+| Ahora (mínimo: Airflow + Postgres) | [guía 02 §5.5, Paso 0](../02-produccion-aws-terraform.md#55-desplegar-subir-código-y-túnel-ssh) |
+| Versión definitiva | [guía 02 §14.1](../02-produccion-aws-terraform.md#141-docker-composeprodyml--base) |
 
-  airflow-init:
-    <<: *airflow-common
-    container_name: airflow-init
-    restart: "no"
-    depends_on:
-      airflow-db: { condition: service_healthy }
-    command: >
-      bash -c "
-        airflow db migrate &&
-        airflow fab-db migrate &&
-        airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true"
+Copiá también el **`Dockerfile.airflow.prod`** del Paso 0b de esa misma sección: el Compose lo
+referencia en `build.dockerfile`, y es una imagen distinta de la del dev local.
 
-  airflow-apiserver:
-    <<: *airflow-common
-    container_name: airflow-apiserver
-    command: api-server
-    ports:
-      - "127.0.0.1:8082:8080"
-    depends_on:
-      airflow-db: { condition: service_healthy }
-      airflow-init: { condition: service_completed_successfully }
-
-  airflow-scheduler:
-    <<: *airflow-common
-    container_name: airflow-scheduler
-    command: scheduler
-    depends_on:
-      airflow-db: { condition: service_healthy }
-      airflow-init: { condition: service_completed_successfully }
-
-  airflow-dag-processor:
-    <<: *airflow-common
-    container_name: airflow-dag-processor
-    command: dag-processor
-    depends_on:
-      airflow-db: { condition: service_healthy }
-      airflow-init: { condition: service_completed_successfully }
-
-  airflow-triggerer:
-    <<: *airflow-common
-    container_name: airflow-triggerer
-    command: triggerer
-    depends_on:
-      airflow-db: { condition: service_healthy }
-      airflow-init: { condition: service_completed_successfully }
-
-networks:
-  hadoopnet:
-```
+> **Gotcha §4.5 — no reuses `Dockerfile.airflow`.** Es la imagen del stack local: trae JDK, Spark y
+> Hadoop porque ahí Airflow corre `spark-submit` en el mismo contenedor. Acá el cómputo va a EMR
+> Serverless, así que esos ~1.5 GB solo alargan el build y ocupan disco en una `t3.large`.
+> `Dockerfile.airflow.prod` no los instala. (Esta guía documentaba `Dockerfile.airflow` por una
+> copia vieja; si seguiste una versión anterior, rehacé el build.)
 
 ```bash
 # La EC2 ya existe y está tagueada: `discover` encuentra su id y su IP sola.
@@ -854,6 +786,15 @@ defensa-en-profundidad **sobre** el login de Airflow.
 
 ## 5. Data lake en S3 + cómputo Spark
 
+> **En esta sección: CREAR en la consola, ~45 min.**
+> **Salís con**: los buckets del lake cerrados y cifrados, y una aplicación de EMR
+> Serverless con **su propio** rol de ejecución.
+
+> **La confusión más cara de esta sección**: darle permisos de S3 al rol de la **EC2**
+> no habilita al job de **Spark**. Son dos identidades distintas para dos cómputos
+> distintos. Si el job falla con `AccessDenied`, mirá el rol de ejecución de EMR, no el
+> de la instancia.
+
 Sin HDFS, **todo el dato vive en S3**: data lake durable (`raw/ → curated/ → analytics/`). Los jobs
 Spark de **EMR Serverless** lo leen/escriben con `s3a://` usando **su propio rol de ejecución**
 (§5.4); las tasks Python puro de Airflow usan `s3://` con el **rol IAM de la EC2** — en ambos casos
@@ -918,7 +859,7 @@ aws ssm put-parameter --name "/${NAME_PREFIX}/config/artifacts_bucket" \
 
 Sin CLI: **Systems Manager → Parameter Store → Create parameter**, *Type* **String**, con esos dos
 nombres y el nombre real de cada bucket como valor. El inventario completo del `.env` está en la
-[guía 02 §13.4](02-produccion-aws-terraform.md#134-materializar-env).
+[guía 02 §13.4](../02-produccion-aws-terraform.md#134-materializar-env).
 
 ### 5.2 IAM: permitir S3 a la EC2
 
@@ -1044,7 +985,7 @@ Athena. Consola: **Glue → Data Catalog → Databases → Add database** → no
 **Paso 3 — La aplicación EMR Serverless.** Consola: **EMR → EMR Serverless → Get started / Create and
 launch application** (o **Applications → Create application**).
 
-- *Name* `pyspark-stack-spark` · *Type* **Spark** · *Release version* **emr-7.5.0**.
+- *Name* `pyspark-stack-spark` · *Type* **Spark** · *Release version* **emr-7.13.0**.
 - *Application setup options*: **Use custom settings**:
   - **Pre-initialized capacity**: dejala en **0** (para escalar a cero de verdad).
   - **Application behavior**: **Auto-start** *On*; **Auto-stop** *On*, *idle timeout* **15 minutes**.
@@ -1183,6 +1124,14 @@ gateway endpoint de S3 no cobra por hora ni por GB). Consola: **VPC → Endpoint
 
 ## 6. Orquestación: Lambda trigger-airflow
 
+> **En esta sección: CREAR en la consola, ~40 min.**
+> **Salís con**: los DAGs disparables por cron y por archivo nuevo en `raw/`, sin
+> exponer la API de Airflow.
+
+El disparo va por **SSM**, no por la API REST de Airflow: la Lambda no necesita ruta de
+red a la EC2, solo permiso IAM sobre esa instancia. Es lo que permite que la API siga
+cerrada.
+
 Airflow corre dentro de la EC2. Para dispararlo desde AWS (por cron o cuando llega un archivo a S3)
 se usa una **Lambda que ejecuta `airflow dags trigger` vía SSM `SendCommand`** — sin abrir puertos ni
 depender de la web.
@@ -1190,120 +1139,19 @@ depender de la web.
 ### 6.1 Lambda que dispara los DAGs vía SSM (con retry si la EC2 está apagada + contrato de datos)
 
 **Paso 1 — Crear la función.** Consola: **Lambda → Create function** → *Function name*
-`pyspark-stack-trigger-airflow` · *Runtime* **Python 3.12** → **Create function**. Pegá el código
-(guardalo en el repo como `lambdas/trigger_airflow.py`) y **Deploy**. Dos mejoras sobre la versión
-mínima, idénticas a la guía 02 §7.1: **(a)** si la EC2 está apagada, la Lambda la prende y deja que
-el reintento (SQS para eventos S3, retry async de Lambda para el cron) la reintente sola en unos
-minutos, en vez de fallar en silencio; **(b)** un **contrato de datos** liviano (stdlib, sin Lambda
-Layers) rechaza archivos con columnas faltantes antes de gastar en cómputo de EMR:
+`pyspark-stack-trigger-airflow` · *Runtime* **Python 3.12** → **Create function**. Pegá el código y
+**Deploy**. Trae dos mejoras sobre una Lambda mínima: **(a)** si la EC2 está apagada, la prende y
+deja que el reintento (SQS para eventos S3, retry async de Lambda para el cron) la vuelva a disparar
+en unos minutos, en vez de fallar en silencio; **(b)** un **contrato de datos** liviano (stdlib, sin
+Lambda Layers) rechaza archivos con columnas faltantes antes de gastar en cómputo de EMR.
 
-```python
-# lambdas/trigger_airflow.py
-import os
-import csv
-import json
-import hashlib
-import urllib.parse
-import boto3
+El código es **el mismo** que el de la guía 02. Copialo del bloque `trigger_airflow.py` de
+[guía 02 §7.1](../02-produccion-aws-terraform.md#71-lambda-que-dispara-los-dags-vía-ssm) y pegalo en el editor de la Lambda;
+guardalo en tu repo como `lambdas/trigger_airflow.py` (en la guía 02 es
+`infra/lambdas/trigger_airflow.py`, mismo contenido).
 
-ssm = boto3.client("ssm")
-ec2 = boto3.client("ec2")
-s3  = boto3.client("s3")
-
-INSTANCE_ID = os.environ["INSTANCE_ID"]
-DEFAULT_DAG = os.environ.get("DEFAULT_DAG", "customer_etl_emr")
-
-CONTRACTS = {
-    "orders.csv":    {"order_id", "customer_id", "product_id", "quantity", "order_date"},
-    "customers.csv": {"customer_id", "customer_name", "city", "state", "signup_date"},
-    "products.json": {"product_id", "category", "unit_price"},
-}
-
-
-class ContractViolation(Exception):
-    pass
-
-
-def _peek_columns(bucket, key):
-    body = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-2047")["Body"].read()
-    head = body.decode("utf-8", errors="replace")
-    if key.endswith(".csv"):
-        return set(next(csv.reader([head.splitlines()[0]])))
-    if key.endswith(".json"):
-        try:
-            data = json.loads(head)
-        except json.JSONDecodeError:
-            return None  # muestra cortada a mitad de objeto: no bloqueamos por un falso positivo
-        first = data[0] if isinstance(data, list) and data else data
-        return set(first.keys()) if isinstance(first, dict) else None
-    return None
-
-
-def _validar_contrato(bucket, key):
-    esperado = CONTRACTS.get(key.rsplit("/", 1)[-1])
-    if esperado is None:
-        return
-    columnas = _peek_columns(bucket, key)
-    if columnas is None:
-        return
-    faltan = esperado - columnas
-    if faltan:
-        raise ContractViolation(f"{key}: faltan columnas {sorted(faltan)} (esperadas {sorted(esperado)})")
-
-
-def _ec2_lista(instance_id):
-    state = ec2.describe_instances(InstanceIds=[instance_id]) \
-               ["Reservations"][0]["Instances"][0]["State"]["Name"]
-    if state == "stopped":
-        ec2.start_instances(InstanceIds=[instance_id])
-        return False
-    if state != "running":
-        return False
-    infos = ssm.describe_instance_information(
-        Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
-    )["InstanceInformationList"]
-    return bool(infos) and infos[0]["PingStatus"] == "Online"
-
-
-def _disparar_dag(dag, conf, run_id=None):
-    trigger = f"airflow dags trigger {dag}"
-    if run_id:
-        trigger += f" --run-id '{run_id}'"
-    if conf:
-        trigger += f" --conf '{json.dumps(conf)}'"
-    resp = ssm.send_command(
-        InstanceIds=[INSTANCE_ID], DocumentName="AWS-RunShellScript",
-        Comment=f"trigger airflow dag {dag}",
-        Parameters={"commands": [f"docker exec airflow-scheduler {trigger}"]},
-    )
-    return resp["Command"]["CommandId"]
-
-
-def handler(event, context):
-    """Cron (async directo): {"dag": "customer_etl_emr"}.
-    Evento S3 vía la cola SQS primaria (§6.3): {"Records": [{"body": "<S3 event JSON>"}]}."""
-    bucket = key = run_id = None
-    if "Records" in event and event["Records"] and "body" in event["Records"][0]:
-        rec = json.loads(event["Records"][0]["body"])["Records"][0]["s3"]
-        key = urllib.parse.unquote_plus(rec["object"]["key"])
-        bucket = rec["bucket"]["name"]
-        dag, conf = DEFAULT_DAG, {"bucket": bucket, "key": key}
-        run_id = "s3-" + hashlib.sha256(f"{bucket}/{key}".encode()).hexdigest()[:16]
-    else:
-        dag, conf = event.get("dag", DEFAULT_DAG), {}
-
-    try:
-        if bucket and key:
-            _validar_contrato(bucket, key)
-    except ContractViolation as e:
-        print(f"RECHAZADO por contrato de datos: {e}")
-        return {"status": "rejected", "reason": str(e)}
-
-    if not _ec2_lista(INSTANCE_ID):
-        raise RuntimeError(f"EC2 {INSTANCE_ID} no está lista todavía; reintentar")
-
-    return {"dag": dag, "conf": conf, "commandId": _disparar_dag(dag, conf, run_id)}
-```
+Trae, y conviene no recortarlos, el `run_id` determinístico —que evita el doble dagrun cuando SQS
+reintenta— y el gate barato de contrato de datos por Range GET.
 
 **Paso 2 — Handler y variables.** *Runtime settings → Edit* → **Handler** = `lambda_function.handler`.
 *Configuration → General → Edit* → **Timeout** = **1 min**. *Environment variables*:
@@ -1442,6 +1290,15 @@ Configuration → Triggers → Add trigger** → **SQS** → `pyspark-stack-trig
 
 ## 7. Secretos y parámetros
 
+> **En esta sección: CREAR en la consola, ~20 min.**
+> **Salís con**: los defaults débiles de desarrollo reemplazados por secretos reales en
+> SSM, y el `.env` de la EC2 generado desde ahí en cada despliegue.
+
+> [!WARNING]
+> **Hasta terminar esta sección, el stack corre con credenciales de ejemplo.** El
+> `docker-compose.prod.yml` arranca igual con los defaults de dev, así que nada te va a
+> avisar. No dejes la EC2 accesible desde Internet hasta cerrar esto.
+
 `docker-compose.prod.yml` trae los secretos con defaults débiles de dev (`${POSTGRES_PASSWORD:-airflow}`,
 JWT `change-me-in-prod`, admin/admin). En producción se generan valores fuertes, se
 guardan en **SSM Parameter Store** (SecureString, cifrado con KMS), y la EC2 los lee con su rol IAM y
@@ -1530,12 +1387,12 @@ La policy del Paso 3 ya cubre estos parámetros: `parameter/pyspark-stack/*` inc
 > Si expusiste la web por HTTPS (§4.6), `airflow_domain` ya lo publicaste ahí. Es la única variable
 > extra que necesita el TLS en esta guía: el compose de 02b deriva las rutas del cert del propio
 > `${AIRFLOW_DOMAIN}`, en vez de las cinco variables separadas que usa la
-> [guía 02 §5.6](02-produccion-aws-terraform.md#56-exponer-la-web-de-airflow-https-nativo-solo-tu-ip).
+> [guía 02 §5.6](../02-produccion-aws-terraform.md#56-exponer-la-web-de-airflow-https-nativo-acceso-desde-la-ip-del-operador).
 
 **Paso 4 — Script que materializa el `.env` desde SSM** — `scripts/load-secrets.sh`, que corre
 **en la EC2**.
 
-El contenido está en la [guía 02 §13.4](02-produccion-aws-terraform.md#134-materializar-env) y no se
+El contenido está en la [guía 02 §13.4](../02-produccion-aws-terraform.md#134-materializar-env) y no se
 reproduce acá a propósito: es un archivo del repositorio, y §11 de esta guía fija la regla de no
 mantener una segunda copia que pueda divergir. Copialo de allí tal cual — **funciona igual por
 consola que por Terraform**, porque no depende del state: lee todo lo que cuelga de
@@ -1562,6 +1419,15 @@ docker-compose.prod.yml up -d`.
 ---
 
 ## 8. CI/CD con GitHub Actions (OIDC, sin claves)
+
+> **En esta sección: CONFIGURAR, ~40 min.**
+> **Salís con**: GitHub validando y desplegando sin una sola access key guardada.
+
+> **`[CI]` no se prueba en tu terminal.** Un bloque que corre con tus credenciales de
+> admin no demuestra nada sobre el rol de OIDC: son identidades distintas y fallan
+> distinto. Los dos errores clásicos —`Could not assume role` (el `sub` del trust no
+> coincide con tu org/repo) y `Unable to locate credentials` (falta
+> `permissions: id-token: write`)— solo aparecen del lado de GitHub.
 
 Dos workflows en `.github/workflows/`: `ci.yml` (valida en cada PR/push) y `deploy.yml` (despliega al
 mergear a `main`). GitHub Actions asume un rol IAM vía **OIDC** — sin access keys en el repo. Los
@@ -1686,7 +1552,7 @@ rule** → *Name* `dbt-ci-expire` · *Prefix* `dbt-ci/` · *Expire current versi
 
 ### 8.3 Los workflows
 
-Los workflows son los de la [guía 02 §11](02-produccion-aws-terraform.md#11-cicd-con-github-actions-y-oidc)
+Los workflows son los de la [guía 02 §11](../02-produccion-aws-terraform.md#11-cicd-con-github-actions-y-oidc)
 **menos el job `terraform`**: por este camino no hay IaC que validar. El resto —lint, validación de
 DAGs y security— es idéntico, incluido el detalle que hace que el CI sirva: el job de DAGs instala
 `apache-airflow==3.2.2` con el mismo constraints file que la imagen de producción, para que un DAG no
@@ -1837,7 +1703,7 @@ jobs:
 ```
 
 El test de integridad de DAGs (`tests/test_dag_integrity.py`) es el de la
-[guía 02 §11.3](02-produccion-aws-terraform.md): el repositorio ya trae la versión local, ampliala
+[guía 02 §11.3](../02-produccion-aws-terraform.md): el repositorio ya trae la versión local, ampliala
 con el contrato del DAG de producción.
 
 **Puesta en marcha:** hacé el primer `git push` a `main` que toque `dags/` o `spark-apps/emr/` (con la
@@ -1847,6 +1713,14 @@ encendido). Los PRs disparan **CI**.
 ---
 
 ## 9. Monitoreo
+
+> **En esta sección: CREAR, ~30 min. Es opcional para el primer despliegue.**
+> **Salís con**: Prometheus, Grafana, Alertmanager y Loki corriendo dentro de la misma
+> EC2, sin costo adicional de AWS.
+
+Corre en la misma caja que Airflow: es lo barato, y es también el límite — si la EC2
+cae, cae el monitoreo con ella. Vale como observabilidad de laboratorio, no como
+alerta de disponibilidad.
 
 Observabilidad completa corriendo **dentro de la EC2** junto al `docker-compose`: métricas + alertas
 + logs centralizados (Prometheus + Grafana + Alertmanager + Loki). **No hay recursos de consola AWS
@@ -1881,10 +1755,10 @@ monitoring/
 ```
 
 De estos archivos, `prometheus.yml` y `alerts.yml` están escritos en la [guía 02
-§12.2](02-produccion-aws-terraform.md#122-prometheus); el resto (`statsd_mapping.yml`,
+§12.2](../02-produccion-aws-terraform.md#122-prometheus); el resto (`statsd_mapping.yml`,
 `loki-config.yml`, `promtail-config.yml` y el provisioning de Grafana) es **roadmap**: la guía 02
 lo declara así en §12 y todavía no trae su contenido. El override que los monta es la [guía 02
-§14.2](02-produccion-aws-terraform.md#142-docker-composeprodmonitoringyml--override-de-observabilidad).
+§14.2](../02-produccion-aws-terraform.md#142-docker-composeprodmonitoringyml--override-de-observabilidad).
 Los dos más importantes de tener a mano:
 
 **`monitoring/prometheus/alerts.yml`** (extracto — las alertas de negocio y EMR):
@@ -1943,7 +1817,7 @@ receivers:
         send_resolved: true
 ```
 
-`prometheus.yml` copialo tal cual de la [guía 02 §12.2](02-produccion-aws-terraform.md#122-prometheus).
+`prometheus.yml` copialo tal cual de la [guía 02 §12.2](../02-produccion-aws-terraform.md#122-prometheus).
 Los demás (`statsd_mapping.yml`, `loki-config.yml`, `promtail-config.yml`, el provisioning de
 Grafana y `overview.json`) todavía no están escritos en ninguna de las dos guías: hasta que existan,
 corré solo el Compose base, sin el override de monitoreo.
@@ -1970,6 +1844,14 @@ AWS, no en Prometheus/Loki:
 ---
 
 ## 10. Athena — capa de consumo SQL/BI (opcional)
+
+> **En esta sección: CREAR, ~15 min. Opcional.**
+> **Salís con**: poder consultar el data lake con SQL puro, sin prender Spark ni un
+> cluster.
+
+Es la respuesta a «quiero mirar los datos», que es distinta de «quiero transformarlos».
+Para lo segundo, el criterio de motor está en la
+[guía 02 §17](../02-produccion-aws-terraform.md#17-qué-motor-usar-para-cada-tarea).
 
 Athena consulta el data lake **con SQL puro, sin prender Spark ni un cluster**: paga solo por dato
 escaneado (~$5/TB, mínimo 10 MB/query) y escala a cero. A esta escala el gasto es **~$0/mes**. Sirve
@@ -2047,7 +1929,7 @@ VACUUM pyspark_stack_analytics.ventas;
 
 > Verificá la sintaxis exacta contra tu versión de Athena engine — el soporte de mantenimiento de
 > Iceberg se fue agregando de forma incremental. El detalle completo (DAG semanal, por qué viernes
-> y no domingo por el auto start/stop) está en la [guía 02 §16.3](02-produccion-aws-terraform.md#163-mantenimiento-iceberg).
+> y no domingo por el auto start/stop) está en la [guía 02 §16.3](../02-produccion-aws-terraform.md#163-mantenimiento-iceberg).
 
 **Paso 4 — Permitir que un DAG consulte (rol de la EC2).** Consola: **IAM → Roles →
 `pyspark-stack-ec2-role` → Add permissions → Create inline policy → JSON**:
@@ -2082,19 +1964,36 @@ calidad post-ETL) está en §14.3.
 
 ## 11. Archivos de aplicación: una sola fuente de verdad
 
+> **En esta sección: LEER y aplicar la regla, ~10 min.**
+> **Salís con**: la frontera clara entre lo que crea la consola (infraestructura) y lo
+> que vive en el repositorio (aplicación).
+
+> **La regla que evita el peor problema de esta guía**: la consola crea
+> infraestructura, **no** mantiene una segunda copia de tus archivos de aplicación. Si
+> editás el Compose o un DAG desde la consola de la EC2, el próximo despliegue lo pisa
+> — y si no lo pisa, es peor: divergiste sin darte cuenta.
+
 La consola crea infraestructura; no debe mantener una segunda versión de los archivos del
 repositorio. Usa los artefactos canónicos de
-[`02-produccion-aws-terraform.md`](02-produccion-aws-terraform.md):
+[`02-produccion-aws-terraform.md`](../02-produccion-aws-terraform.md):
 
 | Artefacto | Sección canónica |
 |---|---|
-| `docker-compose.prod.yml` | guía 02 §14 |
+| `docker-compose.prod.yml` | guía 02 §5.5 (mínimo) y §14 (definitivo) |
+| `Dockerfile.airflow.prod` | guía 02 §5.5 |
+| `lambdas/startstop.py` | guía 02 §5.4 |
+| `lambdas/trigger_airflow.py` | guía 02 §7.1 |
 | `scripts/load-secrets.sh` | guía 02 §13.4 |
+| Jobs Spark para EMR Serverless | guía 02 §6.4 |
 | DAG EMR Serverless | guía 02 §9.4 |
 | Deploy de desarrollo | guía 02 §10.1 |
 | Workflows CI/CD | guía 02 §11 |
 | Prometheus y alertas | guía 02 §12 |
 | Runbook de producción | guía 02 §15 |
+
+Los nombres de archivo difieren en un solo punto: la guía 02 guarda las Lambdas bajo
+`infra/lambdas/` porque allá las empaqueta Terraform, y acá van en `lambdas/` porque las pegás
+en la consola. El **contenido es el mismo**; no mantengas dos versiones.
 
 Este documento explica **dónde hacer clic** para crear AWS. La guía 02 explica **qué ejecutar**
 para operar la plataforma.
@@ -2139,6 +2038,12 @@ EMR Serverless lee esos archivos directamente desde S3; no los toma de la EC2.
 
 ## 12. DAGs de producción
 
+> **En esta sección: ESCRIBIR, ~20 min.**
+> **Salís con**: el contrato que cumple todo DAG productivo de este stack.
+
+La idempotencia no es opcional acá: los disparadores de §6 pueden ejecutar el mismo DAG
+dos veces, y S3 puede entregar el mismo evento más de una vez.
+
 El DAG productivo debe:
 
 - recibir `bucket` y `key` mediante `dag_run.conf`;
@@ -2165,6 +2070,13 @@ El script `load-secrets.sh` de la guía 02 v3 genera esos valores en `.env`.
 ---
 
 ## 13. Operación diaria
+
+> **En esta sección: EJECUTAR todos los días.**
+> **Salís con**: el contexto cargado en modo `discover` y los comandos de rutina.
+
+Es el punto de entrada después de cualquier cambio. Si algo no responde, el orden de
+diagnóstico es siempre el mismo: **AWS → EC2/SSM → Docker → Airflow → EMR → datos**.
+Detené en la primera capa que falle.
 
 ### 13.1 Preparar contexto
 
@@ -2234,6 +2146,13 @@ aws emr-serverless get-job-run \
 ---
 
 ## 14. Smoke tests
+
+> **En esta sección: EJECUTAR después de cada cambio, ~10 min.**
+> **Salís con**: la prueba de que la plataforma quedó operativa, no solo creada.
+
+Se ejecutan **de abajo hacia arriba** y se detiene en el primer fallo, a propósito: un
+DAG que no corre no se puede diagnosticar si SSM está offline. Cada test asume el
+anterior verde.
 
 Ejecutá de abajo hacia arriba y detené en el primer fallo.
 
@@ -2307,6 +2226,15 @@ Las UIs no se publican directamente en el security group.
 
 ## 15. Seguridad y costos
 
+> **En esta sección: VERIFICAR, ~20 min.**
+> **Salís con**: la lista de lo que hay que tener cerrado antes de considerar esto
+> algo más que un laboratorio.
+
+> [!WARNING]
+> **Por consola, este control es más frágil que en la guía 02.** No hay `terraform
+> plan` que te muestre en un diff que alguien abrió un puerto o aflojó una policy.
+> Re-verificá esta sección periódicamente, no una sola vez.
+
 ### 15.1 Checklist de seguridad
 
 - [ ] Security group: 22 y, si aplica, 443 solo desde tu `/32`.
@@ -2335,6 +2263,13 @@ Explorer. Incluye EC2, EBS, snapshots, IPv4 pública, S3, EMR Serverless, CloudW
 
 ## 16. DLQ, alertas y gobierno
 
+> **En esta sección: CREAR, ~25 min.**
+> **Salís con**: que nada falle en silencio — cada camino de eventos con su DLQ, y un
+> presupuesto que avise.
+
+Una DLQ sin alarma es un buzón que nadie abre. El objetivo de esta sección no es tener
+la cola: es enterarte.
+
 ### 16.1 DLQ correcta para cada camino
 
 | Origen | Configuración |
@@ -2360,6 +2295,19 @@ No reutilices una única explicación para los tres casos.
 ---
 
 ## 17. Backup, recuperación y eliminación
+
+> **En esta sección: CONFIGURAR el backup; CONSULTAR el resto.**
+> **Salís con**: snapshots automáticos y —lo que casi nadie hace— el procedimiento de
+> eliminación en orden inverso.
+
+> [!WARNING]
+> **§17.3 es la contracara de no tener Terraform: no hay `destroy`.** Eliminar hay que
+> hacerlo a mano, recurso por recurso, en orden inverso al de creación. Saltarse un
+> paso deja cargos facturando en una cuenta que creés vacía —típicamente la EIP, los
+> snapshots y el bucket con versiones—. Seguí la checklist entera y después verificá
+> en Billing, no en la consola de cada servicio.
+>
+> **Un backup no probado no es un backup.** Restaurá una vez antes de necesitarlo.
 
 ### 17.1 Backup
 
@@ -2407,4 +2355,3 @@ Antes de borrar:
 - [Notificaciones S3 desde la consola](https://docs.aws.amazon.com/AmazonS3/latest/userguide/enable-event-notifications.html)
 - [SQS como origen de Lambda](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-configure.html)
 - [Scheduler, reintentos y DLQ](https://docs.aws.amazon.com/scheduler/latest/UserGuide/configuring-schedule-dlq.html)
-

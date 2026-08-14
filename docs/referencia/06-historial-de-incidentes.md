@@ -1,5 +1,29 @@
 # Historial de incidentes del stack local
 
+> **En este documento: CONSULTAR cuando algo se rompa igual. No se lee de corrido.**
+> **Salís con**: la causa real de 8 fallos que ya pasaron —todos con el fix aplicado—
+> y el detalle de la migración a Airflow 3, que es la que explica media configuración
+> del Compose actual.
+
+> [!NOTE]
+> **Todos los fixes están aplicados: no hay nada que ejecutar acá.** Este documento se
+> conserva porque los mismos problemas reaparecen al reconstruir el stack desde cero, o
+> al actualizar una versión. Si te topás con un síntoma parecido, buscá acá **antes**
+> de debuggear: es probable que la causa ya esté escrita, con el efecto dominó incluido.
+
+**Por dónde buscar**: los incidentes #1–#8 (sección 2) son fallos puntuales con
+síntoma, causa y fix. La sección 3 es distinta —es la historia de una migración— y vale
+leerla entera si vas a tocar versiones: muestra cómo un cambio de Airflow arrastró
+Python, Spark y Java en cascada.
+
+> **Los dos que más vuelven**: el **#1** (JSON multilínea que rompe los jobs — está
+> también en el ejemplo 7 de [04](../04-ejemplos-locales.md)) y el **#8** (procesos
+> `docker-proxy` huérfanos que bloquean los puertos, con el stack aparentemente caído).
+
+> **El equivalente en producción** es el catálogo de diagnóstico de la
+> [guía 02 §8.6](../02-produccion-aws-terraform.md#86-diagnóstico-rápido). Este documento cubre el
+> stack local; aquel, la plataforma en AWS.
+
 Registro de los fallos encontrados al poner a punto el stack local (HDFS + Spark standalone +
 Airflow + Jupyter) y de cómo se resolvieron. Es un documento **histórico**: todos los fixes están
 aplicados. Se conserva porque los mismos problemas reaparecen al reconstruir el stack desde cero.
@@ -10,8 +34,8 @@ aplicados. Se conserva porque los mismos problemas reaparecen al reconstruir el 
 
 > La arquitectura de **producción** ya no se parece a esto: el cómputo Spark corre en EMR Serverless
 > y el storage es S3, sin HDFS. HDFS y el Spark standalone descritos acá son el entorno de
-> **desarrollo local**. Ver [02 — Producción en AWS](02-produccion-aws-terraform.md) y
-> [03 — Arquitectura](03-arquitectura.md).
+> **desarrollo local**. Ver [02 — Producción en AWS](../02-produccion-aws-terraform.md) y
+> [03 — Arquitectura](../03-arquitectura.md).
 
 ---
 
@@ -100,7 +124,7 @@ los consumiera. Quedaban además dos `.inprogress` huérfanos de corridas que nu
 
 **Fix aplicado:** `spark.eventLog.enabled false` con un comentario sobre cómo reactivar el
 historial, y borrado de los `.inprogress` huérfanos. Para volver a habilitarlo, ver
-[01 §8.5](01-stack-local.md).
+[01 §8.5](../01-stack-local.md).
 
 ### #5 · Menor — fecha inexistente en el historial de versiones
 

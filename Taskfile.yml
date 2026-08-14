@@ -1,0 +1,330 @@
+version: "3"
+
+# Taskfile de pyspark_stack. Dos mitades:
+#   · producción: copia LITERAL de los bloques de la guía 02, que son su fuente de verdad. La
+#     guía las entrega por partes (§3.0b infra, §5.5 deploy, §6.4 emr, §8 operación, §10.1,
+#     §13.4, §15 release) y `check-doc-env.py` compara todas: editar una sola hace fallar
+#     `task doc:check`.
+#   · locales (default, doc:check, local:*, test): viven solo acá; la guía no las documenta.
+#
+# `prod-env.sh` provee las VARIABLES y este archivo los COMANDOS: ninguna task resuelve un id
+# ni una IP por su cuenta, las lee del cargador vía {{.CTX}}. Y no lo reemplaza — una task
+# corre en un subshell y no puede exportar nada a tu terminal.
+#
+# Sin `includes:` a propósito: go-task los resuelve antes de despachar, así que un include
+# a un archivo que no está en disco rompe hasta `task --list`.
+
+vars:
+  ENV_DIR: infra/envs/prod
+  MODULES: infra/modules
+  CTX: 'set -a; source ./scripts/prod-env.sh >/dev/null; set +a;'   # el subshell no hereda tu contexto
+
+tasks:
+
+  default:
+    desc: "Qué correr primero. El catálogo completo: task --list"
+    silent: true
+    cmds:
+      - |
+        echo "pyspark_stack — tareas principales"
+        echo
+        echo "  task doc:check                   validadores de la documentación (sin AWS)"
+        echo "  task infra:validate              fmt + validate de los módulos y del entorno"
+        echo "  task infra:apply MODULE=storage  aplica un módulo solo (el bucle de la guía 02 §3.0)"
+        echo "  task prod:status                 estado de la EC2, del agente SSM y de los contenedores"
+        echo "  task prod:deploy                 rsync del repo + up --build en la EC2"
+        echo "  task release:check               el gate de §15: validate + plan + compose + pytest"
+        echo
+        echo "El contexto (\$INSTANCE_ID, \$PUBLIC_IP, …) se carga en TU shell con:"
+        echo "  source ./scripts/prod-env.sh"
+
+  # ── documentación ────────────────────────────────────────────────────────────
+  doc:check:
+    desc: "Valida enlaces, anclas, referencias § y el contrato de variables. No toca AWS"
+    cmds:
+      - python3 scripts/check-doc-links.py
+      - python3 scripts/check-doc-env.py
+
+  # ── infraestructura ──────────────────────────────────────────────────────────
+
+  infra:bootstrap:
+    desc: "§4 — crea el bucket del state. State local, una vez por cuenta"
+    cmds:
+      - terraform -chdir=infra/bootstrap init
+      - terraform -chdir=infra/bootstrap apply
+
+  infra:fmt:
+    desc: "Formatea infra/ (lo que infra:validate solo verifica)"
+    cmds:
+      - terraform fmt -recursive infra/
+
+  infra:validate:
+    desc: "fmt -check + validate de los módulos y del entorno. MODULE=<n> acota. Sin credenciales"
+    cmds:
+      - terraform fmt -check -recursive infra/
+      - |
+        # Solo los módulos que ya tienen .tf: §3.0 crea los 13 directorios de una vez.
+        for m in $(if [ -n "{{.MODULE}}" ]; then
+                     for x in {{.MODULE}}; do echo "{{.MODULES}}/$x"; done
+                   else echo {{.MODULES}}/*; fi); do
+          if ! ls "$m"/*.tf >/dev/null 2>&1; then
+            # Vacío sin MODULE: aún no está implementado. Vacío CON MODULE: nombre incorrecto.
+            [ -z "{{.MODULE}}" ] || { echo "sin .tf en $m — ¿el nombre está bien escrito?" >&2; exit 1; }
+            continue
+          fi
+          terraform -chdir="$m" init -backend=false -input=false >/dev/null
+          terraform -chdir="$m" validate || exit 1
+        done
+      - |
+        # Las trust policies de §5.2 son JSON suelto: terraform no las mira.
+        for f in {{.MODULES}}/_shared/*.json; do
+          [ -e "$f" ] || continue
+          jq -e . "$f" >/dev/null
+        done
+      - |
+        # La composición, en cuanto exista.
+        [ -f {{.ENV_DIR}}/main.tf ] || exit 0
+        terraform -chdir={{.ENV_DIR}} init -backend=false -input=false >/dev/null
+        terraform -chdir={{.ENV_DIR}} validate
+
+  infra:init:
+    desc: "init contra el backend S3. Hace falta tras componer un módulo nuevo"
+    cmds:
+      - terraform -chdir={{.ENV_DIR}} init
+
+  infra:plan:
+    desc: "Plan completo guardado en tfplan. Es el que se revisa antes de aplicar"
+    deps: [infra:init]
+    cmds:
+      - terraform -chdir={{.ENV_DIR}} plan -out=tfplan
+      - terraform -chdir={{.ENV_DIR}} show tfplan
+
+  infra:apply:
+    desc: "Aplica. MODULE=<n> aplica solo ese módulo; acepta varios entre comillas"
+    deps: [infra:init]
+    cmds:
+      - |
+        if [ -n "{{.MODULE}}" ]; then
+          targets=""
+          for x in {{.MODULE}}; do targets="$targets -target=module.$x"; done
+          terraform -chdir={{.ENV_DIR}} apply $targets
+        else
+          terraform -chdir={{.ENV_DIR}} apply
+        fi
+
+  infra:output:
+    desc: "Todos los outputs. NAME=<output> devuelve uno solo, en crudo"
+    cmds:
+      - |
+        if [ -n "{{.NAME}}" ]; then
+          terraform -chdir={{.ENV_DIR}} output -raw {{.NAME}}
+        else
+          terraform -chdir={{.ENV_DIR}} output
+        fi
+
+  # ── operación ────────────────────────────────────────────────────────────────
+
+  prod:wait:
+    desc: "§5.5 — espera el boot: status-ok, cloud-init y /data montado"
+    cmds:
+      - |
+        {{.CTX}}
+        aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+        ssh-keygen -f ~/.ssh/known_hosts -R "$PUBLIC_IP" >/dev/null 2>&1 || true   # la EIP sobrevive, la host key no
+        $SSH -o StrictHostKeyChecking=accept-new "$SSH_TARGET" \
+          'cloud-init status --wait && mountpoint /data && systemctl is-active docker'
+
+  prod:status:
+    desc: "§8.1 — estado real: EC2, agente SSM y contenedores"
+    cmds:
+      - |
+        {{.CTX}}
+        aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+          --query 'Reservations[].Instances[].{id:InstanceId,state:State.Name,ip:PublicIpAddress}' --output table
+        aws ssm describe-instance-information \
+          --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+          --query 'InstanceInformationList[].PingStatus' --output text
+        $SSH "$SSH_TARGET" "docker ps --format '{{`{{.Names}}`}}\t{{`{{.Status}}`}}'" || true
+
+  prod:deploy:
+    desc: "§5.5 y §15 paso 4 — rsync del repo + load-secrets + up --build"
+    cmds:
+      - |
+        {{.CTX}}
+        ssh-keygen -f ~/.ssh/known_hosts -R "$PUBLIC_IP" >/dev/null 2>&1 || true
+        rsync -az --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
+          -e "$RSYNC_SSH" ./ "$SSH_TARGET:$REMOTE_DIR/"
+        # load-secrets.sh existe recién desde §13.4; antes de eso esta línea no hace nada.
+        $SSH "$SSH_TARGET" "cd $REMOTE_DIR && \
+          if [ -x scripts/load-secrets.sh ]; then ./scripts/load-secrets.sh; fi && \
+          docker compose -f $COMPOSE_PROD up -d --build"
+
+  prod:secrets:
+    desc: "§13.4 — regenera el .env desde SSM y reinicia el stack"
+    cmds:
+      - |
+        {{.CTX}}
+        $SSH "$SSH_TARGET" "cd $REMOTE_DIR && ./scripts/load-secrets.sh && \
+          docker compose -f $COMPOSE_PROD up -d"
+
+  prod:tunnel:
+    desc: "§5.5 — túnel a la UI de Airflow en localhost:8082. Ocupa la terminal"
+    interactive: true
+    cmds:
+      - |
+        {{.CTX}}
+        $SSH -L 8082:localhost:8082 "$SSH_TARGET"
+
+  prod:smoke:
+    desc: "§8.2 — smoke test por SSM: el mismo canal que usan las automatizaciones"
+    cmds:
+      # No `terraform validate` suelto: sin init previo falla con "Module not installed".
+      - task: infra:validate
+      - |
+        {{.CTX}}
+        aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+        aws ssm describe-instance-information \
+          --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+          --query 'InstanceInformationList[0].PingStatus' --output text
+        aws emr-serverless get-application --application-id "$EMR_APP_ID" \
+          --query 'application.state' --output text
+      - |
+        {{.CTX}}
+        PARAMS="$(jq -nc --arg dir "$REMOTE_DIR" --arg compose "$COMPOSE_PROD" '{commands: [
+          "cd \($dir)",
+          "mountpoint /data",
+          "docker compose -f \($compose) config --quiet",
+          "docker compose -f \($compose) ps",
+          "docker compose -f \($compose) exec -T airflow-scheduler airflow dags list-import-errors --output json"
+        ]}')"
+        CMD_ID="$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+          --document-name AWS-RunShellScript --parameters "$PARAMS" \
+          --query 'Command.CommandId' --output text)"
+        aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" || true
+        aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+          --query '{status:Status,stdout:StandardOutputContent,stderr:StandardErrorContent}'
+        # El gate: cualquier estado que no sea Success hace fallar la task.
+        [ "$(aws ssm get-command-invocation --command-id "$CMD_ID" \
+             --instance-id "$INSTANCE_ID" --query Status --output text)" = "Success" ]
+
+  prod:e2e:
+    desc: "§8.3 — espera Lambda → SSM → Airflow → EMR y exige SUCCESS. DAG=<id> para otro DAG"
+    vars:
+      DAG: '{{.DAG | default "customer_etl_emr"}}'
+    cmds:
+      - |
+        {{.CTX}}
+        OLD_JOB_ID="$(aws emr-serverless list-job-runs --application-id "$EMR_APP_ID" \
+          --query 'sort_by(jobRuns,&createdAt)[-1].id' --output text)"
+        aws lambda invoke --function-name "$LAMBDA_TRIGGER_NAME" \
+          --cli-binary-format raw-in-base64-out \
+          --payload '{"dag":"{{.DAG}}","conf":{"source":"task-e2e"}}' \
+          /tmp/trigger-response.json
+        cat /tmp/trigger-response.json
+        CMD_ID="$(jq -r '.commandId // empty' /tmp/trigger-response.json)"   # 200 solo dice que atendió
+        [ -n "$CMD_ID" ] || { echo "la Lambda no devolvió commandId — revise su log"; exit 1; }
+        aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" || true
+        aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID"
+        [ "$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+             --query Status --output text)" = "Success" ]
+        JOB_ID=""
+        for _ in $(seq 1 40); do
+          JOB_ID="$(aws emr-serverless list-job-runs --application-id "$EMR_APP_ID" \
+            --query 'sort_by(jobRuns,&createdAt)[-1].id' --output text)"
+          [ -n "$JOB_ID" ] && [ "$JOB_ID" != "None" ] && [ "$JOB_ID" != "$OLD_JOB_ID" ] && break
+          sleep 15
+        done
+        [ -n "$JOB_ID" ] && [ "$JOB_ID" != "None" ] && [ "$JOB_ID" != "$OLD_JOB_ID" ] || \
+          { echo "Airflow no creó un job EMR nuevo en 10 minutos" >&2; exit 1; }
+        for _ in $(seq 1 80); do
+          STATE="$(aws emr-serverless get-job-run --application-id "$EMR_APP_ID" \
+            --job-run-id "$JOB_ID" --query 'jobRun.state' --output text)"
+          case "$STATE" in SUCCESS) break ;; FAILED|CANCELLED|CANCELLING) break ;; esac
+          sleep 15
+        done
+        aws emr-serverless get-job-run --application-id "$EMR_APP_ID" --job-run-id "$JOB_ID" \
+          --query 'jobRun.{id:jobRunId,state:state,detail:stateDetails}'
+        [ "$STATE" = "SUCCESS" ]
+        if [ "{{.DAG}}" = "customer_etl_emr" ]; then
+          KEY_COUNT="$(aws s3api list-objects-v2 --bucket "$DATALAKE_BUCKET" \
+            --prefix "curated/customer_loyalty/dt=$(date -u +%F)/" --max-items 1 \
+            --query KeyCount --output text)"
+          [ "$KEY_COUNT" -gt 0 ]
+        fi
+
+  prod:logs:
+    desc: "§8.6 — último job de EMR y logs de los contenedores"
+    cmds:
+      - |
+        {{.CTX}}
+        aws emr-serverless list-job-runs --application-id "$EMR_APP_ID" \
+          --query 'sort_by(jobRuns,&createdAt)[-1].[id,state,stateDetails]' --output text
+        $SSH "$SSH_TARGET" "cd $REMOTE_DIR && docker compose -f $COMPOSE_PROD logs --tail=50"
+
+  emr:sync:
+    desc: "§6.4 — publica spark-apps/emr/ en artifacts: es lo que EMR ejecuta"
+    cmds:
+      - |
+        {{.CTX}}
+        aws s3 sync spark-apps/emr/ "$EMR_ENTRYPOINTS_URI/" --delete
+
+  dev:sync:
+    desc: "§10.1 — solo dags/ y spark-apps/ + reserialize. No es un despliegue"
+    cmds:
+      - ./scripts/deploy-dev.sh
+
+  # ── promoción (§15) ──────────────────────────────────────────────────────────
+
+  release:check:
+    desc: "§15 paso 1 — fmt, validate, plan -out=tfplan, compose config y pytest. No aplica"
+    cmds:
+      - |
+        {{.CTX}}
+        ./scripts/prod-env.sh --check
+        aws sts get-caller-identity
+      - task: infra:validate
+      - task: infra:plan
+      - |
+        {{.CTX}}
+        CHECK_ENV="$(mktemp)"
+        trap 'rm -f "$CHECK_ENV"' EXIT
+        printf '%s\n' \
+          'POSTGRES_USER=check' 'POSTGRES_PASSWORD=check' 'POSTGRES_DB=check' \
+          'AIRFLOW_JWT_SECRET=check' 'AIRFLOW_ADMIN_USER=check' 'AIRFLOW_ADMIN_PASSWORD=check' \
+          'EMR_APP_ID=check' 'EMR_JOB_ROLE_ARN=arn:aws:iam::000000000000:role/check' \
+          'EMR_LOG_GROUP=/aws/emr-serverless/check' 'STARTSTOP_LAMBDA_NAME=check' \
+          'DATALAKE_BUCKET=check' 'ARTIFACTS_BUCKET=check' > "$CHECK_ENV"
+        PROD_ENV_FILE="$CHECK_ENV" docker compose --env-file "$CHECK_ENV" \
+          -f "$COMPOSE_PROD" config --quiet
+      - pytest -q
+
+  release:apply:
+    desc: "§15 paso 2 — aplica el plan revisado (tfplan), no un apply sin plan guardado"
+    cmds:
+      - terraform -chdir={{.ENV_DIR}} apply tfplan
+      - |
+        echo "Recargue el contexto en su shell:"
+        echo "  PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh"
+
+  release:deploy:
+    desc: "§15 pasos 3-5 — esperar el host, desplegar y publicar los entrypoints"
+    cmds:
+      - task: prod:wait
+      - task: prod:deploy
+      - task: emr:sync
+
+  # ── local (Tramo I; no las documenta la guía 02) ──────────────────────────────
+  local:up:
+    desc: "Levanta el stack local"
+    cmds:
+      - docker compose up -d
+
+  local:down:
+    desc: "Baja el stack local conservando los volúmenes"
+    cmds:
+      - docker compose down
+
+  test:
+    desc: "Tests de integridad de los DAGs"
+    cmds:
+      - pytest -q

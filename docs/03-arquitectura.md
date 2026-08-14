@@ -3,14 +3,29 @@
 Mapa conceptual del camino de producción: responsabilidades, fronteras y flujos. El *cómo*
 ejecutable está en la [guía 02](02-produccion-aws-terraform.md); acá está el porqué.
 
+> **En este documento: LEER, ~25 min. No hay nada que ejecutar.**
+> **Salís con**: entender **por qué** el stack de producción está armado así —y, más
+> útil, qué se descartó y con qué criterio. El *cómo* ejecutable está en la
+> [guía 02](02-produccion-aws-terraform.md).
+
+> [!IMPORTANT]
+> **Leé esto ANTES de la guía 02, no después.** La guía 02 pide explícitamente que no
+> rediscutas las decisiones mientras la seguís, y este es el documento donde esas
+> decisiones se justifican. Si empezás a aplicar Terraform preguntándote «¿por qué EMR
+> Serverless y no un cluster?», vas a interrumpir el stand-up para resolver algo que
+> está resuelto acá (y en la sección 6, *Qué no se usa y por qué*).
+
 **Diseño de referencia:** Airflow y Postgres en una EC2 `t3.large`, Spark en EMR Serverless, datos
 Parquet en S3, Glue Data Catalog, Lambdas/EventBridge/SQS para disparo y auto start/stop, secretos en
 SSM y CI de validación sin permisos de escritura sobre AWS.
 
 **Arquitectura objetivo:** tablas Iceberg en `curated/` y `analytics/`, dbt, Great Expectations,
 OpenLineage y observabilidad con Prometheus, Grafana, Alertmanager, Loki y Promtail. Aparecen en los
-diagramas para mostrar la evolución prevista; hoy son roadmap, no inventario desplegable. La
-[matriz de estado](README.md) es la fuente de verdad.
+diagramas para mostrar la evolución prevista; hoy son roadmap, no inventario desplegable.
+
+**Cómo leer los diagramas, entonces**: mezclan las dos capas a propósito. Lo que está
+desplegable y lo que es diseño lo separa la [matriz de estado](README.md), que es la
+fuente de verdad — no estos diagramas. Ante una diferencia entre ambos, gana la matriz.
 
 ## Configuración de referencia
 
@@ -19,7 +34,7 @@ diagramas para mostrar la evolución prevista; hoy son roadmap, no inventario de
 | Región AWS | `us-east-1` | `var.aws_region`, guía 02 §5.1 |
 | Availability Zone | `us-east-1a` (fija, para que el EBS `/data` no se recree) | `var.availability_zone`, guía 02 §5.1 |
 | Instancia orquestadora | `t3.large` (Airflow + Postgres + monitoreo, sin Spark) | `var.instance_type`, guía 02 §5.1 |
-| Motor Spark | EMR Serverless, `emr-7.5.0` | `release_label`, guía 02 §6.4 |
+| Motor Spark | EMR Serverless, `emr-7.13.0` | `release_label`, guía 02 §6.4 |
 | Formato actual / objetivo | Parquet / Apache Iceberg sobre Glue Data Catalog | guía 02 §16 |
 | IP del cliente | `${MY_IP_CIDR}` — única fuente de SSH (22) y HTTPS (443) | `var.my_ip_cidr`, guía 02 §5.1 |
 | Dominio de Airflow (opcional) | vacío por defecto = solo túnel SSH | `var.airflow_domain`, guía 02 §5.6 |
@@ -78,7 +93,7 @@ flowchart TD
         end
 
         %% CÓMPUTO Y DATA LAKE
-        emrs["⚡ EMR Serverless (Spark emr-7.5.0)<br/>Pago por uso · Escala a cero"]
+        emrs["⚡ EMR Serverless (Spark emr-7.13.0)<br/>Pago por uso · Escala a cero"]
 
         subgraph S3["🪣 Amazon S3"]
             raw["raw/ (Archivos sueltos)"]
@@ -348,7 +363,7 @@ stack híbrido.
 [guía 02 §6.4](02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless)):
 
 - El job Spark escribe con `df.writeTo("glue_catalog.<db>.<tabla>")` en vez de `.write.parquet(...)`,
-  usando el conector Iceberg embebido en el runtime `emr-7.5.0` — no hay nada que instalar.
+  usando el conector Iceberg embebido en el runtime `emr-7.13.0` — no hay nada que instalar.
 - Ese mismo catálogo es el `aws_glue_catalog_database` que usa Athena: una sola base de datos, sin
   crawlers, porque Iceberg registra y actualiza la metadata en cada escritura.
 - Desde Athena (engine v3) o desde dbt (target `athena`) se puede `SELECT`, `MERGE`, `UPDATE`,

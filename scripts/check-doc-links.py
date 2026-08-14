@@ -36,15 +36,29 @@ CROSS_REF = re.compile(
 )
 BARE_REF = re.compile(r"§(\d+\.\d+[a-z]?)")
 
+# Cada guía es una familia de archivos: hoy todas tienen uno solo, pero el índice de secciones
+# se arma con la unión de la familia, así que partir un documento en varios no rompe una sola
+# referencia `§X.Y` — solo hay que sumar el archivo nuevo acá.
+#
+# Las rutas son relativas a `docs/`: en el árbol solo quedan arriba los cuatro documentos
+# centrales, y el material de consulta vive en `referencia/`. Los nombres de archivo son únicos
+# en todo el árbol, así que el resto del script indexa por nombre y no por ruta.
 GUIDES = {
-    "01": "01-stack-local.md",
-    "02": "02-produccion-aws-terraform.md",
-    "02b": "02b-produccion-aws-consola.md",
-    "03": "03-arquitectura.md",
-    "04": "04-ejemplos-locales.md",
-    "05": "05-production-readiness.md",
-    "06": "06-historial-de-incidentes.md",
+    "01": ["01-stack-local.md"],
+    "02": ["02-produccion-aws-terraform.md"],
+    "02b": ["referencia/02b-produccion-aws-consola.md"],
+    "03": ["03-arquitectura.md"],
+    "04": ["04-ejemplos-locales.md"],
+    "05": ["referencia/05-production-readiness.md"],
+    "06": ["referencia/06-historial-de-incidentes.md"],
 }
+
+# Nombre de archivo -> guía a la que pertenece, para resolver un `§X.Y` suelto contra toda su
+# familia. Se indexa por nombre porque los documentos no comparten carpeta.
+FAMILY_OF = {
+    Path(rel).name: guide for guide, rels in GUIDES.items() for rel in rels
+}
+MEMBERS = {guide: {Path(rel).name for rel in rels} for guide, rels in GUIDES.items()}
 
 def strip_code(text: str) -> str:
     """Quita los bloques ``` conservando la numeración de líneas.
@@ -94,7 +108,7 @@ def sections_of(text: str) -> set[str]:
 
 def main() -> int:
     broken: list[str] = []
-    docs = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
+    docs = [ROOT / "README.md", *sorted((ROOT / "docs").rglob("*.md"))]
 
     anchors: dict[str, set[str]] = {}
     sections: dict[str, set[str]] = {}
@@ -102,6 +116,12 @@ def main() -> int:
         text = doc.read_text(encoding="utf-8")
         anchors[doc.name] = anchors_of(text)
         sections[doc.name] = sections_of(text)
+
+    # Secciones por guía: la unión de todos los archivos de la familia.
+    guide_sections: dict[str, set[str]] = {
+        guide: set().union(*(sections.get(n, set()) for n in names))
+        for guide, names in MEMBERS.items()
+    }
 
     for doc in docs:
         text = doc.read_text(encoding="utf-8")
@@ -128,22 +148,23 @@ def main() -> int:
         for match in CROSS_REF.finditer(text):
             cross_spans.append(match.span())
             guide = match.group(1).lower()
-            target_doc = GUIDES[guide]
-            if target_doc == doc.name:
+            if doc.name in MEMBERS[guide]:
                 continue  # se autorreferencia por nombre: se valida como local
             nums = [match.group(2), *re.findall(r"§(\d+(?:\.\d+[a-z]?)?)", match.group(3) or "")]
             for num in nums:
-                if num not in sections.get(target_doc, set()):
+                if num not in guide_sections[guide]:
                     broken.append(
-                        f"{at(match.start())}: §{num} no existe en la guía {guide} ({target_doc})"
+                        f"{at(match.start())}: §{num} no existe en la guía {guide}"
                     )
 
+        # Un `§X.Y` suelto se resuelve contra la guía entera, no contra el archivo suelto.
+        own = guide_sections.get(FAMILY_OF.get(doc.name, ""), sections[doc.name])
         for match in BARE_REF.finditer(text):
             if any(s <= match.start() < e for s, e in cross_spans):
                 continue
-            if match.group(1) not in sections[doc.name]:
+            if match.group(1) not in own:
                 broken.append(
-                    f"{at(match.start())}: §{match.group(1)} no existe en este documento"
+                    f"{at(match.start())}: §{match.group(1)} no existe en esta guía"
                 )
 
     if broken:

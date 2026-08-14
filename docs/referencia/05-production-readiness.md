@@ -1,32 +1,65 @@
 # Checklist de preparación para producción
 
-Este checklist es el gate entre «código preparado» y «despliegue autorizado». No ejecuta cambios en
-AWS. Se aplica una vez construido el árbol de producción siguiendo la
-[guía 02](02-produccion-aws-terraform.md): `infra/`, `docker-compose.prod.yml`, `scripts/` y los
-workflows de CI/CD.
+> **En este documento: VERIFICAR, ~45 min. No ejecuta ningún cambio en AWS.**
+> **Salís con**: una decisión binaria —desplegar o no— respaldada por evidencia, en vez
+> de por la sensación de que «parece que está todo».
 
-Guardá como evidencia la salida de cada control y registrá las excepciones con responsable, fecha de
-vencimiento y riesgo aceptado.
+> [!IMPORTANT]
+> **Este checklist es un gate, no una guía.** Se corre **después** de haber construido
+> el árbol de producción siguiendo la [guía 02](../02-produccion-aws-terraform.md) y
+> **antes** del runbook de puesta en producción
+> ([02 §15](../02-produccion-aws-terraform.md#15-runbook-de-puesta-en-producción)). Si un control no
+> pasa, el fix está en la guía 02 — acá solo se verifica.
+
+```mermaid
+flowchart TD
+    G02["Guía 02 §4–§14<br/><i>árbol de producción construido</i>"]
+    C1["1 · Repositorio<br/><i>validadores, CI verde, nada sensible en git</i>"]
+    C2["2 · Configuración estática<br/><i>fmt, validate, compose config, pytest</i>"]
+    C3["3 · Seguridad previa<br/><i>MFA, /32, SSM, IMDSv2, IAM revisado</i>"]
+    C4["4 · Plan de Terraform<br/><i>sin reemplazos inesperados</i>"]
+    C5["5 · Primera validación integrada<br/><i>SSM, /data, DAG, job EMR, idempotencia</i>"]
+    C6["6 · HTTPS (opcional)"]
+    C7["7 · Criterio de salida"]
+    OK["✅ Despliegue autorizado<br/>→ guía 02 §15, runbook"]
+    NO["⛔ No desplegar<br/><i>volver a la guía 02<br/>a la sección que falló</i>"]
+
+    G02 --> C1 --> C2 --> C3 --> C4 --> C5 --> C6 --> C7
+    C7 -->|toda la evidencia| OK
+    C7 -->|falta algo| NO
+
+    style OK fill:#d4edda,stroke:#155724
+    style NO fill:#f8d7da,stroke:#721c24
+```
+
+**La regla que hace útil a este documento**: una casilla sin evidencia guardada es una
+casilla sin marcar. «Me parece que sí» no es un control — la salida del comando, sí.
+Guardá esa salida, y registrá cada excepción con responsable, fecha de vencimiento y
+riesgo aceptado. Una excepción sin fecha no es una excepción: es un problema que
+acordaron olvidar.
+
+Se aplica sobre el árbol de producción completo: `infra/`, `docker-compose.prod.yml`,
+`scripts/` y los workflows de CI/CD.
 
 ## 1. Repositorio
 
-- [ ] `python3 scripts/check-doc-links.py` termina sin errores (enlaces, anclas y referencias `§`,
-      locales y cruzadas entre guías).
-- [ ] `python3 scripts/check-doc-env.py` termina sin errores (contrato de variables de entorno:
-      orden incremental, nombres, fences, sintaxis `bash -n` y ausencia de literales en los
-      comandos de las guías).
+- [ ] `task doc:check` termina sin errores: `check-doc-links.py` (enlaces, anclas y referencias
+      `§`, locales y cruzadas) y `check-doc-env.py` (contrato de variables: orden incremental,
+      nombres, fences, sintaxis `bash -n` y ausencia de literales en los comandos).
+- [ ] `task --list` muestra las tasks de producción de [guía 02 §3.0b](../02-produccion-aws-terraform.md#30b-el-orquestador-de-comandos-taskfileyml),
+      no solo las locales: si faltan, el `Taskfile.yml` quedó sin la mitad de producción.
 - [ ] `./scripts/prod-env.sh --check` muestra todas las obligatorias con valor, y el `ACCOUNT_ID`
       es el de la cuenta de producción esperada.
 - [ ] CI está verde sobre el commit candidato.
 - [ ] El árbol de trabajo está limpio y el commit está etiquetado.
-- [ ] No hay `.env`, `infra/prod/prod.env`, `*.tfvars`, `*.tfstate`, claves ni certificados
+- [ ] No hay `.env`, `infra/envs/prod/prod.env`, `*.tfvars`, `*.tfstate`, claves ni certificados
       versionados (`git status --porcelain --ignored=no` limpio tras un `apply`).
 - [ ] Las imágenes y dependencias fueron revisadas y sus actualizaciones son deliberadas.
 
 ## 2. Configuración estática
 
-- [ ] `terraform fmt -check -recursive` termina sin errores.
-- [ ] `terraform -chdir=infra/prod init -backend=false && terraform -chdir=infra/prod validate`.
+- [ ] `task infra:validate` termina sin errores: cubre el `fmt -check` de `infra/`, el
+      `init -backend=false && validate` de **cada** módulo y el del entorno.
 - [ ] `docker compose config --quiet` valida el stack local.
 - [ ] El Compose de producción valida con valores de prueba, nunca con secretos reales.
 - [ ] Si se usa el override de observabilidad, `monitoring/` existe y ambos archivos validan juntos.
@@ -48,7 +81,7 @@ vencimiento y riesgo aceptado.
 
 ## 4. Plan de Terraform
 
-- [ ] Se guardó `terraform plan -out=...` y se revisó el resumen completo.
+- [ ] Se guardó el plan (`task infra:plan`, o el `release:check` completo) y se revisó el resumen.
 - [ ] No hay reemplazo inesperado de EC2, EBS, buckets, roles ni reglas de red.
 - [ ] Toda operación destructiva está justificada y respaldada.
 - [ ] Costos, región, AZ, horarios UTC y retención coinciden con el entorno.

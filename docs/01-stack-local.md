@@ -1,13 +1,42 @@
 # El stack local, bloque por bloque
 
-Cómo está construido el `docker-compose.yml` (HDFS + Spark + Jupyter + Airflow 3), el porqué de cada
-decisión y cómo endurecerlo sin romper la comodidad del desarrollo.
+> Tramo I del stack: el entorno donde desarrollás y donde todo tiene que funcionar
+> **antes** de tocar AWS. Cómo está construido el `docker-compose.yml` (HDFS + Spark +
+> Jupyter + Airflow 3), el porqué de cada decisión y cómo endurecerlo sin romper la
+> comodidad del desarrollo.
 
-> **Dev y prod no son lo mismo.** Este Compose es el entorno de **desarrollo local**, self-contained.
-> En **producción** la arquitectura es híbrida: Airflow sigue orquestando desde una EC2 chica, pero
-> el cómputo Spark se delega a EMR Serverless y el storage es S3 (`s3a://`), sin HDFS. Se desarrolla
-> acá y se despliega allá; el stack local no cambia. Ver [02](02-produccion-aws-terraform.md) y
-> [03](03-arquitectura.md).
+> [!IMPORTANT]
+> **Dev y prod no son lo mismo, y la diferencia es deliberada.** Este Compose es el
+> entorno de **desarrollo local**, self-contained: trae su propio HDFS y su propio
+> cluster Spark. En **producción** la arquitectura es híbrida: Airflow sigue
+> orquestando desde una EC2 chica, pero el cómputo Spark se delega a **EMR
+> Serverless** y el storage es **S3** (`s3a://`) — **sin HDFS**. Se desarrolla acá y
+> se despliega allá; el stack local no cambia. Ver
+> [02](02-produccion-aws-terraform.md) y [03](03-arquitectura.md).
+>
+> **Qué implica en la práctica**: un job que dependa de rutas `hdfs://` escritas a
+> mano funciona acá y falla allá. Parametrizá la URI base desde el principio (el
+> ejemplo 13 de [04](04-ejemplos-locales.md) muestra cómo).
+
+> **En este documento: LEER (~40 min) y EJECUTAR el endurecimiento de la sección 8.**
+> **Salís con**: entender por qué cada servicio está donde está —no solo cómo
+> levantarlo—, y con el stack endurecido lo suficiente para que sea un laboratorio y
+> no una máquina abierta.
+
+**Qué hacés en cada sección:**
+
+| Sección | Qué hacés | Detalle |
+|---|---|---|
+| **1–2** | **Leer** (~10 min) | El mapa de los 4 subsistemas y el patrón de anclas YAML que evita repetir configuración |
+| **3–6** | **Leer** (~20 min) | Un subsistema por sección: HDFS, Spark, Jupyter, Airflow. Se leen en orden: cada uno asume el anterior |
+| **7** | **Leer** (~5 min) | Red, volúmenes y orden de arranque — por qué `depends_on` no alcanza |
+| **8** | **Ejecutar** (~20 min) | Endurecimiento: secretos, límites, healthchecks, `docker.sock`. Es lo único que cambia archivos |
+| **9** | **Consultar** | El checklist de calidad, para verificar antes de pasar a producción |
+
+> [!TIP]
+> **Si lo que querés es *usar* el stack, no entenderlo**, este no es el documento:
+> andá a [04 — Ejemplos locales](04-ejemplos-locales.md), que arranca con levantar,
+> verificar, apagar y reanudar. Volvé acá cuando algo no haga lo que esperabas.
 
 ## Índice
 
@@ -25,6 +54,10 @@ decisión y cómo endurecerlo sin romper la comodidad del desarrollo.
 
 ## 1. Visión general
 
+> **En esta sección: LEER, ~5 min.**
+> **Salís con**: el mapa de los 4 subsistemas y la regla de red que explica la mitad
+> de los errores de conexión de este stack.
+
 El Compose levanta cuatro subsistemas en una sola red de Docker (`hadoopnet`):
 
 | Subsistema | Servicios | Rol |
@@ -33,6 +66,21 @@ El Compose levanta cuatro subsistemas en una sola red de Docker (`hadoopnet`):
 | Cómputo | `spark-master`, `spark-worker` | Cluster Spark 4.0.3 standalone |
 | Interactivo | `jupyter` | Driver PySpark para trabajo exploratorio |
 | Orquestación | `airflow-*` (5) + `airflow-db` | Airflow 3.2.2 + Postgres 16 |
+
+**Los comandos del día a día están en el `Taskfile.yml` de la raíz**, versionado, para que sean los
+mismos en tu máquina y en el CI. Estas son las tasks locales; el archivo ya incluye también las de
+producción, cuyo orden explica la [guía 02 §3.0b](02-produccion-aws-terraform.md#30b-el-orquestador-de-comandos-taskfileyml):
+
+| Task | Qué hace |
+|---|---|
+| `task local:up` | `docker compose up -d` — levanta los cuatro subsistemas |
+| `task local:down` | Baja el stack **conservando** los volúmenes (los datos de HDFS y Postgres siguen ahí) |
+| `task test` | `pytest -q` — los controles de integridad de los DAGs |
+| `task doc:check` | Los dos validadores de la documentación — no tocan AWS |
+| `task --list` | El catálogo completo, incluidas las tasks de producción de la [guía 02](02-produccion-aws-terraform.md) |
+
+No son obligatorias: cada bloque de esta guía muestra el comando `docker compose` completo, porque
+lo que se explica acá es el Compose, no el atajo. El Taskfile es para después, cuando ya lo conocés.
 
 Regla base: dentro de una red de Compose, el nombre del servicio **es** el hostname DNS. Por eso
 `spark://spark-master:7077` y `hdfs://hdfs-namenode:9000` resuelven solos. Nunca uses `localhost`
@@ -54,6 +102,13 @@ entre contenedores: dentro de un contenedor, `localhost` es ese mismo contenedor
 ---
 
 ## 2. El patrón de anclas YAML
+
+> **En esta sección: LEER, ~5 min.**
+> **Salís con**: saber por qué el Compose no repite 20 líneas por servicio, y cómo
+> tocar la configuración común sin editarla en cinco lugares.
+
+Es la sección que hace legible todo lo que viene después: si no reconocés `&anchor` y
+`<<: *anchor`, los bloques de las secciones 3–6 van a parecer incompletos.
 
 ```yaml
 x-airflow-common: &airflow-common
@@ -109,6 +164,16 @@ Volúmenes compartidos:
 
 ## 3. Almacenamiento: HDFS
 
+> **En esta sección: LEER, ~5 min.**
+> **Salís con**: entender el par namenode/datanode y por qué su volumen es lo único
+> del stack que no se puede recrear alegremente.
+
+> [!NOTE]
+> **HDFS es solo local.** En producción no existe: el storage es S3 (`s3a://`). Está
+> acá para que puedas practicar el modelo de archivos distribuido sin pagar nada, no
+> porque sea el destino. Los ejemplos que lo usan lo dicen explícitamente
+> ([04 — ejemplo 6](04-ejemplos-locales.md)).
+
 ```yaml
   hdfs-namenode:
     image: chandravenkat/hadoop-namenode@sha256:51ad92...   # el "índice" (metadatos)
@@ -140,6 +205,16 @@ Volúmenes compartidos:
 ---
 
 ## 4. Cómputo: Spark standalone
+
+> **En esta sección: LEER, ~5 min.**
+> **Salís con**: el modelo master/worker, y de dónde sale la URL
+> `spark://spark-master:7077` que van a usar todos los `spark-submit`.
+
+> [!NOTE]
+> **En producción este cluster no existe**: el cómputo se delega a EMR Serverless
+> ([02 §6.4](02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless)). Lo que **sí** viaja
+> es tu código: la lógica de transformación es la misma y por eso conviene mantenerla
+> sin I/O acoplado (ejemplo 20 de [04](04-ejemplos-locales.md)).
 
 ```yaml
   spark-master:
@@ -177,6 +252,17 @@ contenedor (PID 1 terminado → `Exited(0)`). La solución es arrancar la clase 
 ---
 
 ## 5. Cliente interactivo: Jupyter
+
+> **En esta sección: LEER, ~5 min.**
+> **Salís con**: entender que Jupyter acá es un **driver de PySpark**, no un servicio
+> más: se conecta al master y ejecuta en los workers.
+
+> [!WARNING]
+> **Jupyter corre bajo el perfil `dev` y no debe llegar a producción.** Sin token es
+> ejecución remota de código para cualquiera que alcance el puerto — por eso
+> `JUPYTER_TOKEN` está en el checklist de la sección 9 y por eso el stack de
+> producción ([02 §14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)) no lo
+> incluye.
 
 ```yaml
   jupyter:
@@ -218,6 +304,15 @@ contenedor (PID 1 terminado → `Exited(0)`). La solución es arrancar la clase 
 ---
 
 ## 6. Orquestación: Airflow 3
+
+> **En esta sección: LEER, ~10 min.** Es la más densa del documento.
+> **Salís con**: saber qué hace cada uno de los 5 procesos de Airflow 3 y por qué el
+> monolito `webserver`+`scheduler` de Airflow 2 ya no existe.
+
+Importa más que las otras porque **Airflow es lo único de este Compose que sobrevive
+tal cual a producción**: la EC2 corre estos mismos procesos
+([02 §14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)). Lo que cambia allá es
+lo que los rodea, no ellos.
 
 Airflow 3 separó el viejo monolito (`webserver` + `scheduler`) en procesos independientes; todos
 heredan de `*airflow-common`:
@@ -283,6 +378,16 @@ sabe que el contenedor arrancó, no que la base acepta conexiones.
 
 ## 7. Redes, volúmenes y orden de arranque
 
+> **En esta sección: LEER, ~5 min.**
+> **Salís con**: entender por qué `depends_on` no alcanza y qué volumen perdés si
+> corrés `docker compose down -v` sin pensarlo.
+
+> **La regla que más se olvida**: `depends_on` espera a que el contenedor **arranque**,
+> no a que el servicio **esté listo**. Sin healthcheck, Airflow puede intentar migrar
+> contra un Postgres que todavía no acepta conexiones, fallar, y dejarte un error que
+> no menciona a Postgres por ningún lado. Es exactamente lo que resuelve la
+> sección 8.2.
+
 ```yaml
 volumes:
   postgres_data:   # BD de Airflow
@@ -317,6 +422,50 @@ pronto queda esperando executors.
 ---
 
 ## 8. Endurecimiento del stack local
+
+> **En esta sección: EJECUTAR, ~20 min.** Es la única que cambia archivos.
+> **Salís con**: secretos propios en un `.env` fuera de git, límites de memoria,
+> healthchecks reales, rotación de logs y `docker.sock` fuera del stack.
+
+### Mapa del camino — sección 8
+
+**Antes de empezar, el prerrequisito**: el stack levanta y responde
+(`docker compose up -d` y las UIs abren). Endurecer algo que no funciona solo agrega
+una variable más al diagnóstico.
+
+```mermaid
+flowchart TD
+    E1["§8.1 · Secretos en un .env<br/><i>openssl, no los defaults</i>"]
+    E2["§8.2 · Override de endurecimiento<br/><i>límites, healthchecks, restart, logs</i>"]
+    E3["§8.3 · Secretos parametrizados en el base<br/><i>ya está: el Compose interpola</i>"]
+    E4["§8.4 · docker.sock fuera del stack<br/><i>ya está: no se monta</i>"]
+    E5["§8.5 · History server (opcional)<br/><i>para ver los jobs ya terminados</i>"]
+    GATE["✅ Gate del stack local<br/>checklist de la sección 9 completo ·<br/>un DAG corre verde ·<br/>nada sensible en git"]
+
+    E1 --> E2 --> E3 --> E4 --> GATE
+    E2 -.opcional.-> E5
+
+    style GATE fill:#d4edda,stroke:#155724
+    style E5 fill:#fff3cd,stroke:#856404
+```
+
+**Reglas de esta sección:**
+
+- **El endurecimiento va en un override, no editando el Compose base.** Así podés
+  levantar el stack «cómodo» para desarrollar y el «endurecido» para probar, con los
+  mismos archivos y sin ramas divergentes.
+- **`.env` nunca se commitea.** Está en `.gitignore`; `.env.example` es el que viaja,
+  con placeholders. Un secreto commiteado sigue en la historia aunque lo borres
+  después.
+- **Los defaults débiles son deuda, no configuración.** `airflow`/`airflow` y
+  `change-me-in-prod` existen para que el stack levante a la primera; el momento de
+  reemplazarlos es ahora, no «antes de producción».
+
+> **Gotcha §8.1 — cambiar `POSTGRES_PASSWORD` con el volumen ya creado no hace nada.**
+> Postgres solo aplica esas variables al **inicializar** el volumen de datos. Si ya
+> levantaste el stack con la contraseña vieja, la nueva se ignora en silencio y vas a
+> creer que la rotaste. Hay que recrear el volumen (perdiendo la metadata de Airflow)
+> o cambiarla por SQL dentro del contenedor.
 
 Lo que es aceptable en desarrollo pero no en producción:
 
@@ -467,11 +616,15 @@ con API limitada. No lo heredes en api-server, scheduler, triggerer y dag-proces
 Descomentá el bloque `spark-history-server` del Compose y arrancalo: leerá `./spark-events` y dará la
 UI de jobs terminados en `:18080`. Acordate de poner `spark.eventLog.enabled true` en
 `spark-events/spark-defaults.conf` — hoy está en `false` porque sin History Server los event logs
-quedaban huérfanos ([06 §2, incidente #4](06-historial-de-incidentes.md)).
+quedaban huérfanos ([06 §2, incidente #4](referencia/06-historial-de-incidentes.md)).
 
 ---
 
 ## 9. Checklist de calidad
+
+> **En esta sección: VERIFICAR antes de pasar a producción.**
+> **Salís con**: la confirmación de que el Tramo I está sano — que es el gate de
+> entrada del Tramo II ([02](02-produccion-aws-terraform.md)).
 
 - [ ] `.env` fuera de git y con secretos generados con `openssl`.
 - [ ] `AIRFLOW_JWT_SECRET` único por entorno.

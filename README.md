@@ -44,7 +44,8 @@ tests/           controles de integridad de los DAGs
 hadoop-config/   core-site.xml del cliente HDFS
 spark-events/    configuración de eventLog de Spark
 scripts/         utilidades: prod-env.sh (contexto de producción) y validadores de las guías
-docs/            documentación: stack local, arquitectura y producción en AWS
+Taskfile.yml     los comandos repetidos: infra, deploy, validadores (task --list)
+docs/            documentación: cuatro guías centrales, adr/ (decisiones) y referencia/
 ```
 
 Este repositorio contiene **solo el proyecto local**. La infraestructura de producción —Terraform,
@@ -55,18 +56,26 @@ completo de cada archivo.
 La excepción es `scripts/prod-env.sh`: sí se versiona, porque corre en **tu** máquina. Convierte los
 outputs de Terraform en variables de entorno, y es lo que hace que cada comando de las guías se
 copie y funcione tal cual, sin editar IDs, IPs ni nombres de bucket
-([contrato completo](docs/02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-leelo-antes-de-copiar-cualquier-comando)).
+([contrato completo](docs/02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando)).
 
 ## Documentación
 
 - [Índice y estado de implementación](docs/README.md): qué está implementado, qué falta probar y qué es roadmap.
+- [ADR](docs/adr/README.md): las ocho decisiones estructurales, con sus alternativas descartadas.
 - [01 — Stack local](docs/01-stack-local.md): anatomía del `docker-compose.yml`, bloque por bloque.
-- [02 — Producción en AWS con Terraform](docs/02-produccion-aws-terraform.md): guía completa de despliegue y operación.
-- [02b — Producción en AWS por consola](docs/02b-produccion-aws-consola.md): el mismo camino, sin IaC.
+- [02 — Producción en AWS con Terraform](docs/02-produccion-aws-terraform.md): la guía completa de despliegue y
+  operación, en un solo documento — fundamentos y costo (§1–§4), el núcleo EC2 (§5), data lake y EMR Serverless
+  (§6–§7), operación y diagnóstico (§8–§10), CI/CD, secretos y runbook (§11–§15), y la evolución (§16–§22).
 - [03 — Arquitectura](docs/03-arquitectura.md): componentes, flujos, seguridad y costos.
 - [04 — Ejemplos locales](docs/04-ejemplos-locales.md): 21 ejercicios progresivos sobre este stack.
-- [05 — Production readiness](docs/05-production-readiness.md): controles previos al primer despliegue.
-- [06 — Historial de incidentes](docs/06-historial-de-incidentes.md): fallos del stack local y sus fixes.
+
+Material de consulta en [`docs/referencia/`](docs/referencia):
+
+- [02b — Producción en AWS por consola](docs/referencia/02b-produccion-aws-consola.md): el mismo camino, sin IaC.
+- [05 — Production readiness](docs/referencia/05-production-readiness.md): controles previos al primer despliegue.
+- [06 — Historial de incidentes](docs/referencia/06-historial-de-incidentes.md): fallos del stack local y sus fixes.
+- [07 — Secuencia de ejecución](docs/referencia/07-secuencia-de-ejecucion.md): por qué cada comando va donde va, cuáles
+  dejan de hacer falta al avanzar, y en qué se diferencia la secuencia de lo que haría un operador.
 
 ## Seguridad
 

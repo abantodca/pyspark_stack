@@ -13,6 +13,7 @@
 *.tfstate.*
 *.tfvars
 !*.tfvars.example
+**/tfplan
 # .terraform.lock.hcl SI se versiona: pinea las versiones exactas de los providers, para que un
 # init de hoy y uno de dentro de 6 meses instalen lo mismo (mismo criterio que COMPOSE_VERSION).
 
@@ -42,6 +43,7 @@ spark-apps/ejemplos/
 
 # --- Lambdas empaquetadas ---
 **/lambda/*.zip
+infra/modules/*/*.zip
 
 # --- SO / editor ---
 .DS_Store
