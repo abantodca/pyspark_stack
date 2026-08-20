@@ -48,7 +48,8 @@
 6. [Orquestación: Airflow 3](#6-orquestación-airflow-3)
 7. [Redes, volúmenes y orden de arranque](#7-redes-volúmenes-y-orden-de-arranque)
 8. [Endurecimiento del stack local](#8-endurecimiento-del-stack-local)
-9. [Checklist de calidad](#9-checklist-de-calidad)
+9. [Operar el stack: arrancar, acceder y bajar](#9-operar-el-stack-arrancar-acceder-y-bajar)
+10. [Checklist de calidad](#10-checklist-de-calidad)
 
 ---
 
@@ -598,7 +599,97 @@ quedaban huérfanos ([06 §2, incidente #4](referencia/06-historial-de-incidente
 
 ---
 
-## 9. Checklist de calidad
+## 9. Operar el stack: arrancar, acceder y bajar
+
+> **En esta sección: EJECUTAR, ~5 min.**
+> **Salís con**: el stack corriendo, las cuatro UIs abiertas con sus credenciales, y
+> el comando de apagado que conserva tus datos.
+
+### 9.1 Arrancar
+
+```bash
+task local:check   # valida los cuatro secretos, el chmod 600 y el Compose combinado
+task local:up      # construye lo que falte y levanta los 11 servicios en segundo plano
+```
+
+`local:up` depende de `local:check`: si falta el `.env`, un secreto es débil o el archivo no es
+privado, aborta antes de tocar Docker.
+
+La primera vez construye las tres imágenes propias y descarga cerca de 600 MB —los wheels de
+Jupyter y el bundle del AWS SDK, de 532 MB él solo—, así que puede tardar entre 20 y 30 minutos
+según tu conexión. Las corridas siguientes reutilizan la caché y tardan segundos.
+
+Un build largo no muestra nada hasta terminar. Para verlo avanzar en vivo:
+
+```bash
+# --progress va ANTES del subcomando: en "up" es una flag desconocida
+docker compose --progress plain -f docker-compose.yml -f docker-compose.local-hardened.yml up -d --build
+```
+
+Verificá el resultado:
+
+```bash
+docker compose ps   # los 11 servicios; airflow-init debe figurar Exited (0)
+```
+
+`airflow-init` corre las migraciones y crea el usuario admin: sale con código 0 y no vuelve a
+levantar. Los cinco servicios de Airflow arrancan recién cuando ese init termina.
+
+### 9.2 URLs
+
+Todo queda atado a `127.0.0.1`, nada expuesto fuera de tu máquina.
+
+| Servicio | URL | Para qué |
+|---|---|---|
+| Airflow | <http://localhost:8082> | activar y monitorear los DAGs |
+| Jupyter | <http://localhost:8888> | notebooks contra el clúster Spark |
+| Spark Master | <http://localhost:8081> | workers registrados y apps en curso |
+| HDFS NameNode | <http://localhost:9870> | explorar el filesystem y los bloques |
+| Spark app UI | <http://localhost:4055> | detalle de jobs de la sesión de Jupyter |
+
+Dos comportamientos normales que parecen fallas: el puerto **4055** no responde hasta que un
+notebook crea una `SparkSession`, y el **apiserver de Airflow** tarda unos 30 segundos más que el
+resto en contestar después de figurar `Up`.
+
+### 9.3 Credenciales
+
+Viven en el `.env`, que está fuera de git (§8.1). Leelas de ahí en vez de copiarlas a ningún lado:
+
+```bash
+grep -E '^(AIRFLOW_ADMIN_USER|AIRFLOW_ADMIN_PASSWORD)=' .env   # login de Airflow
+```
+
+Para Jupyter conviene armar la URL con el token ya incluido y saltear la pantalla de login:
+
+```bash
+echo "http://localhost:8888/?token=$(grep '^JUPYTER_TOKEN=' .env | cut -d= -f2)"
+```
+
+Los tres DAGs se cargan **pausados**, que es el default de Airflow: hay que activarlos desde la UI
+para que corran.
+
+### 9.4 Bajar
+
+Tres niveles, de menos a más destructivo:
+
+| Qué querés | Comando | Qué pasa con los datos |
+|---|---|---|
+| Pausar y retomar después | `docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml stop` | intactos, los contenedores siguen existiendo |
+| Liberar los contenedores | `task local:down` | intactos, los cuatro volúmenes sobreviven |
+| Empezar de cero | `docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml down -v` | **se borran** los cuatro volúmenes |
+
+`task local:down` es el apagado de todos los días: borra contenedores y red, y conserva
+`postgres_data`, `hdfs-nn-data`, `hdfs-dn-data` y `airflow_logs`. Al volver a subir encontrás tus
+DAGs, su historial y los datos en HDFS.
+
+> **`down -v` es irreversible.** Te llevás puesta la base de Airflow —usuarios, historial de runs,
+> conexiones—, todos los bloques de HDFS y los task logs. Es lo que hay que hacer si rotaste
+> `POSTGRES_PASSWORD` en el `.env`, porque el volumen viejo conserva la contraseña anterior y
+> `airflow-db` no autentica. Al levantar de nuevo, `airflow-init` recrea la base desde cero.
+
+---
+
+## 10. Checklist de calidad
 
 > **En esta sección: VERIFICAR antes de pasar a producción.**
 > **Salís con**: la confirmación de que el Tramo I está sano — que es el gate de
