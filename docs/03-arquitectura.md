@@ -20,12 +20,14 @@ Parquet en S3, Glue Data Catalog, Lambdas/EventBridge/SQS para disparo y auto st
 SSM y CI de validación sin permisos de escritura sobre AWS.
 
 **Arquitectura objetivo:** tablas Iceberg en `curated/` y `analytics/`, dbt, Great Expectations,
-OpenLineage y observabilidad con Prometheus, Grafana, Alertmanager, Loki y Promtail. Aparecen en los
+OpenLineage y observabilidad con Prometheus, Grafana, Alertmanager, Loki y Grafana Alloy. Aparecen en los
 diagramas para mostrar la evolución prevista; hoy son roadmap, no inventario desplegable.
 
 **Cómo leer los diagramas, entonces**: mezclan las dos capas a propósito. Lo que está
 desplegable y lo que es diseño lo separa la [matriz de estado](README.md), que es la
 fuente de verdad — no estos diagramas. Ante una diferencia entre ambos, gana la matriz.
+El [estándar de gobierno y operaciones](referencia/08-gobierno-operaciones-datos.md) define además
+los controles humanos y de datos que ningún diagrama de infraestructura puede sustituir.
 
 ## Configuración de referencia
 
@@ -80,14 +82,14 @@ flowchart TD
                 exp["Exporters<br/>(node · cAdvisor · statsd)"]
                 prom["Prometheus"]
                 am["Alertmanager"]
-                promtail["Promtail"]
+                alloy["Grafana Alloy"]
                 loki["Loki"]
                 graf["Grafana"]
 
                 exp --> prom
                 prom --> am
                 prom --> graf
-                promtail -->|"Container Logs"| loki
+                alloy -->|"Container Logs"| loki
                 loki --> graf
             end
         end
@@ -119,6 +121,7 @@ flowchart TD
     dev -->|"git push"| gha
     gha -->|"aws s3 sync"| art
     gha -->|"SSM sync-down"| af
+    af -->|"Task logs remotos<br/>S3 90d; copia local eliminada"| art
 
     cronSS --> lSS
     lSS -->|"ec2:Start / Stop<br/>(tag: AutoStartStop=true)"| EC2
@@ -157,12 +160,12 @@ Spark UI vive en la consola de EMR Serverless, y en producción no hay Jupyter.
 | EMR Serverless (aplicación Spark) | AWS | Cómputo Spark bajo demanda |
 | Rol de ejecución de EMR Serverless | AWS | Permisos S3 del job, least-privilege |
 | Prometheus + Alertmanager + Grafana + Loki | EC2 / Docker | Métricas, alertas y logs |
-| node-exporter · cAdvisor · statsd-exporter · Promtail | EC2 / Docker | Exporters de host, contenedor, Airflow y logs |
+| node-exporter · cAdvisor · statsd-exporter · Alloy | EC2 / Docker | Exporters de host, contenedor, Airflow y logs |
 | S3 data lake (`raw` / `curated` / `analytics`) | AWS | Almacenamiento durable; `curated`/`analytics` como tablas **Iceberg** |
 | Glue Data Catalog | AWS | Catálogo de las tablas Iceberg, compartido por Spark y Athena, sin crawlers |
 | Athena | AWS | Consumo SQL/BI, `MERGE` y time-travel sobre Iceberg (opcional, guía 02 §16) |
 | dbt Core | EC2, disparado por Airflow | Transformaciones SQL `curated → analytics` (guía 02 §19) |
-| Great Expectations | EC2, disparado por Airflow | Gate de calidad antes de promover `curated → analytics` (guía 02 §20) |
+| Great Expectations | EC2, disparado por Airflow | Opción futura para el gate `staging → curated`; no es requisito (guía 02 §20) |
 | OpenLineage | Airflow + dbt + Spark | Lineage hacia un backend HTTP autenticado (guía 02 §22) |
 | S3 artifacts | AWS | Scripts, logs, deploys, estado de dbt y eventos de lineage |
 | SQS `trigger-events` | AWS | Cola entre S3 y `trigger-airflow`; da el reintento automático si la EC2 está apagada |
@@ -199,12 +202,13 @@ bootstrap (S3) → terraform apply (S3, EC2, IAM, Lambda, EventBridge, EIP)
 ### 3.2 ETL disparado por evento
 
 ```
-Archivo llega a s3://datalake/raw/  →  S3 ObjectCreated  →  SQS (trigger-events)
+Productor carga orders/customers/products y al final publica raw/manifests/customer_etl/<lote>.json
+  → S3 ObjectCreated filtrado por prefijo+sufijo → SQS (trigger-events)
   → Lambda trigger-airflow:
-      1) contrato de datos (columnas esperadas, Range GET barato); si falla, RECHAZA sin reintentar
+      1) valida manifest, conjunto exacto de objetos y columnas; un rechazo termina en DLQ
       2) ¿EC2 running y SSM Online? no → ec2:StartInstances y devuelve error (SQS reintenta solo
          en ~6 min, ya con la EC2 arriba) · sí → SSM SendCommand → EC2:
-         docker exec airflow-scheduler airflow dags trigger <dag> --conf '{bucket,key}'
+         docker exec airflow-scheduler airflow dags trigger <dag> --conf '{bucket,key,run_date}'
   → DAG: EmrServerlessStartJobOperator(deferrable=True)
       → EMR Serverless lee s3a://…/raw → transforma → escribe s3a://…/curated
 ```
@@ -213,14 +217,14 @@ Con `deferrable=True` el triggerer espera sin ocupar un worker; no hace falta un
 
 **Nada se pierde si la EC2 está apagada.** S3 no invoca la Lambda directo: escribe en una cola SQS.
 Si el handler falla porque la EC2 está arrancando, el mensaje no se borra y vuelve a estar visible a
-los ~6 minutos. Tras 5 intentos (~30 min) cae en la DLQ, con alarma por email. La alerta
-`DailyEtlMissing` (§3.4) sigue como red de seguridad de más arriba: cubre el caso de que el DAG haya
-corrido sin producir el resultado esperado.
+los ~6 minutos. Tras 5 intentos (~30 min) cae en la DLQ, con alarma por email. El dead-man switch
+`DailyEtlMissing` queda como roadmap explícito (§3.4); no se cuenta como control
+operativo hasta que exista su regla y una prueba de alerta.
 
 **El retry no duplica trabajo.** `airflow dags trigger` usa un `--run-id` determinístico derivado de
-bucket+key (guía 02 §7.1): si el mismo archivo dispara dos veces, Airflow rechaza el segundo run en
-vez de duplicarlo. El DAG tiene además `max_active_runs=1`, así que ni un archivo distinto del mismo
-día lanza un segundo job de EMR en paralelo sobre el mismo `{{ ds }}`. Y la Lambda declara
+bucket+key+versionId+sequencer (guía 02 §7.1): un retry conserva el run id, pero una versión nueva
+de la misma key se puede reprocesar. El DAG tiene además `max_active_runs=1`, así que dos manifests
+no escriben en paralelo sobre la misma partición. Y la Lambda declara
 `reserved_concurrent_executions=2`: un backfill de decenas de archivos no dispara una avalancha
 contra el `maximum_capacity` de EMR Serverless, los deja esperando en cola.
 
@@ -237,12 +241,13 @@ EventBridge Scheduler (12:00 UTC, L-V — dentro de la ventana de encendido)
 MÉTRICAS: node-exporter (host) · cAdvisor (contenedores) · statsd-exporter (Airflow)
   → Prometheus (scrape 15s) → evalúa alerts.yml
   → Alertmanager → email
-       INFRA:   TargetDown, disco lleno, memoria
-       NEGOCIO: DAG fallido, ETL diario no ejecutado (dead-man switch), job EMR FAILED
+       ROADMAP LOCAL: disco /data lleno y heartbeat del scheduler
 EMR SERVERLESS: métricas por CloudWatch · logs del driver/executors en s3://artifacts/emr/logs/
   y/o CloudWatch Logs · estado visible en la task deferrable de Airflow
-LOGS: Promtail (todos los contenedores) → Loki
+LOGS: Grafana Alloy (todos los contenedores) → Loki
 Grafana ← Prometheus (métricas) + Loki (logs) · dashboard "Overview" auto-provisionado
+ALARMAS AWS IMPLEMENTADAS: mensajes en DLQ → CloudWatch → SNS; Budgets y anomalías → email
+ROADMAP AWS: errores/throttles Lambda, edad SQS, job EMR FAILED y dead-man switch del ETL
 ```
 
 ### 3.5 Ahorro: auto start/stop
@@ -284,7 +289,9 @@ laptop (edita dags/, spark-apps/, notebooks/) → git push a main
   versionado. El **S3 VPC Gateway Endpoint** mantiene el tráfico EC2↔S3 dentro de la red de AWS; no
   aplica a EMR Serverless salvo que la aplicación use una configuración de red en tu VPC.
 - **IMDSv2 y EBS:** metadata solo por IMDSv2 (`hop_limit` 2) y volúmenes EBS cifrados.
-- **Logs de EMR Serverless:** cifrados y con retención definida.
+- **Logs:** Airflow sube task logs cifrados a `artifacts/logs/airflow/` y elimina la copia local;
+  EMR usa S3/CloudWatch. S3 conserva ambos 90 días, CloudWatch 14–30 días, Loki 7 días y Docker
+  rota `3 × 10 MiB` por contenedor. Las alertas de `/data` disparan al 80% y 90%.
 - **Estado de Terraform:** cifrado y versionado en S3, con lock nativo (`use_lockfile`), sin
   DynamoDB.
 
@@ -389,10 +396,9 @@ nuevo—. Detalle completo en la [guía 02](02-produccion-aws-terraform.md).
 - **dbt Core:** transformaciones SQL versionadas `curated → analytics` con el target Athena. Los
   reprocesos pesados siguen siendo jobs PySpark en EMR Serverless orquestados por Airflow, porque EMR
   Serverless batch no expone un endpoint SQL permanente para `dbt-spark`.
-- **Great Expectations:** gate de calidad de datos. Una task de Airflow corre un *checkpoint* sobre
-  `curated/` después del ETL y antes de promover a `analytics/`. Si falla, dispara la misma alerta de
-  «DAG fallido» que ya existe en Alertmanager (§3.4): no es un canal nuevo, es una validación más
-  estricta que el `SELECT count(*)` de Athena.
+- **Great Expectations:** opción para suites grandes. El gate correcto corre sobre staging después
+  del ETL y antes de promover a `curated/`; los controles PySpark/SQL ya pueden cumplir el contrato
+  sin incorporar otra herramienta. Si falla, el lote queda sin publicar y el DAG termina en error.
 
 ---
 
@@ -401,6 +407,9 @@ nuevo—. Detalle completo en la [guía 02](02-produccion-aws-terraform.md).
 Cuatro piezas AWS-nativas que cierran huecos operativos. Detalle en la
 [guía 02 §18](02-produccion-aws-terraform.md#18-gobierno-resiliencia-y-costos):
 
+Ownership, clasificación, SLO, incidentes y autorización de datos reales se gobiernan en la
+[referencia 08](referencia/08-gobierno-operaciones-datos.md); crear alarmas no asigna responsables.
+
 | Pieza | Qué resuelve |
 |---|---|
 | **DLQ por origen** | El redrive de SQS protege el camino S3; la DLQ de Scheduler protege el cron; el destino async de Lambda protege las invocaciones asíncronas |
@@ -408,10 +417,9 @@ Cuatro piezas AWS-nativas que cierran huecos operativos. Detalle en la
 | **Cost Anomaly Detection** | Detecta picos fuera del patrón histórico, como un job de EMR escalando de más — sin costo |
 | **IAM Access Analyzer** | Detección temprana de recursos accesibles desde fuera de la cuenta — sin costo ni mantenimiento |
 
-Budgets y Cost Anomaly notifican **directo por email** a `var.alert_email` (guía 02 §18.3–§18.4);
-no pasan por SNS. Unificar todo en un topic **SNS `alerts`** —necesario para las alarmas de
-CloudWatch de la guía 02 §18.2, que hoy solo están enunciadas— es roadmap: requiere el topic, su suscripción
-y una `aws_cloudwatch_metric_alarm` por cada punto de la lista.
+Budgets y Cost Anomaly notifican **directo por email** a `var.alert_email` mediante sus respectivas
+suscripciones (guía 02 §18.3–§18.4). Las alarmas CloudWatch de las DLQ usan el topic SNS `alerts` y
+su suscripción confirmada; las señales adicionales de Lambda, SQS y EMR siguen marcadas como roadmap.
 
 ---
 

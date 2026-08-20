@@ -130,9 +130,31 @@ tasks:
       - |
         {{.CTX}}
         aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
-        ssh-keygen -f ~/.ssh/known_hosts -R "$PUBLIC_IP" >/dev/null 2>&1 || true   # la EIP sobrevive, la host key no
-        $SSH -o StrictHostKeyChecking=accept-new "$SSH_TARGET" \
+        $SSH -o StrictHostKeyChecking=yes "$SSH_TARGET" \
           'cloud-init status --wait && mountpoint /data && systemctl is-active docker'
+
+  prod:trust-host:
+    desc: "§5.5 — registra la host key obtenida por el canal autenticado SSM"
+    cmds:
+      - |
+        {{.CTX}}
+        aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+        for _ in $(seq 1 60); do
+          [ "$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+            --query 'InstanceInformationList[0].PingStatus' --output text)" = "Online" ] && break
+          sleep 10
+        done
+        PARAMS='{"commands":["cat /etc/ssh/ssh_host_ed25519_key.pub"]}'
+        CMD_ID="$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+          --document-name AWS-RunShellScript --parameters "$PARAMS" \
+          --query 'Command.CommandId' --output text)"
+        aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID"
+        HOST_KEY="$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+          --query StandardOutputContent --output text | awk 'NF >= 2 {print $1, $2; exit}')"
+        printf '%s\n' "$HOST_KEY" | grep -Eq '^ssh-ed25519 [A-Za-z0-9+/=]+$'
+        mkdir -p "$HOME/.ssh"; touch "$HOME/.ssh/known_hosts"; chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/known_hosts"
+        ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$PUBLIC_IP" >/dev/null 2>&1 || true
+        printf '%s %s\n' "$PUBLIC_IP" "$HOST_KEY" >> "$HOME/.ssh/known_hosts"
 
   prod:status:
     desc: "§8.1 — estado real: EC2, agente SSM y contenedores"
@@ -151,21 +173,26 @@ tasks:
     cmds:
       - |
         {{.CTX}}
-        ssh-keygen -f ~/.ssh/known_hosts -R "$PUBLIC_IP" >/dev/null 2>&1 || true
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
         rsync -az --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
           -e "$RSYNC_SSH" ./ "$SSH_TARGET:$REMOTE_DIR/"
         # load-secrets.sh existe recién desde §13.4; antes de eso esta línea no hace nada.
         $SSH "$SSH_TARGET" "cd $REMOTE_DIR && \
           if [ -x scripts/load-secrets.sh ]; then ./scripts/load-secrets.sh; fi && \
-          docker compose -f $COMPOSE_PROD up -d --build"
+          docker compose $COMPOSE_ARGS up -d --build"
 
   prod:secrets:
-    desc: "§13.4 — regenera el .env desde SSM y reinicia el stack"
+    desc: "§13.4 — rematerializa .env desde SSM; no rota credenciales"
     cmds:
       - |
         {{.CTX}}
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
         $SSH "$SSH_TARGET" "cd $REMOTE_DIR && ./scripts/load-secrets.sh && \
-          docker compose -f $COMPOSE_PROD up -d"
+          docker compose $COMPOSE_ARGS up -d"
 
   prod:tunnel:
     desc: "§5.5 — túnel a la UI de Airflow en localhost:8082. Ocupa la terminal"
@@ -190,12 +217,15 @@ tasks:
           --query 'application.state' --output text
       - |
         {{.CTX}}
-        PARAMS="$(jq -nc --arg dir "$REMOTE_DIR" --arg compose "$COMPOSE_PROD" '{commands: [
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
+        PARAMS="$(jq -nc --arg dir "$REMOTE_DIR" --arg compose "$COMPOSE_ARGS" '{commands: [
           "cd \($dir)",
           "mountpoint /data",
-          "docker compose -f \($compose) config --quiet",
-          "docker compose -f \($compose) ps",
-          "docker compose -f \($compose) exec -T airflow-scheduler airflow dags list-import-errors --output json"
+          "docker compose \($compose) config --quiet",
+          "docker compose \($compose) ps",
+          "docker compose \($compose) exec -T airflow-scheduler airflow dags list-import-errors --output json"
         ]}')"
         CMD_ID="$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
           --document-name AWS-RunShellScript --parameters "$PARAMS" \
@@ -257,9 +287,12 @@ tasks:
     cmds:
       - |
         {{.CTX}}
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
         aws emr-serverless list-job-runs --application-id "$EMR_APP_ID" \
           --query 'sort_by(jobRuns,&createdAt)[-1].[id,state,stateDetails]' --output text
-        $SSH "$SSH_TARGET" "cd $REMOTE_DIR && docker compose -f $COMPOSE_PROD logs --tail=50"
+        $SSH "$SSH_TARGET" "cd $REMOTE_DIR && docker compose $COMPOSE_ARGS logs --tail=50"
 
   emr:sync:
     desc: "§6.4 — publica spark-apps/emr/ en artifacts: es lo que EMR ejecuta"
@@ -286,16 +319,23 @@ tasks:
       - task: infra:plan
       - |
         {{.CTX}}
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
         CHECK_ENV="$(mktemp)"
         trap 'rm -f "$CHECK_ENV"' EXIT
         printf '%s\n' \
           'POSTGRES_USER=check' 'POSTGRES_PASSWORD=check' 'POSTGRES_DB=check' \
           'AIRFLOW_JWT_SECRET=check' 'AIRFLOW_ADMIN_USER=check' 'AIRFLOW_ADMIN_PASSWORD=check' \
+          'AIRFLOW_DOMAIN=airflow.example.invalid' 'AIRFLOW_BASE_URL=https://airflow.example.invalid:8080' \
+          'AIRFLOW_EXECUTION_API_URL=https://airflow.example.invalid:8080/execution/' \
+          'AIRFLOW_SSL_CERT=/run/tls/cert.pem' 'AIRFLOW_SSL_KEY=/run/tls/key.pem' \
+          'GRAFANA_ADMIN_PASSWORD=check' \
           'EMR_APP_ID=check' 'EMR_JOB_ROLE_ARN=arn:aws:iam::000000000000:role/check' \
           'EMR_LOG_GROUP=/aws/emr-serverless/check' 'STARTSTOP_LAMBDA_NAME=check' \
           'DATALAKE_BUCKET=check' 'ARTIFACTS_BUCKET=check' > "$CHECK_ENV"
         PROD_ENV_FILE="$CHECK_ENV" docker compose --env-file "$CHECK_ENV" \
-          -f "$COMPOSE_PROD" config --quiet
+          $COMPOSE_ARGS config --quiet
       - pytest -q
 
   release:apply:
@@ -309,22 +349,36 @@ tasks:
   release:deploy:
     desc: "§15 pasos 3-5 — esperar el host, desplegar y publicar los entrypoints"
     cmds:
+      - task: prod:trust-host
       - task: prod:wait
       - task: prod:deploy
       - task: emr:sync
 
   # ── local (Tramo I; no las documenta la guía 02) ──────────────────────────────
   local:up:
-    desc: "Levanta el stack local"
+    desc: "Valida el entorno y levanta el stack local endurecido"
+    deps: [local:check]
     cmds:
-      - docker compose up -d
+      - docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml up -d --build
 
   local:down:
     desc: "Baja el stack local conservando los volúmenes"
     cmds:
-      - docker compose down
+      - docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml down
+
+  local:check:
+    desc: "Valida secretos, permisos y configuración efectiva del stack local"
+    cmds:
+      - python3 scripts/check-local-env.py
+      - docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml config --quiet
 
   test:
-    desc: "Tests de integridad de los DAGs"
+    desc: "Tests reproducibles de DAGs, contratos y transformaciones dentro de la imagen Airflow"
+    deps: [local:check]
     cmds:
-      - pytest -q
+      - >-
+        docker compose run --rm --build --no-deps
+        -e TEST_DAGS_FOLDER=/opt/airflow/dags
+        -w /opt/airflow
+        airflow-scheduler
+        python -m pytest /opt/tests -q -p no:cacheprovider

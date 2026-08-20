@@ -570,12 +570,12 @@ provider `standard`, y `schedule=` (no `schedule_interval=`).
 `ej11_loyalty.py`, así que el Ejemplo 11 tiene que estar hecho; la diferencia es que acá el `hdfs put`
 de las tres fuentes lo hace el propio DAG, no vos a mano.
 
-> ⚠️ Agregá `set -euo pipefail` si movés esto a un `.sh`: el shell del pipeline heredado **no** lo
-> tiene y un fallo intermedio puede dejar el DAG en un `success` engañoso.
+> ⚠️ Agregá `set -euo pipefail` si movés este ejercicio a un `.sh`. El shell canónico de
+> `customer_etl` ya usa `set -Eeuo pipefail` y está cubierto por una prueba de contrato.
 
 ---
 
-## Ejemplo 13 — Parametrizar por entorno con Airflow `Variable` (dev/prod)
+## Ejemplo 13 — Parametrizar por entorno sin I/O durante el parseo del DAG
 
 **Dónde:** DAG + Variables de Airflow (el equivalente a `env.sh`).
 
@@ -584,19 +584,19 @@ docker exec airflow-scheduler airflow variables set loyalty_env dev
 ```
 ```python
 # fragmento para dags/ej12_loyalty_dag.py
-from airflow.sdk import Variable
-
-env = Variable.get("loyalty_env", default="dev")     # Airflow 3: 'default', no 'default_var'
-prefix = "/prod" if env == "prod" else ""            # dev → raíz; prod → /prod/...
-hdfs_in  = f"{prefix}/ejemplos/input"
-hdfs_out = f"{prefix}/ejemplos/output/loyalty"
+run_loyalty = BashOperator(
+    task_id="run_loyalty",
+    bash_command='bash /opt/spark-apps/ejemplos/run.sh "$PIPELINE_ENV" "{{ ds }}"',
+    env={"PIPELINE_ENV": "{{ var.value.get('loyalty_env', 'dev') }}"},
+    append_env=True,
+)
 ```
 
 **Qué observar:** cambiar la Variable a `prod` (`airflow variables set loyalty_env prod`) reencamina
 las rutas HDFS sin tocar código.
 
-**Por qué:** es el patrón `env.sh` (dev/prod paths) llevado a Airflow. Ojo con la ruptura de Airflow
-3: `Variable.get(..., default=...)` (con `default_var=` truena con `TypeError`).
+**Por qué:** la Variable se resuelve al renderizar la task, no cuando el dag-processor importa el
+archivo. El scheduler puede parsear el DAG aunque la metadata DB esté temporalmente indisponible.
 
 ---
 
@@ -787,9 +787,9 @@ lineas = (spark.read.option("header", True).csv("file:///opt/spark-apps/landing/
 fila a fila. Mucho más rápido que un UDF Python clásico.
 
 **Por qué:** aquí se cobra el peaje del stack: el Pandas UDF **solo funciona porque driver y executors
-comparten Python 3.12** y ambos tienen `pyarrow` (viene con `pyspark`). Es la razón de fondo de toda
-la alineación de versiones. Si algún día falla con `[PYTHON_VERSION_MISMATCH]`
-o `ModuleNotFoundError: pyarrow`, el problema es de imagen, no del código.
+comparten Python 3.12**. La distribución oficial ya trae el runtime PySpark; las imágenes agregan y
+alinean explícitamente `numpy`, `pandas` y `pyarrow`, que son dependencias opcionales. Si aparece
+`ModuleNotFoundError: pyarrow`, reconstruya la imagen; el problema es de dependencias.
 
 ---
 
@@ -864,11 +864,11 @@ def test_total_por_orden(spark):
     assert res == {"O1": 200}
 ```
 ```bash
-docker exec -w /opt jupyter-notebook python -m pytest /opt/tests -q
+task test
 ```
 
-El comando supone que Jupyter monta `./tests:/opt/tests:ro`. Si ese volumen no existe en tu
-Compose, agrégalo antes de ejecutar el test.
+La task construye/reutiliza la imagen Airflow, monta `./tests:/opt/tests:ro` y ejecuta Spark en modo
+`local[1]`; no depende de que Jupyter o el cluster estén levantados.
 
 **Qué observar:** el test crea DataFrames en memoria con `Row`, ejecuta la función pura y verifica el
 resultado. No toca HDFS, Airflow ni el cluster: corre en segundos.
@@ -985,7 +985,7 @@ equivalente local (porque corre contra servicios AWS, no contra el cluster de es
 | Tablas Iceberg (ACID/MERGE/time-travel) | **Ej. 21**, acá mismo, sin AWS | [docs/02 §16](02-produccion-aws-terraform.md#16-athena-e-iceberg) |
 | Consumo SQL/BI (Athena) | El SQL del Ej. 21 es el mismo que correrías en Athena | [docs/02 §16](02-produccion-aws-terraform.md#16-athena-e-iceberg) |
 | Transformaciones versionadas (dbt) | No hay equivalente local en este repo — dbt corre contra Athena/EMR reales | [docs/02 §19](02-produccion-aws-terraform.md#19-transformaciones-con-dbt) |
-| Calidad de datos (Great Expectations) | No hay equivalente local — valida contra Athena real | [docs/02 §20](02-produccion-aws-terraform.md#20-calidad-de-datos) |
+| Calidad de datos | Contratos locales reales en `transforms.py`; Great Expectations sigue opcional | [docs/02 §20](02-produccion-aws-terraform.md#20-calidad-de-datos) |
 | Lineage de datos (OpenLineage) | No hay equivalente local — los eventos van a S3/Athena reales | [docs/02 §22](02-produccion-aws-terraform.md#22-lineage-con-openlineage) |
 | Disparo event-driven con retry (SQS + Lambda) | No hay equivalente local — depende de S3/SQS/SSM reales | [docs/02 §7.3](02-produccion-aws-terraform.md#73-disparo-por-evento-archivo-nuevo-en-s3-vía-sqs) |
 | Orquestación (Airflow, siempre) | Ej. 12–13 ya son Airflow real, mismo motor que en prod | [docs/02 §5](02-produccion-aws-terraform.md#5-núcleo-ec2-con-docker) |
@@ -994,4 +994,3 @@ Ver [docs/02](02-produccion-aws-terraform.md) (el cómo, copy-paste) y [docs/03]
 
 > Limpieza: los `spark-apps/ejemplos/out/` y las rutas `/ejemplos/...` de HDFS son scratch. Borralos
 > con `hdfs dfs -rm -r /ejemplos` y `rm -rf spark-apps/ejemplos/out` cuando termines (no los versiones).
-

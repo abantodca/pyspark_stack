@@ -19,9 +19,15 @@ Jupyter (PySpark 4)                     →  notebooks (solo dev)
 Requisitos: Docker y Docker Compose. Recomendado 16 GB de RAM para el stack completo.
 
 ```bash
-cp .env.example .env          # secretos locales; activa el perfil "dev" (Jupyter)
-docker compose up -d --build
+cp .env.example .env
+chmod 600 .env
+# Generá y pegá cuatro valores distintos con `openssl rand -hex 32`.
+task local:up
 ```
+
+`task local:up` rechaza secretos vacíos/débiles, valida el Compose efectivo y usa el override local
+con límites, healthchecks y política de reinicio. `task test` ejecuta los contratos y las
+transformaciones en la misma imagen de Airflow que usa el pipeline.
 
 | UI | URL |
 |---|---|
@@ -48,10 +54,10 @@ Taskfile.yml     los comandos repetidos: infra, deploy, validadores (task --list
 docs/            documentación: cuatro guías centrales, adr/ (decisiones) y referencia/
 ```
 
-Este repositorio contiene **solo el proyecto local**. La infraestructura de producción —Terraform,
-Compose de producción, Lambdas, workflows de CI/CD y jobs de EMR Serverless— no se versiona acá: se
-crea paso a paso siguiendo [docs/02](docs/02-produccion-aws-terraform.md), que incluye el contenido
-completo de cada archivo.
+El repositorio contiene el proyecto local y una **composición Terraform parcial** (`network` y
+`orchestrator`) que puede validarse sin credenciales. El resto de la infraestructura de producción,
+Lambdas, Compose productivo, workflows y jobs de EMR siguen siendo guía de implementación: no se
+consideran desplegables ni probados de punta a punta.
 
 La excepción es `scripts/prod-env.sh`: sí se versiona, porque corre en **tu** máquina. Convierte los
 outputs de Terraform en variables de entorno, y es lo que hace que cada comando de las guías se
@@ -76,9 +82,12 @@ Material de consulta en [`docs/referencia/`](docs/referencia):
 - [06 — Historial de incidentes](docs/referencia/06-historial-de-incidentes.md): fallos del stack local y sus fixes.
 - [07 — Secuencia de ejecución](docs/referencia/07-secuencia-de-ejecucion.md): por qué cada comando va donde va, cuáles
   dejan de hacer falta al avanzar, y en qué se diferencia la secuencia de lo que haría un operador.
+- [Gobierno y operaciones de datos](docs/referencia/08-gobierno-operaciones-datos.md): ownership,
+  contratos, calidad, SLO, incidentes, retención y gate para datos reales.
 
 ## Seguridad
 
-- Los secretos locales tienen defaults deliberadamente débiles: sirven para desarrollo, nunca para
-  producción. El Compose de producción exige valores explícitos, cargados desde AWS SSM.
-- `.env`, los estados de Terraform y las claves están en `.gitignore`. Nunca subas secretos reales.
+- Los cuatro secretos locales son obligatorios; `task local:check` rechaza valores débiles y exige
+  modo `0600` en `.env`. El Compose productivo deberá cargarlos desde AWS SSM.
+- `.env`, los estados de Terraform y las claves están en `.gitignore`; `.dockerignore` evita que
+  entren al contexto de build. Nunca subas secretos reales.

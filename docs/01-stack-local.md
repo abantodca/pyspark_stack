@@ -73,9 +73,10 @@ producción, cuyo orden explica la [guía 02 §3.0b](02-produccion-aws-terraform
 
 | Task | Qué hace |
 |---|---|
-| `task local:up` | `docker compose up -d` — levanta los cuatro subsistemas |
+| `task local:check` | Valida secretos, permisos y el Compose efectivo sin arrancar servicios |
+| `task local:up` | Valida y levanta los cuatro subsistemas con el override endurecido |
 | `task local:down` | Baja el stack **conservando** los volúmenes (los datos de HDFS y Postgres siguen ahí) |
-| `task test` | `pytest -q` — los controles de integridad de los DAGs |
+| `task test` | Pruebas reproducibles de DAGs, contratos y transformaciones dentro de la imagen Airflow |
 | `task doc:check` | Los dos validadores de la documentación — no tocan AWS |
 | `task --list` | El catálogo completo, incluidas las tasks de producción de la [guía 02](02-produccion-aws-terraform.md) |
 
@@ -240,8 +241,8 @@ contenedor (PID 1 terminado → `Exited(0)`). La solución es arrancar la clase 
 
 - `--host spark-master`: el master anuncia ese hostname para que el worker y los drivers lo
   encuentren; debe coincidir con el nombre del servicio.
-- `8081:8080`: la UI del master corre en el `8080` interno y se publica en `8081`, porque el `8080`
-  local ya lo ocupa el api-server de Airflow.
+- `8081:8080`: la UI del master corre en el `8080` interno y se publica en `8081` para evitar
+  colisiones con otras herramientas; Airflow se publica por separado en el host `8082`.
 - `Dockerfile.spark` instala Python 3.12 (la base trae 3.10) y fija `PYSPARK_PYTHON=python3.12`: los
   executors deben correr el mismo minor de Python que el driver o Spark aborta con
   `[PYTHON_VERSION_MISMATCH]`.
@@ -348,6 +349,7 @@ heredan de `*airflow-common`:
 | `airflow-scheduler` | Programa y despacha tasks | Ya no parsea DAGs |
 | `airflow-dag-processor` | Parsea los `.py` de `dags/` | Proceso nuevo y separado |
 | `airflow-triggerer` | Corre operadores deferrables (I/O async) | Estándar en Airflow 3 |
+| `airflow-log-cleaner` | Aplica edad y tope de tamaño al volumen de logs | Servicio operativo del stack, no un proceso de Airflow |
 
 Dependencias de arranque:
 
@@ -358,10 +360,10 @@ Dependencias de arranque:
 
 ```yaml
   airflow-db:
-    image: postgres:16
+    image: postgres:16.14-bookworm@sha256:64154d0babcb1741988719e703419af0382b19953706149f9872fbd0f438efa8
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-airflow}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
       - POSTGRES_DB=${POSTGRES_DB:-airflow}
     volumes: [postgres_data:/var/lib/postgresql/data]
     healthcheck:
@@ -393,6 +395,7 @@ volumes:
   postgres_data:   # BD de Airflow
   hdfs-nn-data:    # metadatos de HDFS
   hdfs-dn-data:    # bloques de HDFS
+  airflow_logs:    # task logs persistentes con retención acotada
 
 networks:
   hadoopnet:       # una sola red bridge; DNS por nombre de servicio
@@ -410,7 +413,7 @@ Orden efectivo de arranque, resuelto por `depends_on`:
 ```
 airflow-db (healthy)
     └─► airflow-init (completa la migración)
-            └─► apiserver, scheduler, dag-processor, triggerer
+            └─► apiserver, scheduler, dag-processor, triggerer, log-cleaner
 hdfs-namenode ─► hdfs-datanode
 spark-master  ─► spark-worker
 spark-master  ─► jupyter   (solo bajo el perfil dev; no espera al worker)
@@ -425,18 +428,16 @@ pronto queda esperando executors.
 
 > **En esta sección: EJECUTAR, ~20 min.** Es la única que cambia archivos.
 > **Salís con**: secretos propios en un `.env` fuera de git, límites de memoria,
-> healthchecks reales, rotación de logs y `docker.sock` fuera del stack.
+> healthchecks reales, logs persistentes pero acotados y `docker.sock` fuera del stack.
 
 ### Mapa del camino — sección 8
 
-**Antes de empezar, el prerrequisito**: el stack levanta y responde
-(`docker compose up -d` y las UIs abren). Endurecer algo que no funciona solo agrega
-una variable más al diagnóstico.
+**Antes de empezar, el prerrequisito** es completar `.env` y ejecutar `task local:check`.
 
 ```mermaid
 flowchart TD
     E1["§8.1 · Secretos en un .env<br/><i>openssl, no los defaults</i>"]
-    E2["§8.2 · Override de endurecimiento<br/><i>límites, healthchecks, restart, logs</i>"]
+    E2["§8.2 · Override de endurecimiento<br/><i>límites, healthchecks y restart</i>"]
     E3["§8.3 · Secretos parametrizados en el base<br/><i>ya está: el Compose interpola</i>"]
     E4["§8.4 · docker.sock fuera del stack<br/><i>ya está: no se monta</i>"]
     E5["§8.5 · History server (opcional)<br/><i>para ver los jobs ya terminados</i>"]
@@ -451,15 +452,15 @@ flowchart TD
 
 **Reglas de esta sección:**
 
-- **El endurecimiento va en un override, no editando el Compose base.** Así podés
-  levantar el stack «cómodo» para desarrollar y el «endurecido» para probar, con los
-  mismos archivos y sin ramas divergentes.
+- **El endurecimiento de recursos va en el override versionado.** Los controles que deben estar
+  siempre activos —secretos obligatorios, loopback y rotación de logs— viven en el Compose base.
 - **`.env` nunca se commitea.** Está en `.gitignore`; `.env.example` es el que viaja,
   con placeholders. Un secreto commiteado sigue en la historia aunque lo borres
   después.
-- **Los defaults débiles son deuda, no configuración.** `airflow`/`airflow` y
-  `change-me-in-prod` existen para que el stack levante a la primera; el momento de
-  reemplazarlos es ahora, no «antes de producción».
+- **El build no recibe el repositorio completo.** `.dockerignore` sólo permite
+  `requirements.txt`, que es el único archivo copiado por los Dockerfiles.
+- **No existen defaults para secretos.** Si falta uno, Compose aborta antes de crear contenedores;
+  `task local:check` además rechaza longitudes y valores conocidos inseguros.
 
 > **Gotcha §8.1 — cambiar `POSTGRES_PASSWORD` con el volumen ya creado no hace nada.**
 > Postgres solo aplica esas variables al **inicializar** el volumen de datos. Si ya
@@ -471,22 +472,54 @@ Lo que es aceptable en desarrollo pero no en producción:
 
 | # | Problema | Riesgo | Estado |
 |---|---|---|---|
-| 1 | Secretos con defaults débiles (`airflow`/`airflow`, JWT `change-me-in-prod`, admin/admin) | Sin un `.env` propio quedan las credenciales por defecto | Abierto (§8.1) |
-| 2 | Sin `restart` en HDFS, Spark y Jupyter | Un crash deja el servicio caído | Abierto (§8.2) |
-| 3 | Sin healthchecks salvo en Postgres | `depends_on` no sabe si el servicio *funciona* | Abierto (§8.2) |
-| 4 | Sin límites de recursos | Un job de Spark puede comerse toda la RAM del host | Abierto (§8.2) |
-| 5 | Jupyter sin token | Cualquiera en la red entra | Abierto (§8.1) |
+| 1 | Secretos con defaults débiles | Arranque accidental con credenciales conocidas | Resuelto: obligatorios + gate local (§8.1) |
+| 2 | Sin `restart` en HDFS, Spark y Jupyter | Un crash deja el servicio caído | Resuelto en override versionado (§8.2) |
+| 3 | Sin healthchecks salvo en Postgres | `depends_on` no sabe si el servicio *funciona* | Resuelto en base/override (§8.2) |
+| 4 | Sin límites de recursos | Un job de Spark puede comerse toda la RAM del host | Resuelto en override versionado (§8.2) |
+| 5 | Jupyter sin token | Cualquiera en la red entra | Resuelto: token obligatorio y puerto loopback (§8.1) |
 | 6 | Montaje de `docker.sock` | Control del host para todos los procesos de Airflow | Resuelto: no se monta (§8.4) |
 | 7 | Clave `version:` obsoleta | Warning en cada comando de Compose | Resuelto: eliminada |
+| 8 | Logs locales sin límite | El disco puede llenarse aunque los contenedores sigan sanos | Resuelto: rotación + retención acotada |
+
+### Política de logs aplicada
+
+El Compose base ya protege las dos clases de logs, sin depender del override de endurecimiento:
+
+- `stdout/stderr` de **todos** los contenedores usa `json-file` con `max-size: 10m` y
+  `max-file: 3`: cada servicio conserva aproximadamente 30 MiB como máximo.
+- Los task logs de Airflow viven en el volumen nombrado `airflow_logs`, por lo que sobreviven a
+  una recreación de contenedores y a `docker compose down`.
+- `airflow-log-cleaner` revisa cada 15 minutos: elimina archivos de más de 30 días y, si el volumen
+  aún supera 1 GiB, borra primero los más antiguos. La edad conserva contexto y el tope protege
+  también ante una tormenta de logs. Los valores se parametrizan en `.env`:
+
+```dotenv
+AIRFLOW_LOCAL_LOG_RETENTION_DAYS=30
+AIRFLOW_LOCAL_LOG_MAX_SIZE_MB=1024
+AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES=15
+```
+
+Una poda inmediata y una comprobación de espacio se pueden ejecutar así:
+
+```bash
+docker compose run --rm --no-deps airflow-log-cleaner bash /opt/pyspark-stack/scripts/prune-airflow-logs.sh --once
+docker compose exec airflow-log-cleaner du -sh /opt/airflow/logs
+```
+
+`docker compose down -v` sí elimina deliberadamente `airflow_logs`, Postgres y HDFS; no lo use
+como parada rutinaria. La retención por edad limita el histórico y la rotación limita ráfagas de
+los contenedores. En producción, la copia durable va a S3 y se elimina del host tras subirla
+([guía 02 §14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)).
 
 ### 8.1 Secretos en un `.env`
 
-El Compose base ya lee los secretos por interpolación (§8.3); solo falta darles valores fuertes:
+El Compose base exige los secretos por interpolación (§8.3); generá un valor distinto para cada
+variable y protegé el archivo:
 
 ```bash
-cp .env.example .env      # .env está en .gitignore; no commitear
-openssl rand -hex 32      # para AIRFLOW_JWT_SECRET
-openssl rand -hex 24      # para POSTGRES_PASSWORD
+cp .env.example .env
+chmod 600 .env
+openssl rand -hex 32      # ejecutar cuatro veces y pegar un valor diferente en cada secreto
 ```
 
 ```dotenv
@@ -497,78 +530,23 @@ POSTGRES_DB=airflow
 AIRFLOW_JWT_SECRET=<openssl rand -hex 32>
 AIRFLOW_ADMIN_USER=admin
 AIRFLOW_ADMIN_PASSWORD=<valor fuerte>
+AIRFLOW_LOCAL_LOG_RETENTION_DAYS=30
+AIRFLOW_LOCAL_LOG_MAX_SIZE_MB=1024
+AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES=15
 JUPYTER_TOKEN=<token largo>
 ```
 
 ### 8.2 Override de endurecimiento
 
-En vez de tocar el Compose base, usá un override que Compose fusiona: el desarrollo queda intacto y
-se añaden `restart`, rotación de logs, healthchecks y límites de memoria.
+Usá un override que Compose fusiona para añadir `restart`, healthchecks y límites de memoria. La
+rotación y retención de logs ya están en el Compose base y no se duplican aquí.
 
-**Primero creá el archivo** en la raíz del repo (no está versionado; el `up -d` de más abajo lo
-necesita):
-
-```yaml
-# docker-compose.local-hardened.yml — límites y healthchecks para el laboratorio local
-x-restart: &restart-policy
-  restart: unless-stopped
-
-x-logging: &default-logging          # rota logs para no llenar el disco
-  logging:
-    driver: json-file
-    options: { max-size: "10m", max-file: "3" }
-
-services:
-  hdfs-namenode:
-    <<: [*restart-policy, *default-logging]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9870"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits: { memory: 2g }
-
-  hdfs-datanode:
-    <<: [*restart-policy, *default-logging]
-    deploy:
-      resources:
-        limits: { memory: 2g }
-
-  spark-master:
-    <<: [*restart-policy, *default-logging]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits: { memory: 2g }
-
-  spark-worker:
-    <<: [*restart-policy, *default-logging]
-    deploy:
-      resources:
-        limits: { memory: 4g }        # tope duro del contenedor (cgroup)
-
-  airflow-db:
-    <<: [*restart-policy, *default-logging]
-
-  airflow-apiserver:     { <<: *default-logging }
-  airflow-scheduler:     { <<: *default-logging }
-  airflow-dag-processor: { <<: *default-logging }
-  airflow-triggerer:     { <<: *default-logging }
-```
-
-Jupyter no aparece: vive bajo el perfil `dev` y no se endurece para producción, donde directamente no
-corre.
-
-**Con el archivo creado, levantá el stack endurecido:**
+El archivo [`docker-compose.local-hardened.yml`](../docker-compose.local-hardened.yml) ya está
+versionado. `task local:up` siempre lo combina con el Compose base:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml up -d
+task local:check
+task local:up
 ```
 
 > Este override endurece el **stack local completo**, útil si querés correrlo así en una sola
@@ -578,26 +556,26 @@ docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml up -d
 
 ### 8.3 Secretos parametrizados en el Compose base
 
-Ya está aplicado: el Compose usa interpolaciones `${VAR:-default}`, así que sin `.env` corre con los
-defaults de desarrollo y con `.env` toma los valores reales.
+Ya está aplicado: el Compose usa `${VAR:?mensaje}` para los cuatro secretos. Sin `.env`, o con un
+valor vacío, la expansión falla antes de arrancar.
 
 ```yaml
   airflow-db:
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-airflow}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
       - POSTGRES_DB=${POSTGRES_DB:-airflow}
 ```
 
 ```yaml
 x-airflow-common: &airflow-common
   environment: &airflow-common-env
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow-db:5432/${POSTGRES_DB:-airflow}
-    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:-change-me-in-prod}'
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}@airflow-db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:?define AIRFLOW_JWT_SECRET en .env}'
 ```
 
-> Esos defaults existen solo para el entorno local. El Compose de producción no debe aceptar
-> defaults para secretos: los carga desde SSM antes de arrancar
+> Los nombres de usuario y base conservan defaults no sensibles; las contraseñas, JWT y token no.
+> El Compose de producción deberá cargarlos desde SSM antes de arrancar
 > ([guía 02 §13](02-produccion-aws-terraform.md)).
 
 ### 8.4 Mantener `docker.sock` fuera del stack
@@ -629,12 +607,12 @@ quedaban huérfanos ([06 §2, incidente #4](referencia/06-historial-de-incidente
 - [ ] `.env` fuera de git y con secretos generados con `openssl`.
 - [ ] `AIRFLOW_JWT_SECRET` único por entorno.
 - [ ] `JUPYTER_TOKEN` no vacío (solo aplica en local: en producción Jupyter no corre).
-- [ ] `restart: unless-stopped` en todos los servicios long-running.
-- [ ] Healthchecks en HDFS, Spark y Jupyter, no solo en Postgres.
-- [ ] Límites de memoria por servicio (`deploy.resources.limits`).
-- [ ] Rotación de logs (`max-size`, `max-file`).
-- [ ] `docker.sock` fuera del stack o detrás de un proxy.
-- [ ] Imágenes pineadas por tag inmutable o `@sha256`.
+- [x] `restart: unless-stopped` en todos los servicios long-running mediante el override.
+- [x] Healthchecks en HDFS, Spark y Jupyter, no solo en Postgres.
+- [x] Límites de memoria por servicio (`deploy.resources.limits`).
+- [x] Rotación de logs Docker y retención de task logs de Airflow.
+- [x] `docker.sock` fuera del stack.
+- [x] Imágenes base externas pineadas por versión y `@sha256`.
 - [ ] Backup de los volúmenes de Postgres y del namenode de HDFS.
 
 > **Siguiente paso:** [02 — Producción en AWS](02-produccion-aws-terraform.md) para el despliegue

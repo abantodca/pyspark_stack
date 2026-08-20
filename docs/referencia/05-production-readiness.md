@@ -89,6 +89,11 @@ Se aplica sobre el árbol de producción completo: `infra/`, `docker-compose.pro
 
 ## 5. Primera validación integrada
 
+- [ ] Los responsables nominales, clasificación, retención y SLO del
+      [estándar de gobierno](08-gobierno-operaciones-datos.md) están aprobados.
+- [ ] El manifest identifica objetos/versiones exactos y el job consume esos mismos objetos; una
+      ruta fija o mutable no pasa este gate.
+- [ ] El lote escribe a staging, ejecuta calidad/reconciliación y sólo después promueve a curated.
 - [ ] SSM muestra la instancia como `Online`.
 - [ ] `/data` corresponde al EBS esperado y persiste tras un stop/start.
 - [ ] `scripts/load-secrets.sh` genera un `.env` con modo `0600`.
@@ -116,5 +121,6 @@ Se aplica sobre el árbol de producción completo: `infra/`, `docker-compose.pro
 El primer despliegue se acepta únicamente con evidencia de: smoke test, prueba end-to-end,
 persistencia tras reinicio, restauración de backup y teardown ensayado en un entorno sin datos.
 
-Iceberg, monitoreo, dbt, calidad y lineage no bloquean la primera versión porque son roadmap: cada
-uno debe llegar con su propio cambio, sus pruebas y su criterio de aceptación.
+Iceberg, dbt, Great Expectations y OpenLineage pueden seguir como roadmap. Para datos reales sí son
+obligatorios el contrato inmutable, controles mínimos de calidad, alerta externa, owner/steward y
+recuperación probada; ninguna herramienta particular es obligatoria.

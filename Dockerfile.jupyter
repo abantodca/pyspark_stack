@@ -2,7 +2,7 @@
 # La base trae Python 3.10, pero el cluster corre Python 3.12 -> se instala Python 3.12
 # (deadsnakes) para que el driver del notebook case con los executors (evita PYTHON_VERSION_MISMATCH).
 # (jupyter/pyspark-notebook solo llega a Spark 3.5, por eso no se usa.)
-FROM apache/spark:4.0.3-scala2.13-java17-python3-ubuntu
+FROM apache/spark:4.0.3-scala2.13-java17-python3-ubuntu@sha256:7112c0c0ca07b7d2605163ba91a05e53af39ba7cfcf9886e63141ade3f850456
 
 USER root
 RUN apt-get update && \
@@ -10,24 +10,26 @@ RUN apt-get update && \
     add-apt-repository -y ppa:deadsnakes/ppa && \
     apt-get update && \
     apt-get install -y --no-install-recommends python3.12 python3.12-venv && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 && \
-    python3.12 -m pip install --no-cache-dir jupyterlab pyspark==4.0.3 && \
+    python3.12 -m ensurepip --upgrade && \
+    python3.12 -m pip install --no-cache-dir \
+      'jupyterlab==4.6.3' 'pytest==8.4.2' 'six==1.17.0' \
+      'numpy==2.4.6' 'pandas==2.3.3' 'pyarrow==24.0.0' && \
     apt-get purge -y software-properties-common && apt-get autoremove -y && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     mkdir -p /opt/notebooks
-
-# 'six' es dependencia transitiva de python-dateutil (lo importa jupyter_client) pero
-# get-pip.py/pip la dejo sin resolver en esta base -> se instala aparte para evitar
-# ModuleNotFoundError: No module named 'six' al arrancar JupyterLab.
-RUN python3.12 -m pip install --no-cache-dir six
 
 # --- Conector S3A: habilita s3a:// desde el notebook usando el rol IAM de la EC2 ---
 ARG HADOOP_AWS_VERSION=3.4.1
 ARG AWS_SDK_BUNDLE_VERSION=2.24.6
 RUN curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
       -o "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
+    curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar.sha1" -o /tmp/hadoop-aws.jar.sha1 && \
+    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/hadoop-aws.jar.sha1)" "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" | sha1sum -c - && \
     curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" \
-      -o "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar"
+      -o "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar.sha1" -o /tmp/aws-bundle.jar.sha1 && \
+    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/aws-bundle.jar.sha1)" "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" | sha1sum -c - && \
+    rm -f /tmp/hadoop-aws.jar.sha1 /tmp/aws-bundle.jar.sha1
 
 WORKDIR /opt/notebooks
 EXPOSE 8888
@@ -35,10 +37,12 @@ EXPOSE 8888
 # El driver del notebook y los executors usan Python 3.12 (igual que el cluster).
 ENV PYSPARK_PYTHON=python3.12
 ENV PYSPARK_DRIVER_PYTHON=python3.12
+# La distribución oficial ya incluye PySpark y Py4J; se exponen al Python de Jupyter
+# sin descargar una segunda copia de 434 MB desde PyPI.
+ENV PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.9-src.zip
 
-# Token controlado por la env var JUPYTER_TOKEN (forma shell para que se expanda):
+# Token controlado por la env var JUPYTER_TOKEN (sh expande la variable y exec
+# entrega las señales directamente a JupyterLab):
 #  - sin definir/vacia -> sin token (entorno local de practica, igual que antes);
 #  - definida (override de prod, ver docs/02 §14.1, docker-compose.prod.yml) -> token obligatorio.
-CMD python3.12 -m jupyterlab \
-    --ip=0.0.0.0 --port=8888 --no-browser --allow-root \
-    --ServerApp.token="${JUPYTER_TOKEN:-}" --ServerApp.password= --ServerApp.root_dir=/opt/notebooks
+CMD ["sh", "-c", "exec python3.12 -m jupyterlab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token=\"${JUPYTER_TOKEN:-}\" --ServerApp.password= --ServerApp.root_dir=/opt/notebooks"]

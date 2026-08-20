@@ -1,96 +1,83 @@
+#!/usr/bin/env bash
 
-#!/bin/bash
+set -Eeuo pipefail
 
-# Step 1: Validate Input
-if [ -z "$1" ]; then
-  echo "Usage: ./run_customer_etl.sh env"
+if [ "$#" -ne 2 ]; then
+  echo "Usage: customer_etl_job_airflow.sh <dev|prod> <run_date:YYYY-MM-DD>" >&2
   exit 1
 fi
 
+ENV="$1"
+RUN_DATE="$2"
 
-ENV=${1:-dev}
-echo $ENV
-
-echo $HDFS_INPUT
-#RUN_DATE="$1"
-#LANDING_PATH="/opt/spark-apps/landing/customer_etl/"
-#HDFS_INPUT="/customer_etl/input"
-#HDFS_OUTPUT="/customer_etl/output/loyalty_snapshot_${RUN_DATE}"
-#FINAL_CSV="/opt/spark-apps/shared_output/customer_etl/loyalty_snapshot_${RUN_DATE}.csv"
-
-echo " Running Customer ETL for: $RUN_DATE"
-echo " Final CSV will be stored at: $FINAL_CSV"
-
-# Step 2: Detect if running inside container
-
-
-# modified recently since previous if condition was throwing error for few students(NEW)
 if [ -f /.dockerenv ]; then
-#if grep -qE 'docker|containerd' /proc/1/cgroup; then
-  echo " Detected: Running INSIDE container (Airflow or Jupyter)"
+  echo "[INFO] ejecución dentro de contenedor"
 
-  export PATH=$PATH:/opt/hadoop/bin
-  # La raiz de HDFS pertenece a root:supergroup; el usuario 'airflow' no puede escribir en '/'.
-  # Se opera como 'root' (dueno de '/') para poder crear /customer_etl/... y subir los inputs.
-  export HADOOP_USER_NAME=root
+  source /opt/spark-apps/customer_etl/config/env.sh "$ENV" "$RUN_DATE"
 
-  source /opt/spark-apps/customer_etl/config/env.sh "$ENV"
+  echo "[INFO] cargando lote aislado en $HDFS_INPUT"
+  python /opt/spark-apps/customer_etl/scripts/hdfs_io.py \
+    load "$HDFS_INPUT" "$LANDING_PATH"
+  python /opt/spark-apps/customer_etl/scripts/hdfs_io.py \
+    prepare-output "$HDFS_OUTPUT"
 
-  echo $env
-  echo 'HDFS_INPUT' $HDFS_INPUT
-   
-  echo " Uploading to HDFS..."
-  hdfs dfs -rm -r -f ${HDFS_INPUT}
-  hdfs dfs -mkdir -p ${HDFS_INPUT}
-  
-  hdfs dfs -put "${LANDING_PATH}/customers.csv" ${HDFS_INPUT}/
-  hdfs dfs -put "${LANDING_PATH}/products.json" ${HDFS_INPUT}/
-  hdfs dfs -put "${LANDING_PATH}/orders.csv" ${HDFS_INPUT}/
-
-  #echo "  Running Spark job..."
-  
-  #added newly args to spark script since all hardcoding has been removed in pyspark script as well(NEW) 
+  # En modo simple HDFS toma el usuario del proceso del driver (airflow). El job
+  # publica con la identidad dedicada que posee únicamente el directorio output.
+  export HADOOP_USER_NAME="${HDFS_OUTPUT_USER:-spark}"
   spark-submit --master spark://spark-master:7077 \
-	  --conf spark.pyspark.python=python3.12 \
-	  --conf spark.pyspark.driver.python=python3.12 \
-	  /opt/spark-apps/customer_etl/scripts/customer_etl_job.py \
-	  $ENV "$RUN_DATE" "$HDFS_INPUT" "$HDFS_OUTPUT"
+    --conf spark.pyspark.python=python3.12 \
+    --conf spark.pyspark.driver.python=python3.12 \
+    /opt/spark-apps/customer_etl/scripts/customer_etl_job.py \
+    "$ENV" "$RUN_DATE" "$HDFS_INPUT" "$HDFS_OUTPUT"
 
-  echo " Exporting merged CSV to local path..."
-  
-  # added newly since hdfs merge from inside container is not possible. hence generating in tmp location and copying
-  # it to final csv(NEW)
-
-  CONSOLIDATED_CSV="/tmp/loyalty_snapshot_${RUN_DATE}.csv"
-  
-  hdfs dfs -getmerge "${HDFS_OUTPUT}/part*" "$CONSOLIDATED_CSV"
-  cp "$CONSOLIDATED_CSV" "$FINAL_CSV"
+  python /opt/spark-apps/customer_etl/scripts/hdfs_io.py \
+    validate-output "$HDFS_OUTPUT"
+  echo "[INFO] resultado validado en HDFS: $HDFS_OUTPUT"
 
 else
-  echo " Detected: Running OUTSIDE container (Ubuntu host)"
+  echo "[INFO] ejecución desde el host"
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+  source "$SCRIPT_DIR/../config/env.sh" "$ENV" "$RUN_DATE"
 
-  echo " Uploading to HDFS via docker exec..."
-  
-  source "$(dirname "$0")/../config/env.sh" "$ENV"
+  docker exec hdfs-namenode hdfs dfs -rm -r -f "$HDFS_INPUT"
+  docker exec hdfs-namenode hdfs dfs -mkdir -p "$HDFS_INPUT"
+  docker exec hdfs-namenode hdfs dfs -put "${LANDING_PATH}/customers.csv" "$HDFS_INPUT/"
+  docker exec hdfs-namenode hdfs dfs -put "${LANDING_PATH}/products.json" "$HDFS_INPUT/"
+  docker exec hdfs-namenode hdfs dfs -put "${LANDING_PATH}/orders.csv" "$HDFS_INPUT/"
 
-  docker exec hdfs-namenode hdfs dfs -rm -r -f ${HDFS_INPUT}
-  docker exec hdfs-namenode hdfs dfs -mkdir -p ${HDFS_INPUT}
-  #docker exec hdfs-namenode hdfs dfs -put "${LANDING_PATH}/*" ${HDFS_INPUT}/
-  docker exec hdfs-namenode hdfs dfs -put "${LANDING_PATH}/customers.csv" ${HDFS_INPUT}/
-  docker exec hdfs-namenode hdfs dfs -put "${LANDING_PATH}/products.json" ${HDFS_INPUT}/
-  docker exec hdfs-namenode hdfs dfs -put "${LANDING_PATH}/orders.csv" ${HDFS_INPUT}/
+  HDFS_OUTPUT_PARENT="${HDFS_OUTPUT%/*}"
+  docker exec hdfs-namenode hdfs dfs -mkdir -p "$HDFS_OUTPUT_PARENT"
+  docker exec hdfs-namenode hdfs dfs -chown spark "$HDFS_OUTPUT_PARENT"
 
+  docker exec spark-master /opt/spark/bin/spark-submit \
+    --master spark://spark-master:7077 \
+    --conf spark.pyspark.python=python3.12 \
+    --conf spark.pyspark.driver.python=python3.12 \
+    /opt/spark-apps/customer_etl/scripts/customer_etl_job.py \
+    "$ENV" "$RUN_DATE" "$HDFS_INPUT" "$HDFS_OUTPUT"
 
-  echo " Submitting Spark job via docker exec..."
-
-  #added newly args to spark script since all hardcoding has been removed in pyspark script as well(NEW)
-  docker exec spark-master spark-submit /opt/spark-apps/customer_etl/scripts/customer_etl_job.py \
-	  $ENV "$RUN_DATE" "$HDFS_INPUT" "$HDFS_OUTPUT"
-
-  echo "Merging HDFS output to host shared folder..."
-  #mkdir -p "/opt/spark-apps/shared_output/customer_etl/"
-  docker exec hdfs-namenode hdfs dfs -getmerge ${HDFS_OUTPUT}/part-* "$FINAL_CSV"
+  OUTPUT_DIR="$PROJECT_ROOT/spark-apps/shared_output/customer_etl"
+  FINAL_CSV="$OUTPUT_DIR/loyalty_snapshot_${RUN_DATE}.csv"
+  mkdir -p "$OUTPUT_DIR"
+  TEMP_OUTPUT_DIR="$(mktemp -d "$OUTPUT_DIR/.loyalty_snapshot_${RUN_DATE}.XXXXXX")"
+  TEMP_CSV="$TEMP_OUTPUT_DIR/output.csv"
+  TEMP_CRC="$TEMP_OUTPUT_DIR/.output.csv.crc"
+  FINAL_CRC="$OUTPUT_DIR/.$(basename "$FINAL_CSV").crc"
+  cleanup_output_temp() {
+    rm -f -- "$TEMP_CSV" "$TEMP_CRC"
+    rmdir -- "$TEMP_OUTPUT_DIR" 2>/dev/null || true
+  }
+  trap cleanup_output_temp EXIT
+  docker exec hdfs-namenode hdfs dfs -getmerge \
+    "${HDFS_OUTPUT}/part*" \
+    "/opt/spark-apps/shared_output/customer_etl/$(basename "$TEMP_OUTPUT_DIR")/output.csv"
+  test -s "$TEMP_CSV"
+  mv -f -- "$TEMP_CSV" "$FINAL_CSV"
+  # Hadoop genera checksums para el filesystem local del contenedor; el CSV
+  # compartido no los necesita y un sidecar previo no debe sobrevivir al reemplazo.
+  rm -f -- "$TEMP_CRC" "$FINAL_CRC"
+  rmdir -- "$TEMP_OUTPUT_DIR"
+  trap - EXIT
+  echo "[INFO] resultado disponible en $FINAL_CSV"
 fi
-
-echo " Done. Output available at: $FINAL_CSV"
-
