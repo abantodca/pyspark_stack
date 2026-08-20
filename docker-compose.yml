@@ -3,6 +3,12 @@
 # Airflow 3 parte el monolito: api-server (UI+API), scheduler, dag-processor y triggerer
 # son procesos independientes que comparten esta misma imagen, env y volumenes.
 # -----------------------------------------------------------------------------
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 x-airflow-common: &airflow-common
   # image + build compartidos: la imagen se construye UNA vez y los 5 servicios airflow-*
   # la reutilizan (evita 5 imagenes duplicadas de ~7GB y que 'up' agarre una imagen vieja).
@@ -15,18 +21,22 @@ x-airflow-common: &airflow-common
     # En Airflow 3 la creacion de usuarios/RBAC vive en el provider FAB:
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     # SQL_ALCHEMY_CONN se movio de [core] a [database] en Airflow 3:
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow-db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}@airflow-db:5432/${POSTGRES_DB:-airflow}
     AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
     # El scheduler/worker habla con el api-server via la Task Execution API (nuevo en Airflow 3).
     # OJO: debe apuntar al hostname del contenedor api-server, NO a localhost:
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     # Reemplaza al viejo WEBSERVER__SECRET_KEY: el api-server firma tokens JWT.
-    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:-change-me-in-prod}'
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:?define AIRFLOW_JWT_SECRET en .env}'
     AIRFLOW_UID: 50000
   volumes:
     - ./dags:/opt/airflow/dags
     - ./spark-apps:/opt/spark-apps
+    - ./tests:/opt/tests:ro
     - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
+    # Persiste los task logs entre recreaciones. airflow-log-cleaner aplica la retencion.
+    - airflow_logs:/opt/airflow/logs
+  logging: *default-logging
   networks:
     - hadoopnet
 
@@ -38,11 +48,13 @@ services:
     environment:
       - CLUSTER_NAME=hadoop-cluster
       - CORE_CONF_fs_defaultFS=hdfs://hdfs-namenode:9000
+      - HDFS_CONF_dfs_webhdfs_enabled=true
     ports:
-      - "9870:9870"
+      - "127.0.0.1:9870:9870"
     volumes:
       - hdfs-nn-data:/hadoop/dfs/name
       - ./spark-apps:/opt/spark-apps
+    logging: *default-logging
     networks:
       - hadoopnet
 
@@ -56,9 +68,16 @@ services:
       - CLUSTER_NAME=hadoop-cluster
       - CORE_CONF_fs_defaultFS=hdfs://hdfs-namenode:9000
       - HDFS_CONF_dfs_replication=1
+      - HDFS_CONF_dfs_webhdfs_enabled=true
     volumes:
       - hdfs-dn-data:/hadoop/dfs/data
       - ./spark-apps:/opt/spark-apps
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9864"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging: *default-logging
     networks:
       - hadoopnet
 
@@ -74,11 +93,12 @@ services:
     entrypoint: ["/opt/spark/bin/spark-class"]
     command: ["org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
     ports:
-      - "7077:7077"
-      - "8081:8080"
+      - "127.0.0.1:7077:7077"
+      - "127.0.0.1:8081:8080"
     volumes:
       - ./spark-apps:/opt/spark-apps
       - ./spark-events:/tmp/spark-events
+    logging: *default-logging
     networks:
       - hadoopnet
 
@@ -96,6 +116,12 @@ services:
       - ./spark-apps:/opt/spark-apps
     networks:
       - hadoopnet
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging: *default-logging
       
 #  spark-history-server:
 #    build:
@@ -129,10 +155,11 @@ services:
     # o con `docker compose --profile dev up`. Un `docker compose up` "pelado" (prod) NO lo levanta.
     profiles: ["dev"]
     ports:
-      - "8888:8888"
-      - "4055:4040"
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:4055:4040"
     volumes:
       - ./notebooks:/opt/notebooks
+      - ./tests:/opt/tests:ro
       - ./spark-apps:/opt/spark-apps
       - ./spark-events:/tmp/spark-events
     depends_on:
@@ -149,14 +176,20 @@ services:
       # Sin esta línea el token del .env nunca llega al contenedor: compose usa el .env para
       # sustituir en el YAML, no lo inyecta en el proceso. Dockerfile.jupyter lo lee como
       # --ServerApp.token="${JUPYTER_TOKEN:-}" y, vacío, levanta JupyterLab SIN token.
-      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-}
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:?define JUPYTER_TOKEN en .env}
+    healthcheck:
+      test: ["CMD", "python3.12", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/api', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging: *default-logging
 
   airflow-db:
-    image: postgres:16
+    image: postgres:16.14-bookworm@sha256:64154d0babcb1741988719e703419af0382b19953706149f9872fbd0f438efa8
     container_name: airflow-db
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-airflow}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
       - POSTGRES_DB=${POSTGRES_DB:-airflow}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -165,6 +198,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    logging: *default-logging
     networks:
       - hadoopnet
 
@@ -181,8 +215,8 @@ services:
       bash -c "
         airflow db migrate &&
         airflow fab-db migrate &&
-        (airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:-admin} ||
-         airflow users reset-password --username ${AIRFLOW_ADMIN_USER:-admin} --password ${AIRFLOW_ADMIN_PASSWORD:-admin})"
+        (airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:?define AIRFLOW_ADMIN_PASSWORD en .env} ||
+         airflow users reset-password --username ${AIRFLOW_ADMIN_USER:-admin} --password ${AIRFLOW_ADMIN_PASSWORD:?define AIRFLOW_ADMIN_PASSWORD en .env})"
 
   # UI + API REST (antes 'airflow webserver'). Sirve en 8080 dentro del contenedor.
   airflow-apiserver:
@@ -191,7 +225,7 @@ services:
     restart: always
     command: api-server
     ports:
-      - "8082:8080"
+      - "127.0.0.1:8082:8080"
     depends_on:
       airflow-db:
         condition: service_healthy
@@ -233,10 +267,30 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # Airflow no elimina por si solo los task logs locales. Este servicio comparte el volumen y
+  # aplica periodicamente edad + tamano maximo; evita que la persistencia crezca sin limite.
+  airflow-log-cleaner:
+    <<: *airflow-common
+    container_name: airflow-log-cleaner
+    restart: unless-stopped
+    environment:
+      <<: *airflow-common-env
+      AIRFLOW_LOCAL_LOG_RETENTION_DAYS: ${AIRFLOW_LOCAL_LOG_RETENTION_DAYS:-30}
+      AIRFLOW_LOCAL_LOG_MAX_SIZE_MB: ${AIRFLOW_LOCAL_LOG_MAX_SIZE_MB:-1024}
+      AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES: ${AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES:-15}
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - ./scripts/prune-airflow-logs.sh:/opt/pyspark-stack/scripts/prune-airflow-logs.sh:ro
+    command: ["bash", "/opt/pyspark-stack/scripts/prune-airflow-logs.sh"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
 volumes:
   postgres_data:
   hdfs-nn-data:
   hdfs-dn-data:
+  airflow_logs:
 
 networks:
   hadoopnet:

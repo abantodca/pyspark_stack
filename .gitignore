@@ -23,6 +23,7 @@ monitoring/alertmanager/alertmanager.yml
 # --- Python ---
 **/__pycache__/
 *.py[cod]
+.venv/
 .ipynb_checkpoints/
 
 # --- Spark ---

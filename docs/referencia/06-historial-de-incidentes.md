@@ -46,7 +46,7 @@ aplicados. Se conserva porque los mismos problemas reaparecen al reconstruir el 
 | `hdfs-namenode` / `hdfs-datanode` | `chandravenkat/hadoop-*` | Almacenamiento HDFS (`hdfs://hdfs-namenode:9000`) |
 | `spark-master` / `spark-worker` | build `Dockerfile.spark` (base `apache/spark:4.0.3`) | Cluster Spark standalone (`spark://spark-master:7077`), UI en `8081` |
 | `jupyter` | build `Dockerfile.jupyter` | Notebooks con PySpark 4.0.3 |
-| `airflow-db` | `postgres:16` | Metadata de Airflow |
+| `airflow-db` | `postgres:16.14-bookworm` | Metadata de Airflow |
 | `airflow-init` | build `Dockerfile.airflow` | One-shot: `db migrate` + `fab-db migrate` + crea el admin |
 | `airflow-apiserver` | build `Dockerfile.airflow` | UI y API REST (antes `webserver`), puerto `8082` |
 | `airflow-scheduler` | build `Dockerfile.airflow` | Orquestación (LocalExecutor) |

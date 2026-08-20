@@ -439,8 +439,10 @@ UUID="$(sudo blkid -s UUID -o value "$DEVICE")"
 grep -q "$UUID" /etc/fstab ||
   echo "UUID=$UUID /data xfs defaults,nofail 0 2" | sudo tee -a /etc/fstab
 
-sudo mkdir -p /data/{postgres,prometheus,grafana,loki}
+sudo mkdir -p /data/{postgres,airflow-logs,backups/postgres,prometheus,grafana,loki}
 sudo chown -R ec2-user:ec2-user /data
+sudo chown 50000:0 /data/airflow-logs
+printf 'e /data/airflow-logs - - - 7d\n' | sudo tee /etc/tmpfiles.d/airflow-logs.conf
 sudo chown 65534:65534 /data/prometheus
 sudo chown 472:472 /data/grafana
 sudo chown 10001:10001 /data/loki
@@ -831,13 +833,22 @@ nombre del bucket en los dos ARN):
 }
 ```
 
-**Lifecycle (solo `datalake`)** — *Management → Create lifecycle rule*:
+**Lifecycle del `datalake`** — *Management → Create lifecycle rule*:
 
 - *Rule name* `tiering` · *Rule scope*: **Apply to all objects in the bucket** (aceptá el aviso).
 - *Lifecycle rule actions*: **Move current versions of objects between storage classes**:
   - **Standard-IA** a los **30** días.
   - **Glacier Instant Retrieval** a los **90** días.
 - **Create rule**.
+
+**Lifecycle de `artifacts`** — cree reglas separadas porque los logs son operativos, no datos del
+lake:
+
+- Prefijo `logs/airflow/`: expirar objetos actuales a los **90 días**.
+- Prefijo `emr/logs/`: expirar objetos actuales a los **90 días**.
+- Todo el bucket: borrar versiones no actuales a los **30 días** y abortar multipart incompletos a
+  los **7 días**. No transicione cada log pequeño a Glacier: requests y recuperación pueden costar
+  más que el almacenamiento ahorrado.
 
 > (Opcional) *Create folder* para `raw/`, `curated/`, `analytics/` — también aparecen solos con la
 > primera escritura.
@@ -1267,22 +1278,19 @@ cola `pyspark-stack-trigger-airflow-dlq` (la de §16.1), *Maximum receives* **5*
 ```
 
 **Paso 3 — Notificación S3 → SQS.** Consola: **S3 → bucket `pyspark-stack-datalake-<acct>` →
-Properties → Event notifications → Create event notification** → *Event name* `on-upload-raw` ·
-*Prefix* `raw/` · *Event types* **All object create events** · *Destination*: **SQS queue** →
+Properties → Event notifications → Create event notification** → *Event name* `customer-etl-ready` ·
+*Prefix* `raw/manifests/customer_etl/` · *Suffix* `.json` · *Event types* **All object create events** · *Destination*: **SQS queue** →
 `pyspark-stack-trigger-events` → **Save changes**.
 
 **Paso 4 — La Lambda consume la cola.** Consola: **Lambda → `pyspark-stack-trigger-airflow` →
 Configuration → Triggers → Add trigger** → **SQS** → `pyspark-stack-trigger-events` → *Batch size*
-**1** (un archivo = una invocación: así uno rechazado o lento no bloquea a los demás) → **Add**.
+**1** (un manifest completo = una invocación) → **Add**.
 
 > Los dos disparadores (cron y evento S3) apuntan al DAG de producción `customer_etl_emr` (§12) —
-> no al `customer_etl_dag` dev-local, que usa el Spark/HDFS deshabilitado en prod. Tal como viene,
-> `customer_etl_emr` tampoco lee `dag_run.conf` (procesa por `{{ ds }}`): por evento S3 corre pero
-> ignora el archivo puntual. Para el camino event-driven real, hacé que lea
-> `{{ dag_run.conf['bucket'] }}` / `{{ dag_run.conf['key'] }}` y los pase como
-> `entryPointArguments` del `EmrServerlessStartJobOperator` (patrón de §12/§14).
+> no al `customer_etl_dag` dev-local. Publique el manifest solamente después de los tres objetos;
+> `customer_etl_emr` recibe bucket, key y run_date por `dag_run.conf` y el job registra el manifest.
 
-> Verificá el retry: apagá la EC2 a mano, subí un archivo a `raw/`, y mirá **SQS → la cola →
+> Verificá el retry: apagá la EC2, publicá un manifest válido y mirá **SQS → la cola →
 > Monitoring** — el mensaje queda "in flight" (procesándose o esperando el próximo intento) hasta
 > que la EC2 esté arriba y el DAG se dispare solo.
 
@@ -1736,7 +1744,7 @@ Qué se monitorea:
 | Contenedores (uso por servicio) | `cAdvisor` | 8080 |
 | Airflow (DAGs, tasks, duraciones) | Airflow StatsD → `statsd-exporter` | 9102 |
 | Spark (jobs) | **EMR Serverless** → CloudWatch + logs a S3 (`emr/logs/`) | — (managed) |
-| Logs de todos los contenedores | `Promtail` → `Loki` | 3100 |
+| Logs de todos los contenedores | `Grafana Alloy` → `Loki` | 3100 |
 | Alertas | `Alertmanager` → email | 9093 |
 | Dashboards | `Grafana` | 3000 |
 
@@ -1748,16 +1756,15 @@ monitoring/
 ├── alertmanager/alertmanager.yml
 ├── statsd/statsd_mapping.yml
 ├── loki/loki-config.yml
-├── promtail/promtail-config.yml
+├── alloy/config.alloy
 └── grafana/
     ├── provisioning/{datasources/datasources.yml, dashboards/dashboards.yml}
     └── dashboards/overview.json
 ```
 
-De estos archivos, `prometheus.yml` y `alerts.yml` están escritos en la [guía 02
-§12.2](../02-produccion-aws-terraform.md#122-prometheus); el resto (`statsd_mapping.yml`,
-`loki-config.yml`, `promtail-config.yml` y el provisioning de Grafana) es **roadmap**: la guía 02
-lo declara así en §12 y todavía no trae su contenido. El override que los monta es la [guía 02
+De estos archivos, `prometheus.yml`, `alerts.yml`, `alloy/config.alloy` y `loki/loki-config.yml`
+están escritos en la [guía 02 §12.2](../02-produccion-aws-terraform.md#122-prometheus); el resto
+(`statsd_mapping.yml` y el provisioning de Grafana) es **roadmap**. El override que los monta es la [guía 02
 §14.2](../02-produccion-aws-terraform.md#142-docker-composeprodmonitoringyml--override-de-observabilidad).
 Los dos más importantes de tener a mano:
 
@@ -1773,10 +1780,15 @@ groups:
         labels: { severity: critical }
         annotations: { summary: "Target {{ $labels.job }} caído" }
       - alert: HostDiskAlmostFull
-        expr: (node_filesystem_avail_bytes{mountpoint="/data"} / node_filesystem_size_bytes{mountpoint="/data"}) * 100 < 10
+        expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/data"} / node_filesystem_size_bytes{mountpoint="/data"}) > 80
+        for: 15m
+        labels: { severity: warning }
+        annotations: { summary: "Disco /data supera 80%" }
+      - alert: HostDiskCritical
+        expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/data"} / node_filesystem_size_bytes{mountpoint="/data"}) > 90
         for: 5m
         labels: { severity: critical }
-        annotations: { summary: "Disco /data casi lleno" }
+        annotations: { summary: "Disco /data supera 90%" }
       - alert: DailyEtlMissing   # dead-man switch: el ETL diario dejó de correr en silencio
         expr: >-
           increase(airflow_dagrun_duration_success_count{dag_id="customer_etl_emr"}[26h]) == 0
@@ -1817,10 +1829,11 @@ receivers:
         send_resolved: true
 ```
 
-`prometheus.yml` copialo tal cual de la [guía 02 §12.2](../02-produccion-aws-terraform.md#122-prometheus).
-Los demás (`statsd_mapping.yml`, `loki-config.yml`, `promtail-config.yml`, el provisioning de
-Grafana y `overview.json`) todavía no están escritos en ninguna de las dos guías: hasta que existan,
-corré solo el Compose base, sin el override de monitoreo.
+`prometheus.yml` y `loki-config.yml` copialos tal cual de la
+[guía 02 §12.2](../02-produccion-aws-terraform.md#122-prometheus). Loki conserva 7 días y
+Prometheus 15 días con tope de 5 GiB. `statsd_mapping.yml`, el provisioning de Grafana y
+`overview.json` siguen sin estar escritos: hasta que existan, corré solo el Compose base, sin el
+override de monitoreo.
 
 **Acceso (por túnel SSH):**
 
@@ -1980,6 +1993,7 @@ repositorio. Usa los artefactos canónicos de
 | Artefacto | Sección canónica |
 |---|---|
 | `docker-compose.prod.yml` | guía 02 §5.5 (mínimo) y §14 (definitivo) |
+| `scripts/prune-airflow-logs.sh` | repositorio; defensa local del Compose definitivo de guía 02 §14.1 |
 | `Dockerfile.airflow.prod` | guía 02 §5.5 |
 | `lambdas/startstop.py` | guía 02 §5.4 |
 | `lambdas/trigger_airflow.py` | guía 02 §7.1 |
@@ -1989,6 +2003,7 @@ repositorio. Usa los artefactos canónicos de
 | Deploy de desarrollo | guía 02 §10.1 |
 | Workflows CI/CD | guía 02 §11 |
 | Prometheus y alertas | guía 02 §12 |
+| Retención de logs S3/CloudWatch/Loki y logging remoto de Airflow | guía 02 §6.1, §12 y §14.1 |
 | Runbook de producción | guía 02 §15 |
 
 Los nombres de archivo difieren en un solo punto: la guía 02 guarda las Lambdas bajo
@@ -2201,7 +2216,7 @@ aws ssm get-command-invocation \
 ### 14.3 Evento S3
 
 ```bash
-KEY="raw/_smoke/$(date -u +%Y%m%dT%H%M%SZ)/_SUCCESS"
+KEY="diagnostics/$(date -u +%Y%m%dT%H%M%SZ)/iam.txt"
 printf 'ready\n' | aws s3 cp - "s3://${DATALAKE_BUCKET}/${KEY}"
 ```
 

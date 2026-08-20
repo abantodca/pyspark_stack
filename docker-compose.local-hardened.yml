@@ -1,0 +1,54 @@
+services:
+  hdfs-namenode:
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy: {resources: {limits: {memory: 2g}}}
+
+  hdfs-datanode:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: 2g}}}
+
+  spark-master:
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy: {resources: {limits: {memory: 1g}}}
+
+  spark-worker:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: 4g}}}
+
+  jupyter:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: 4g}}}
+
+  airflow-db:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: 1g}}}
+
+  airflow-apiserver:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: 1g}}}
+
+  airflow-scheduler:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: 1g}}}
+
+  airflow-dag-processor:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: 1g}}}
+
+  airflow-triggerer:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: 1g}}}
+
+  airflow-log-cleaner:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: 256m}}}

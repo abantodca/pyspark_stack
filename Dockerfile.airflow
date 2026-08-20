@@ -3,56 +3,36 @@
 # cloudpickle de PySpark 3.2.1 no serializa lambdas en Python 3.11+). Se usa Spark 4.0.3,
 # que requiere Java 17 -> se instala Temurin (Adoptium) JDK 17 desde tarball (bookworm no
 # trae openjdk-11; y Spark 4 ya no soporta Java 11).
-FROM apache/airflow:3.2.2-python3.12
+FROM apache/spark:4.0.3-scala2.13-java17-python3-ubuntu@sha256:7112c0c0ca07b7d2605163ba91a05e53af39ba7cfcf9886e63141ade3f850456 AS spark-runtime
+
+FROM apache/airflow:3.2.2-python3.12@sha256:bbe58e3204d550ab98dbf738a42c0e6663c455357ecd0e2d1440ef9cb6a75f00
 
 ARG AIRFLOW_VERSION=3.2.2
 ARG PYTHON_VERSION=3.12
 ARG SPARK_VERSION=4.0.3
-ARG HADOOP_CLI_VERSION=3.4.1
 # JDK 17 (x86_64). Si cambias de arquitectura, ajusta esta URL de Adoptium.
-ARG TEMURIN_JDK_URL=https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.12%2B7/OpenJDK17U-jdk_x64_linux_hotspot_17.0.12_7.tar.gz
+ARG TEMURIN_JDK_URL=https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.18%2B8/OpenJDK17U-jdk_x64_linux_hotspot_17.0.18_8.tar.gz
 
 USER root
 
 # ----------------------------
-#  Install Java 17 (Temurin) and Spark 4.0.3 (para spark-submit contra el cluster standalone)
+#  Install Java 17 (Temurin). Spark se copia de su imagen oficial pineada y cacheable.
 # ----------------------------
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl wget vim procps && \
+    apt-get install -y --no-install-recommends curl procps && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     mkdir -p /opt/java && \
-    curl -fSL "${TEMURIN_JDK_URL}" | tar -xz -C /opt/java --strip-components=1 && \
-    curl -fSL "https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz" \
-    | tar -xz -C /opt/ && \
-    mv "/opt/spark-${SPARK_VERSION}-bin-hadoop3" /opt/spark
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 3 "${TEMURIN_JDK_URL}" -o /tmp/temurin.tar.gz && \
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 3 "${TEMURIN_JDK_URL}.sha256.txt" -o /tmp/temurin.sha256 && \
+    printf '%s  %s\n' "$(awk '{print $1}' /tmp/temurin.sha256)" /tmp/temurin.tar.gz | sha256sum -c - && \
+    tar -xzf /tmp/temurin.tar.gz -C /opt/java --strip-components=1 && \
+    rm -f /tmp/temurin.tar.gz /tmp/temurin.sha256
+
+COPY --from=spark-runtime /opt/spark /opt/spark
 
 ENV JAVA_HOME=/opt/java
 ENV SPARK_HOME=/opt/spark
 ENV PATH="${PATH}:${JAVA_HOME}/bin:${SPARK_HOME}/bin"
-
-# ----------------------------
-#  Install Hadoop CLI (HDFS) 3.4.1 (compatible con Java 17)
-# ----------------------------
-RUN wget "https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_CLI_VERSION}/hadoop-${HADOOP_CLI_VERSION}.tar.gz" && \
-    tar -xzf "hadoop-${HADOOP_CLI_VERSION}.tar.gz" -C /opt/ && \
-    ln -s "/opt/hadoop-${HADOOP_CLI_VERSION}" /opt/hadoop && \
-    rm "hadoop-${HADOOP_CLI_VERSION}.tar.gz" && \
-    echo 'export HADOOP_HOME=/opt/hadoop' >> ~/.bashrc && \
-    echo 'export PATH=$PATH:/opt/hadoop/bin' >> ~/.bashrc
-
-ENV HADOOP_HOME=/opt/hadoop
-ENV PATH="${PATH}:${HADOOP_HOME}/bin"
-# Hadoop CLI en Java 17 necesita abrir algunos modulos internos de la JVM:
-ENV HADOOP_OPTS="--add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/java.net=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED"
-
-# --- Conector S3A en el Spark del driver (spark-submit contra s3a:// con el rol IAM de la EC2) ---
-# Spark 4.0.3 empaqueta Hadoop 3.4.1 => hadoop-aws 3.4.1 + AWS SDK v2 bundle 2.24.6.
-ARG HADOOP_AWS_VERSION=3.4.1
-ARG AWS_SDK_BUNDLE_VERSION=2.24.6
-RUN curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
-      -o "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
-    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" \
-      -o "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar"
 
 # ----------------------------
 # 🔁 Switch back to airflow user and install Python providers
@@ -64,4 +44,4 @@ RUN pip install --no-cache-dir -r /requirements.txt \
       --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
 
 # pyspark 4.0.3 SIN constraints: debe casar con el cluster Spark 4.0.3.
-RUN pip install --no-cache-dir pyspark==4.0.3
+RUN pip install --no-cache-dir 'pyspark[sql]==4.0.3' 'pytest==8.4.2'

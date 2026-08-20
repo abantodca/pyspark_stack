@@ -29,7 +29,7 @@ docs/
 ├── 03-arquitectura.md                 el porqué
 ├── 04-ejemplos-locales.md             tutorial
 ├── adr/                               decisiones estructurales, con sus alternativas descartadas
-└── referencia/                        consulta: 02b, readiness, incidentes, secuencia
+└── referencia/                        consulta: readiness, incidentes, secuencia y gobierno
 ```
 
 | Documento | Propósito | Estado |
@@ -50,6 +50,7 @@ Y en [`referencia/`](referencia), lo que se abre cuando hace falta:
 | [05 — Production readiness](referencia/05-production-readiness.md) | Controles previos al primer despliegue | Implementado |
 | [06 — Historial de incidentes](referencia/06-historial-de-incidentes.md) | Fallos del stack local y sus fixes | Histórico |
 | [07 — Secuencia de ejecución](referencia/07-secuencia-de-ejecucion.md) | Dependencias entre comandos y lectura DevOps de la guía 02 | Análisis |
+| [08 — Gobierno y operaciones](referencia/08-gobierno-operaciones-datos.md) | Ownership, contratos, calidad, SLO, incidentes y gate de datos reales | Estándar; owners por designar |
 
 ### Cómo está organizada la guía 02
 
@@ -57,10 +58,9 @@ Es **un solo documento** con numeración continua de §1 a §22, en el orden en 
 construye la plataforma: cada sección usa lo que dejó la anterior. Se recorre en seis
 tramos, y el [índice](02-produccion-aws-terraform.md#índice) enlaza sección por sección.
 
-La infraestructura se escribe como **composición Terraform**: `infra/envs/prod/` instancia
-módulos y no declara un solo `resource`; los doce módulos de `infra/modules/` tienen interfaz
-propia (`variables.tf` / `outputs.tf`). Cada sección repite el mismo bucle: pegar el módulo,
-validarlo aislado, componerlo y aplicarlo con `-target`.
+La infraestructura objetivo se escribe como **composición Terraform**. En el repositorio sólo están
+materializados `network` y `orchestrator`; los demás módulos siguen siendo contenido de la guía. El
+uso de `-target` es andamio de construcción: toda promoción exige un plan completo posterior.
 
 | Tramo | Secciones | Qué resuelve |
 |---|---|---|
@@ -126,16 +126,16 @@ Terraform, va `terraform import` antes del siguiente `apply`.
 
 ## Qué contiene el repositorio
 
-El repositorio versiona **únicamente el proyecto local**: Compose, Dockerfiles, DAGs, jobs PySpark,
-notebooks y tests. Todo lo de producción se crea siguiendo la guía 02 (o la 02b), que trae el
-contenido íntegro de cada archivo.
+El repositorio versiona el proyecto local y una base Terraform **parcial**. Que un bloque figure en
+la guía no significa que exista, esté desplegado o haya pasado una prueba integrada en AWS.
 
 | Capacidad | Dónde vive |
 |---|---|
 | Spark, HDFS, Jupyter y Airflow en local | Repositorio — implementado |
 | Contexto de producción en variables de entorno (`scripts/prod-env.sh`) | Repositorio — implementado; contrato en guía 02 §3.1 |
 | Orquestador de comandos (`Taskfile.yml`) | Repositorio — implementación completa; guía 02 explica su crecimiento por etapas |
-| Terraform de EC2, S3, EMR Serverless, IAM y automatización | Guía 02 §4–§7 |
+| Terraform de red y EC2/orquestador | Repositorio — parcial, validación estática |
+| Terraform de S3, EMR Serverless y automatización | Guía 02 §4–§7 — no materializado |
 | DAG de Airflow contra EMR Serverless | Guía 02 §9.4 |
 | Jobs Spark para EMR Serverless | Guía 02 §6.4 |
 | Compose de producción y carga de secretos desde SSM | Guía 02 §13.4 y §14.1 |
@@ -143,6 +143,7 @@ contenido íntegro de cada archivo.
 | Observabilidad Prometheus/Grafana/Loki | Guía 02 §12 y §14.2 — roadmap |
 | Tablas Iceberg | Guía 02 §16 — roadmap; el job de referencia escribe Parquet |
 | dbt, Great Expectations y OpenLineage | Guía 02 §19–§22 — roadmap |
+| Gobierno, ownership, SLO y gate de datos reales | Referencia 08 — estándar; responsables pendientes |
 
 ## Regla de mantenimiento
 

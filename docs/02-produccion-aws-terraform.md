@@ -3,7 +3,7 @@
 > [!WARNING]
 > **Laboratorio controlado, no exposición productiva segura** ([ADR-002](adr/ADR-002-plano-de-control-single-node.md)). Airflow, Postgres y monitoreo comparten una EC2.
 > Las UIs usan túnel SSH; §5.6 permite HTTPS únicamente desde la IP `/32` del operador.
-> Para datos reales son obligatorias [§13](#13-hardening-y-secretos) y [§18](#18-gobierno-resiliencia-y-costos).
+> Para datos reales son obligatorias [§13](#13-hardening-y-secretos), [§18](#18-gobierno-resiliencia-y-costos) y el [estándar de gobierno y operaciones](referencia/08-gobierno-operaciones-datos.md).
 > No incluye alta disponibilidad: la EC2 sigue siendo un punto único de fallo.
 
 > Este tramo promueve a AWS el **contrato del orquestador** validado en [local](01-stack-local.md).
@@ -13,8 +13,8 @@
 
 > [!IMPORTANT]
 > **Estado: guía completa, sin desplegar de extremo a extremo en AWS.**
-> Observabilidad, Iceberg, dbt, Great Expectations, OpenLineage y CD son arquitectura objetivo.
-> Consulte la [matriz de estado](README.md); *Roadmap* significa diseño, no runbook validado.
+> Observabilidad, Iceberg, dbt, Great Expectations, OpenLineage y CD son arquitectura objetivo; consulte la [matriz de estado](README.md).
+> El job EMR y la publicación son referencias incompletas: no se autorizan para datos reales hasta consumir el manifest inmutable y publicar después del gate.
 
 > [!IMPORTANT]
 > **Un comando por terminal, siempre el mismo.** Parado en la raíz del repo, antes de
@@ -81,12 +81,13 @@ permisos faltantes del rol real.
    alternativas descartadas, en los [ADR](adr/README.md). Cambiar una implica
    reescribir secciones, no parchear un bloque.
 
-> **Qué existe en el repositorio y qué debe crear el operador.** El repositorio versiona
-> **únicamente el proyecto local**. La infraestructura de producción se crea desde esta guía:
+> **Qué existe en el repositorio y qué debe crear el operador.** Hay un proyecto local y una
+> composición Terraform parcial. El resto de producción se crea desde esta guía:
 >
 > | Ruta | Estado | Acción requerida |
 > |---|---|---|
-> | `infra/bootstrap/` + `infra/envs/prod/` + `infra/modules/*` (red, orquestador, storage, EMR, Lambdas, …) | **por crear** | **Escribirlo**, bloque por bloque, en §4–§7 y ampliarlo en §13, §16 y §18 |
+> | `infra/bootstrap/`, `infra/envs/prod/`, módulos `network` y `orchestrator` | **existen parcialmente** | Validar y revisar; no equivalen a un entorno desplegado |
+> | Módulos storage, EMR, Lambdas, gobierno y demás producción | **por crear** | **Escribirlos**, probarlos y revisarlos antes de desplegar |
 > | `Taskfile.yml` | **existe**, con el resultado final | Usarlo directamente; los bloques de §3.0b, §5.5, §6.4, §8, §10.1, §13.4 y §15 muestran cómo crece por etapas |
 > | `Dockerfile.airflow.prod` | **por crear** | **Pegarlo** de [§5.5](#55-desplegar-subir-código-y-túnel-ssh) |
 > | `docker-compose.prod.yml` (+ `.https.yml`, + `.monitoring.yml`) | **por crear** | **Pegarlo** de [§14.1](#141-docker-composeprodyml--base), [§5.6](#56-exponer-la-web-de-airflow-https-nativo-acceso-desde-la-ip-del-operador) y [§14.2](#142-docker-composeprodmonitoringyml--override-de-observabilidad) |
@@ -98,14 +99,14 @@ permisos faltantes del rol real.
 > Ya existen y no se modifican: `scripts/prod-env.sh`, los dos validadores y el stack local.
 > Incluye Compose, Dockerfiles, Hadoop, DAGs, jobs, notebooks y `tests/test_dag_integrity.py`.
 >
-> Corolario: como `infra/` no vive en el repo, un `terraform validate` normal **no
-> comprueba el HCL de esta guía**. Lo que sí se valida en cada cambio es el contrato de
-> comandos, con los dos validadores.
+> Corolario: `task infra:validate` sólo comprueba el HCL que ya existe; no valida módulos que siguen
+> siendo texto en esta guía. Los validadores documentales comprueban referencias y comandos, no la
+> conducta real de AWS.
 
 > [!IMPORTANT]
 > **Gate de entrada:** no inicie el Tramo II sin el stack local en estado correcto:
-> `docker compose up -d` sano ([`01-stack-local.md`](01-stack-local.md)), un
-> `spark-submit` en 0 y un DAG en verde ([`04-ejemplos-locales.md`](04-ejemplos-locales.md)).
+> `task local:up` sano ([`01-stack-local.md`](01-stack-local.md)), `task test` en verde y una
+> ejecución local completa ([`04-ejemplos-locales.md`](04-ejemplos-locales.md)).
 > Diagnosticar un DAG con errores en AWS consume tiempo de EMR y es más lento que hacerlo en Docker.
 
 ## Índice
@@ -127,7 +128,7 @@ define de dónde sale cada valor de cada comando.
 **3 · Datos y cómputo — ESCRIBIR Y APLICAR.** S3, EMR Serverless y disparadores, una vez
 que la EC2 arranca.
 
-6. [Data lake en S3](#6-data-lake-en-s3) — [6.1 Buckets](#61-buckets-s3) · [6.2 IAM para `s3a`](#62-iam-permitir-s3a-a-la-ec2-sin-keys) · [6.3 Backups (DLM)](#63-backups-snapshots-ebs-automáticos-dlm) · [6.4 EMR Serverless](#64-cómputo-spark-emr-serverless) · [6.5 VPC Endpoint](#65-s3-vpc-gateway-endpoint) · [6.6 DAG ejecutable](#66-dag-ejecutable-de-referencia)
+6. [Data lake en S3](#6-data-lake-en-s3) — [6.1 Buckets](#61-buckets-s3) · [6.2 IAM para `s3a`](#62-iam-permitir-s3a-a-la-ec2-sin-keys) · [6.3 Backups](#63-backups-dump-postgresql--snapshots-ebs-dlm) · [6.4 EMR Serverless](#64-cómputo-spark-emr-serverless) · [6.5 VPC Endpoint](#65-s3-vpc-gateway-endpoint) · [6.6 DAG ejecutable](#66-dag-ejecutable-de-referencia)
 7. [Orquestación por cron y por evento](#7-orquestación-lambda-trigger-airflow-ssm--eventbridge--event-driven) — [7.1 Lambda `trigger-airflow`](#71-lambda-que-dispara-los-dags-vía-ssm) · [7.2 Disparo por cron](#72-disparo-por-cron-eventbridge-scheduler) · [7.3 Disparo por evento S3](#73-disparo-por-evento-archivo-nuevo-en-s3-vía-sqs)
 
 **4 · Operación — EJECUTAR.** El día a día y el punto de entrada después de cada `apply`.
@@ -447,11 +448,11 @@ no debe agregarlo nuevamente. `check-doc-env.py` evita divergencias entre la gu�
 | Bloque incremental | Se incorpora en | Consumidor |
 |---|---|---|
 | `vars:` + `infra:*` (7 tasks) | **en esta guía** | §4 en adelante |
-| `prod:wait` · `prod:deploy` · `prod:tunnel` | [§5.5](#55-desplegar-subir-código-y-túnel-ssh) | §5.5, §15 |
+| `prod:trust-host` · `prod:wait` · `prod:deploy` · `prod:tunnel` | [§5.5](#55-desplegar-subir-código-y-túnel-ssh) | §5.5, §15 |
 | `emr:sync` | [§6.4](#64-cómputo-spark-emr-serverless) | §6.4, §15 |
 | `prod:status` · `prod:smoke` · `prod:e2e` · `prod:logs` | [§8](#8-operación-diaria-y-diagnóstico) | operación diaria |
 | `dev:sync` | [§10.1](#101-iteración-rápida) | iteración de DAGs |
-| `prod:secrets` | [§13.4](#134-materializar-env) | rotación de secretos |
+| `prod:secrets` | [§13.4](#134-materializar-env) | materialización; la rotación coordinada está en §13.4.1 |
 | `release:check` · `release:apply` · `release:deploy` | [§15](#15-runbook-de-puesta-en-producción) | cada promoción |
 
 Requiere [go-task](https://taskfile.dev/installation/), incluido en el bloque de §3.
@@ -874,7 +875,7 @@ locals {
 | `module "scheduler"` | [§5.4](#54-automatización-eventbridge--lambda) | §5.4 |
 | `module "https"` (opcional) | [§5.6](#56-exponer-la-web-de-airflow-https-nativo-acceso-desde-la-ip-del-operador) | §5.6 |
 | `module "storage"` | [§6.1](#61-buckets-s3) | §6.1 y §6.2 |
-| `module "backups"` | [§6.3](#63-backups-snapshots-ebs-automáticos-dlm) | §6.3 |
+| `module "backups"` | [§6.3](#63-backups-dump-postgresql--snapshots-ebs-dlm) | §6.3 |
 | `module "emr"` | [§6.4](#64-cómputo-spark-emr-serverless) | §6.4 |
 | `module "triggers"` | [§7.1](#71-lambda-que-dispara-los-dags-vía-ssm) | §7.1–§7.3 |
 | `module "cicd"` | [§11.4](#114-workflow-de-despliegue) | §11.4 |
@@ -1022,6 +1023,14 @@ variable "instance_type" {
   # desaconsejaba t3 porque las JVMs de Spark degradan en burstable; ese motivo se mudó a EMR
   # Serverless, que tiene su propio cómputo dedicado por-job.)
   default = "t3.large"
+}
+variable "ami_id" {
+  description = "AMI AL2023 x86_64 resuelta y fijada en terraform.tfvars para esta release."
+  type        = string
+  validation {
+    condition     = can(regex("^ami-[0-9a-f]+$", var.ami_id))
+    error_message = "ami_id debe ser un ID de AMI explícito; no use most_recent."
+  }
 }
 variable "root_volume_gb" {
   type    = number
@@ -1238,11 +1247,12 @@ Las dos entradas obligatorias deben existir antes del primer plan. Genere el arc
 reales; el mismo archivo seguirá creciendo en §5.6, §11 y §18:
 
 ```bash
+AMI_ID="$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)"
 cat > infra/envs/prod/terraform.tfvars <<EOF
 my_ip_cidr     = "$(curl -fsS https://checkip.amazonaws.com)/32"
 ssh_public_key = "$(cat ~/.ssh/pyspark_stack.pub)"
+ami_id         = "$AMI_ID"
 EOF
-cat infra/envs/prod/terraform.tfvars
 ```
 
 Primero valide el módulo aislado; después aplique la composición contra AWS:
@@ -1389,6 +1399,7 @@ máquina en §5.3— y se valida y aplica una sola vez al finalizar.
 variable "name_prefix" { type = string }
 
 variable "instance_type"    { type = string }
+variable "ami_id"           { type = string }
 variable "root_volume_gb"   { type = number }
 variable "data_volume_gb"   { type = number }
 variable "availability_zone" { type = string }
@@ -1474,29 +1485,14 @@ resource "aws_iam_instance_profile" "ec2" {
 
 #### 5.3.1 `infra/modules/orchestrator/main.tf` — la máquina
 
-Continúe en el **mismo archivo** de §5.2, debajo del instance profile. El módulo incorpora cuatro
-decisiones: AMI resuelta por filtro, IMDSv2 obligatorio con `hop_limit = 2`, EBS de datos
-anclado a la AZ de la variable, y `user_data_replace_on_change` — que **recrea la instancia** cuando
-modifique el script.
+Continúe en el **mismo archivo** de §5.2. Fija la AMI en `terraform.tfvars`, exige IMDSv2 con
+`hop_limit = 2`, ancla el EBS a una AZ y recrea la instancia al cambiar `user_data`. Actualice
+`ami_id` en una PR dedicada y revise explícitamente el reemplazo del host.
 
 ```hcl
 # infra/modules/orchestrator/main.tf  (continuación)
-data "aws_ami" "al2023" {
-  most_recent = true
-  owners      = ["amazon"]
-  filter {
-    name   = "name"
-    # "2023*" excluye las variantes minimal/ecs, que no traen el agente SSM (lo usa toda la §7).
-    values = ["al2023-ami-2023*-x86_64"]
-  }
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
 resource "aws_instance" "pyspark" {
-  ami                    = data.aws_ami.al2023.id
+  ami                    = var.ami_id
   instance_type          = var.instance_type
   key_name               = aws_key_pair.pyspark.key_name
   vpc_security_group_ids = [var.security_group_id]
@@ -1512,6 +1508,7 @@ resource "aws_instance" "pyspark" {
     # Identificador exacto del EBS persistente. El script lo usa para resolver el NVMe correcto
     # antes de montar o formatear; no depende del orden nvme1n1/nvme2n1.
     data_volume_id = aws_ebs_volume.data.id
+    parameter_prefix = "/${var.name_prefix}"
   })
   user_data_replace_on_change = true
 
@@ -1570,13 +1567,16 @@ procesa Terraform: cada `$` de bash que quieras conservar necesita ir duplicado.
 ```bash
 #!/bin/bash
 set -euxo pipefail
+# Bootstrap no secreto: vincula de forma explícita este host con el prefijo Terraform.
+printf 'PARAMETER_PREFIX=%q\n' '${parameter_prefix}' > /etc/pyspark-stack.env
+chmod 600 /etc/pyspark-stack.env
 # Instala solo las dependencias requeridas. Los parches del sistema deben aplicarse mediante
 # una actualización controlada de la AMI o una ventana de mantenimiento; `dnf update -y` en cada
 # recreación hace que dos boots puedan producir hosts distintos.
 dnf install -y docker git && systemctl enable --now docker
 
-# Versiones PINEADAS (mismo criterio que las imágenes por @sha256): un boot de hoy y uno de dentro
-# de seis meses instalan lo mismo. Actualice las versiones mediante un cambio controlado.
+# Versiones exactas y binarios verificados por checksum: un boot no consume silenciosamente otra
+# release. Actualice versión y checksum mediante un cambio controlado.
 COMPOSE_VERSION=v5.3.1
 BUILDX_VERSION=v0.35.0
 DOCKER_CONFIG=/usr/local/lib/docker
@@ -1589,11 +1589,18 @@ mkdir -p $DOCKER_CONFIG/cli-plugins
 # Toda variable Bash entre llaves que se agregue a este archivo requiere el mismo escape.
 curl --fail --silent --show-error --location --retry 5 --retry-all-errors "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
   -o $DOCKER_CONFIG/cli-plugins/docker-compose
+curl --fail --silent --show-error --location "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-x86_64.sha256" \
+  -o /tmp/docker-compose.sha256
+(cd $DOCKER_CONFIG/cli-plugins && sha256sum -c /tmp/docker-compose.sha256)
 chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
 # El paquete `docker` de dnf en AL2023 no trae buildx (o trae uno viejo): sin esto, el deploy
 # falla con "compose build requires buildx 0.17.0 or later" al ejecutar `up --build`.
 curl --fail --silent --show-error --location --retry 5 --retry-all-errors "https://github.com/docker/buildx/releases/download/$${BUILDX_VERSION}/buildx-$${BUILDX_VERSION}.linux-amd64" \
-  -o $DOCKER_CONFIG/cli-plugins/docker-buildx
+  -o /tmp/buildx-$${BUILDX_VERSION}.linux-amd64
+curl --fail --silent --show-error --location "https://github.com/docker/buildx/releases/download/$${BUILDX_VERSION}/checksums.txt" \
+  -o /tmp/buildx-checksums.txt
+(cd /tmp && grep " buildx-$${BUILDX_VERSION}.linux-amd64$" buildx-checksums.txt | sha256sum -c -)
+install -m 0755 /tmp/buildx-$${BUILDX_VERSION}.linux-amd64 $DOCKER_CONFIG/cli-plugins/docker-buildx
 chmod +x $DOCKER_CONFIG/cli-plugins/docker-buildx
 usermod -aG docker ec2-user
 
@@ -1642,7 +1649,9 @@ grep -q "UUID=$DATA_UUID " /etc/fstab || echo "UUID=$DATA_UUID /data xfs default
 chown -R ec2-user:ec2-user /data
 # Bind mounts del compose de prod. Los UID están ligados a las imágenes pineadas; validar los
 # permisos al actualizar imágenes.
-mkdir -p /data/postgres /data/prometheus /data/grafana /data/loki
+mkdir -p /data/postgres /data/airflow-logs /data/backups/postgres /data/prometheus /data/grafana /data/loki
+chown 50000:0     /data/airflow-logs
+printf 'e /data/airflow-logs - - - 7d\n' > /etc/tmpfiles.d/airflow-logs.conf
 chown 65534:65534 /data/prometheus
 chown 472:472     /data/grafana
 chown 10001:10001 /data/loki
@@ -1722,6 +1731,7 @@ module "orchestrator" {
   source            = "../../modules/orchestrator"
   name_prefix       = var.name_prefix
   instance_type     = var.instance_type
+  ami_id            = var.ami_id
   root_volume_gb    = var.root_volume_gb
   data_volume_gb    = var.data_volume_gb
   availability_zone = var.availability_zone
@@ -1752,7 +1762,7 @@ terraform -chdir=infra/envs/prod apply -target=module.orchestrator
 
 </details>
 
-**Qué tiene que decir el plan**: `7 to add` — key pair, rol, attachment, instance profile,
+**Qué tiene que decir el plan**: `9 to add` — key pair, rol, attachment, instance profile,
 instancia, EIP + asociación, volumen y su attachment. Si dice `1 to destroy` sobre el
 `aws_security_group`, la composición incluye una dependencia inesperada: cancele y revise
 `security_group_id` antes de confirmar.
@@ -1789,9 +1799,9 @@ instancia, EIP + asociación, volumen y su attachment. Si dice `1 to destroy` so
 #### 5.4.1 El código de la Lambda
 
 Una Lambda prende y apaga la EC2, disparada por cron desde EventBridge Scheduler. Va Lambda y
-no una llamada directa de Scheduler a EC2 porque ahí vive la lógica: no apagar con un DAG
-corriendo, avisar por SNS, prender solo si hay trabajo en cola. Convierte ~$60/mes fijos en
-~$12 (8h×22d).
+no una llamada directa de Scheduler a EC2 porque ahí vive la guarda implementada: no apagar con
+un DAG corriendo. El encendido sigue el horario y las alertas viven en gobierno (§18); esta Lambda
+no inspecciona colas ni publica SNS. Convierte ~$60/mes fijos en ~12 (8h×22d).
 
 **`infra/lambdas/startstop.py`:** el handler `stop` consulta antes si hay DAG runs activos y,
 si los hay, no apaga — apagado *job-aware*: con varios DAGs, se apaga cuando termina el
@@ -2274,7 +2284,7 @@ x-airflow-common: &airflow-common
 
 services:
   airflow-db:
-    image: postgres:16
+    image: postgres:16.14-bookworm
     container_name: airflow-db
     restart: unless-stopped
     logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
@@ -2387,22 +2397,46 @@ continuación de las de infraestructura de [§3.0b](#30b-el-orquestador-de-coman
       - |
         {{.CTX}}
         aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
-        ssh-keygen -f ~/.ssh/known_hosts -R "$PUBLIC_IP" >/dev/null 2>&1 || true   # la EIP sobrevive, la host key no
-        $SSH -o StrictHostKeyChecking=accept-new "$SSH_TARGET" \
+        $SSH -o StrictHostKeyChecking=yes "$SSH_TARGET" \
           'cloud-init status --wait && mountpoint /data && systemctl is-active docker'
+
+  prod:trust-host:
+    desc: "§5.5 — registra la host key obtenida por el canal autenticado SSM"
+    cmds:
+      - |
+        {{.CTX}}
+        aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+        for _ in $(seq 1 60); do
+          [ "$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+            --query 'InstanceInformationList[0].PingStatus' --output text)" = "Online" ] && break
+          sleep 10
+        done
+        PARAMS='{"commands":["cat /etc/ssh/ssh_host_ed25519_key.pub"]}'
+        CMD_ID="$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+          --document-name AWS-RunShellScript --parameters "$PARAMS" \
+          --query 'Command.CommandId' --output text)"
+        aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID"
+        HOST_KEY="$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+          --query StandardOutputContent --output text | awk 'NF >= 2 {print $1, $2; exit}')"
+        printf '%s\n' "$HOST_KEY" | grep -Eq '^ssh-ed25519 [A-Za-z0-9+/=]+$'
+        mkdir -p "$HOME/.ssh"; touch "$HOME/.ssh/known_hosts"; chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/known_hosts"
+        ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$PUBLIC_IP" >/dev/null 2>&1 || true
+        printf '%s %s\n' "$PUBLIC_IP" "$HOST_KEY" >> "$HOME/.ssh/known_hosts"
 
   prod:deploy:
     desc: "§5.5 y §15 paso 4 — rsync del repo + load-secrets + up --build"
     cmds:
       - |
         {{.CTX}}
-        ssh-keygen -f ~/.ssh/known_hosts -R "$PUBLIC_IP" >/dev/null 2>&1 || true
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
         rsync -az --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
           -e "$RSYNC_SSH" ./ "$SSH_TARGET:$REMOTE_DIR/"
         # load-secrets.sh existe recién desde §13.4; antes de eso esta línea no hace nada.
         $SSH "$SSH_TARGET" "cd $REMOTE_DIR && \
           if [ -x scripts/load-secrets.sh ]; then ./scripts/load-secrets.sh; fi && \
-          docker compose -f $COMPOSE_PROD up -d --build"
+          docker compose $COMPOSE_ARGS up -d --build"
 
   prod:tunnel:
     desc: "§5.5 — túnel a la UI de Airflow en localhost:8082. Ocupa la terminal"
@@ -2427,6 +2461,12 @@ PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
 
 ```bash
 ./scripts/prod-env.sh --check
+task prod:trust-host
+```
+
+La clave queda obtenida por SSM, un canal autenticado por IAM; después SSH opera en modo estricto:
+
+```bash
 task prod:wait
 ```
 
@@ -2445,10 +2485,10 @@ task prod:tunnel
 terraform -chdir=infra/envs/prod init
 terraform -chdir=infra/envs/prod apply
 
-# 3 — prod:wait
+# 3 — prod:trust-host + prod:wait
+task prod:trust-host
 aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
-ssh-keygen -f ~/.ssh/known_hosts -R "$PUBLIC_IP" >/dev/null 2>&1 || true
-$SSH "$SSH_TARGET" \
+$SSH -o StrictHostKeyChecking=yes "$SSH_TARGET" \
   'cloud-init status --wait && mountpoint /data && systemctl is-active docker'
 
 # 4 — prod:deploy
@@ -2476,8 +2516,8 @@ los comandos posteriores requieren las variables en la terminal actual; una task
 |---|---|
 | `PROD_ENV_REFRESH=1` | Si §5.1 ejecutó `update-sg-ip.sh`, puede existir una caché anterior a la EC2. Un `source` sin refresh devuelve ese contexto, sin `PUBLIC_IP`, y `prod:deploy` no puede resolver el host |
 | `aws ec2 wait instance-status-ok` | La instancia figura `running` bastante antes de que termine el `user_data`. Sin el wait, el `rsync` falla con *connection refused*: `sshd` todavía no levantó |
-| `ssh-keygen -R` | La EIP sobrevive al reemplazo de la instancia, pero la host key no. Si el `apply` reemplazó la EC2 (`-/+` en el plan: cambios al SG, al `user_data`, a la AMI), `ssh` y `rsync` fallan con *Host key verification failed*. Si no hubo reemplazo, la línea no hace nada |
-| `StrictHostKeyChecking=accept-new` en `prod:wait` | Después de `ssh-keygen -R`, evita que la primera conexión bloquee la task. Acepta sin verificar la primera clave de esa IP; para datos reales, retire el flag y verifique la huella manualmente |
+| `prod:trust-host` | Obtiene la clave Ed25519 por SSM/IAM, valida su forma y reemplaza la entrada exacta de la EIP; `release:deploy` puede repetirlo porque la confianza viene del canal autenticado, no de TOFU |
+| `StrictHostKeyChecking=yes` | Todo SSH posterior falla cerrado si la clave difiere de la registrada por SSM; un cambio de host igualmente debe estar explicado por el plan revisado |
 | `--exclude '.env'` y `--exclude 'infra'` | El `.env` local pertenece a desarrollo; en EC2 lo genera `load-secrets.sh`. `infra/` permanece local y `docker-compose.prod.yml` sí se sincroniza |
 
 > **`$SSH` y las comillas.** `$SSH` (`ssh -i <clave>`) se expande en varias palabras a
@@ -2809,9 +2849,19 @@ services:
       platform:
         aliases:
           - '${AIRFLOW_DOMAIN:?AIRFLOW_DOMAIN requerido para HTTPS}'
+
+  # Todos los procesos que consumen la Task Execution API deben usar el mismo endpoint TLS.
+  airflow-scheduler:
+    environment: &https-execution-api
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: '${AIRFLOW_EXECUTION_API_URL:?AIRFLOW_EXECUTION_API_URL requerido para HTTPS}'
+  airflow-dag-processor:
+    environment: *https-execution-api
+  airflow-triggerer:
+    environment: *https-execution-api
 ```
 
-Conserva el 8082 y los volúmenes del base, y agrega el 443, los certificados y el alias interno.
+Conserva el 8082 y los volúmenes del base, agrega el 443, los certificados y el alias interno, y
+actualiza el Execution API en scheduler, dag-processor y triggerer; dejar alguno en HTTP rompe tasks.
 Se monta `/data/certs` completo porque los archivos de `live/` son symlinks relativos a
 `archive/`. Los `:?` cortan el `up` si falta una variable: nunca publica HTTP plano en 443.
 
@@ -3042,13 +3092,19 @@ resource "aws_s3_bucket_policy" "tls_only" {
   })
 }
 
-# Lifecycle: transición a clases baratas para bajar el costo de almacenamiento.
+# Lifecycle por capa: solo raw grande se archiva. Los metadatos activos de Iceberg en
+# curated/analytics permanecen en STANDARD para no penalizar cada consulta.
 resource "aws_s3_bucket_lifecycle_configuration" "datalake" {
   bucket = aws_s3_bucket.datalake.id
   rule {
-    id     = "tiering"
+    id     = "raw-tiering-large-objects"
     status = "Enabled"
-    filter {} # aplica a todo el bucket; el provider exige filter o prefix
+    filter {
+      and {
+        prefix                   = "raw/"
+        object_size_greater_than = 131072
+      }
+    }
     transition {
       days          = 30
       storage_class = "STANDARD_IA"
@@ -3057,6 +3113,42 @@ resource "aws_s3_bucket_lifecycle_configuration" "datalake" {
       days          = 90
       storage_class = "GLACIER_IR"
     }
+  }
+
+  rule {
+    id     = "version-and-upload-housekeeping"
+    status = "Enabled"
+    filter {}
+    noncurrent_version_expiration { noncurrent_days = 90 }
+    abort_incomplete_multipart_upload { days_after_initiation = 7 }
+  }
+}
+
+# Logs operativos: no se transicionan uno a uno a Glacier porque suelen ser objetos pequenos y
+# el costo de requests/recuperacion puede superar el ahorro. Se conservan 90 dias y expiran.
+resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+
+  rule {
+    id     = "airflow-logs-expire"
+    status = "Enabled"
+    filter { prefix = "logs/airflow/" }
+    expiration { days = 90 }
+  }
+
+  rule {
+    id     = "emr-logs-expire"
+    status = "Enabled"
+    filter { prefix = "emr/logs/" }
+    expiration { days = 90 }
+  }
+
+  rule {
+    id     = "artifact-version-and-upload-housekeeping"
+    status = "Enabled"
+    filter {}
+    noncurrent_version_expiration { noncurrent_days = 30 }
+    abort_incomplete_multipart_upload { days_after_initiation = 7 }
   }
 }
 
@@ -3101,10 +3193,13 @@ output "artifacts_bucket" { value = module.storage.artifacts_bucket }
    (default) · *Bucket Versioning* **Enable** · cifrado SSE-S3 (default).
 2. Política solo-TLS: en cada bucket → *Permissions → Bucket policy* → copie el JSON
    `DenyInsecureTransport` del Terraform (ajustando el nombre del bucket en los dos ARN).
-3. Lifecycle (solo datalake): *Management → Create lifecycle rule* → nombre `tiering`, alcance
+3. Lifecycle del datalake: *Management → Create lifecycle rule* → nombre `tiering`, alcance
    todo el bucket → transiciones: **Standard-IA a los 30 días** y **Glacier Instant Retrieval a
    los 90**.
-4. Opcional: *Create folder* para `raw/`, `curated/`, `analytics/`; también se crean con
+4. En `artifacts`, cree dos reglas de expiración a **90 días**, una para `logs/airflow/` y otra
+   para `emr/logs/`; agregue limpieza de versiones no actuales a 30 días y multipart incompletos
+   a 7 días. No archive cada log pequeño a Glacier.
+5. Opcional: *Create folder* para `raw/`, `curated/`, `analytics/`; también se crean con
    la primera escritura.
 
 </details>
@@ -3129,8 +3224,8 @@ terraform -chdir=infra/envs/prod apply -target=module.storage
 
 </details>
 
-**Qué tiene que decir el plan**: `11 to add` — 2 buckets + 4×2 configuraciones (PAB, SSE,
-versioning, policy) + 1 lifecycle. Ningún `destroy`: si aparece uno sobre un bucket, el nombre
+**Qué tiene que decir el plan**: `12 to add` — 2 buckets + 4×2 configuraciones (PAB, SSE,
+versioning, policy) + 2 lifecycle. Ningún `destroy`: si aparece uno sobre un bucket, el nombre
 cambió (`name_prefix`, por ejemplo) y existe riesgo de pérdida de datos. **Cancele el apply.**
 
 > **Checkpoint §6.1** — los buckets por su nombre real, no por un prefijo asumido:
@@ -3147,8 +3242,8 @@ cambió (`name_prefix`, por ejemplo) y existe riesgo de pérdida de datos. **Can
 > ```
 >
 > **Resultado en la consola:** S3 → Buckets → ambos, *Access: Bucket and objects not public*,
-> versioning **Enabled** y, en el datalake, una regla de lifecycle `tiering`. Vacíos: el primer
-> objeto lo escribe §6.2.
+> versioning **Enabled**; el datalake con `tiering` y artifacts con expiración de logs. Vacíos: el
+> primer objeto lo escribe §6.2.
 
 > **Gotcha §6.1 — `prevent_destroy` en el datalake aborta el plan entero, no solo ese recurso.**
 > Un `terraform destroy` (o un `-target` que lo alcance) falla completo hasta que borres esa línea.
@@ -3254,13 +3349,13 @@ $SSH "$SSH_TARGET" \
   "aws s3 cp /etc/hostname '$RAW_URI/smoke-iam.txt'"
 ```
 
-### 6.3 Backups: snapshots EBS automáticos (DLM)
+### 6.3 Backups: dump PostgreSQL + snapshots EBS (DLM)
 
-`/data` guarda Postgres y los datos de monitoreo: el estado que **no** vive en S3. **Data
-Lifecycle Manager (DLM)** le toma snapshots y retiene los últimos N, sin código.
+`/data` guarda Postgres y monitoreo. DLM toma snapshots del volumen y el backup lógico de §6.3.6
+protege PostgreSQL con un formato restaurable y una copia fuera del host.
 
-> **ESCRIBIR y APLICAR, ~3 min. Resultado:** módulo mínimo con snapshots diarios
-> del EBS de datos y 7 días de retención.
+> **ESCRIBIR y APLICAR, ~10 min. Resultado:** snapshots diarios, 7 días de retención, dump lógico
+> diario y objetivos de recuperación verificables.
 
 #### 6.3.1 `infra/modules/backups/variables.tf`
 
@@ -3321,9 +3416,8 @@ resource "aws_dlm_lifecycle_policy" "data" {
 
 </details>
 
-> Restore: cree un volumen desde el snapshot y móntelo en `/data` (o recree la instancia con
-> `user_data` que ya hace `mount ... /data`). S3 ya está versionado, así que el data lake
-> tiene su propia protección.
+> Para recuperar el host completo, cree un volumen desde el snapshot y móntelo en `/data`. Para
+> PostgreSQL prefiera el dump lógico más reciente de artifacts y valide la restauración (§6.3.6).
 
 #### 6.3.3 `infra/modules/backups/outputs.tf`
 
@@ -3378,6 +3472,36 @@ terraform -chdir=infra/envs/prod apply -target=module.backups
 > `Name = <prefijo>-data`, un tag que pone `module.orchestrator`. Si alguien lo cambia, DLM sigue
 > `ENABLED` sin producir snapshots. Verifique el vínculo real
 > con `aws ec2 describe-volumes --filters Name=tag:Name,Values="${NAME_PREFIX}-data" --query 'Volumes[].VolumeId'`.
+
+#### 6.3.6 Backup consistente de PostgreSQL y objetivos de recuperación
+
+El snapshot EBS es crash-consistent, no reemplaza un backup lógico. Defina **RPO objetivo 24 h** y
+**RTO objetivo 2 h** para este laboratorio; si el negocio exige menos, aumente frecuencia y capacidad.
+
+**Archivo en la EC2:** `/usr/local/sbin/backup-airflow-db`.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+. /home/ec2-user/pyspark_stack/.env
+POSTGRES_USER="${POSTGRES_USER:?POSTGRES_USER ausente en .env}"
+POSTGRES_DB="${POSTGRES_DB:?POSTGRES_DB ausente en .env}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+TMP="/data/backups/postgres/.airflow-${STAMP}.dump.tmp"
+OUT="/data/backups/postgres/airflow-${STAMP}.dump"
+docker exec airflow-db pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > "$TMP"
+mv "$TMP" "$OUT"
+aws s3 cp "$OUT" "s3://${ARTIFACTS_BUCKET}/backups/postgres/$(basename "$OUT")"
+find /data/backups/postgres -type f -name 'airflow-*.dump' -mtime +7 -delete
+```
+
+Instale un timer a las 04:30 UTC, antes del snapshot DLM de las 05:00, con
+`OnCalendar=*-*-* 04:30:00 UTC`, `Persistent=true` y `ExecStart=/usr/local/sbin/backup-airflow-db`.
+El servicio debe usar `Type=oneshot`; habilítelo con `systemctl enable --now airflow-db-backup.timer`.
+
+Cada trimestre restaure el dump en una base vacía con `pg_restore --clean --if-exists`, levante
+Airflow, ejecute `prod:smoke` y un DAG controlado, y registre tiempos. El gate es RPO ≤24 h y RTO
+≤2 h; un snapshot existente sin una restauración probada no cuenta como backup aprobado.
 
 ### 6.4 Cómputo Spark: EMR Serverless
 
@@ -3722,20 +3846,28 @@ por-job en `sparkSubmitParameters`. El CD sincroniza esta carpeta —y solo esta
 `spark-apps/emr/customer_etl.py` — lee `raw/`, calcula el segmento de lealtad y escribe Parquet
 particionado por fecha en `curated/`:
 
+> [!WARNING]
+> **Referencia educativa, no artefacto productivo.** Aunque recibe `manifest_key`, lee tres rutas
+> fijas y escribe directo en `curated/`. Antes de desplegarlo, implementá objetos/versiones exactos,
+> esquemas, reconciliación, staging y promoción posterior al gate. El repo no añade ese despliegue.
+
 ```python
 """customer_etl para EMR Serverless — S3 in/out, sin HDFS, sin master hardcodeado.
 
 Se sube a s3://<artifacts>/emr/customer_etl.py (deploy, §11.3) y lo ejecuta
 EmrServerlessStartJobOperator (dags/customer_etl_emr_dag.py, §6.6).
 
-Args: 1) datalake_bucket (sin s3://)   2) run_date (YYYY-MM-DD, para particionar).
+Args: 1) datalake_bucket  2) run_date (YYYY-MM-DD)  3) manifest_key que autorizó el lote.
 """
 import sys
 
 from pyspark.sql import SparkSession
 
 
-def main(datalake: str, run_date: str) -> None:
+def main(datalake: str, run_date: str, manifest_key: str) -> None:
+    if manifest_key != "scheduled" and not manifest_key.startswith("raw/manifests/customer_etl/"):
+        raise ValueError(f"manifest fuera del contrato customer_etl: {manifest_key}")
+    print(f"Procesando lote autorizado por s3://{datalake}/{manifest_key}")
     base = f"s3a://{datalake}"
     raw = f"{base}/raw/customer_etl"
     out = f"{base}/curated/customer_loyalty/dt={run_date}"
@@ -3784,10 +3916,10 @@ def main(datalake: str, run_date: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Uso: customer_etl.py <datalake_bucket> [run_date]")
+    if len(sys.argv) != 4:
+        print("Uso: customer_etl.py <datalake_bucket> <run_date> <manifest_key>")
         sys.exit(1)
-    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "latest")
+    main(sys.argv[1], sys.argv[2], sys.argv[3])
 ```
 
 `spark-apps/emr/wordcount.py` — el "hola mundo" de Spark en EMR, para validar la app de punta a punta
@@ -3798,10 +3930,8 @@ sin depender de datos en `raw/`:
 
 Args: 1) output_uri (opcional): s3a://.../analytics/wordcount ; si falta, solo imprime.
 """
-# EMR Serverless 7.x corre PySpark con Python 3.9 por defecto (3.11 está instalado pero no es
-# el intérprete salvo que fijes PYSPARK_PYTHON). El `str | None` de abajo es sintaxis 3.10+ y
-# se evalúa al definir la función: sin este import, el módulo falla con TypeError ANTES de
-# crear la SparkSession. Ojo, el ruff del CI usa target py312 y no lo detecta.
+# El import mantiene las anotaciones inertes y evita acoplar este ejemplo al minor exacto de
+# Python del release EMR elegido. Verifique el runtime real como parte del smoke test.
 from __future__ import annotations
 
 import sys
@@ -4024,7 +4154,8 @@ with DAG(
                 "entryPoint": "s3://{{ var.value.artifacts }}/emr/customer_etl.py",
                 "entryPointArguments": [
                     "{{ dag_run.conf.get('bucket', var.value.datalake) }}",
-                    "{{ ds }}",
+                    "{{ dag_run.conf.get('run_date', ds) }}",
+                    "{{ dag_run.conf.get('key', 'scheduled') }}",
                 ],
                 "sparkSubmitParameters": (
                     "--conf spark.executor.cores=2 "
@@ -4137,9 +4268,8 @@ s3  = boto3.client("s3")
 INSTANCE_ID = os.environ["INSTANCE_ID"]
 DEFAULT_DAG = os.environ.get("DEFAULT_DAG", "customer_etl_emr")
 
-# Contrato mínimo por archivo: columnas/keys requeridas. Lo que no está acá no se valida (pasa
-# igual). Amplíe el contrato al incorporar fuentes. Es un gate económico: inspecciona el header o
-# primeras keys); la validación de contenido de verdad es Great Expectations (§20), después del ETL.
+# Contrato mínimo de los tres objetos que debe declarar un manifest customer_etl. Los objetos
+# desconocidos se rechazan: el manifest es el único evento que dispara cómputo.
 CONTRACTS = {
     "orders.csv":    {"order_id", "customer_id", "product_id", "quantity", "order_date"},
     "customers.csv": {"customer_id", "customer_name", "city", "state", "signup_date"},
@@ -4171,16 +4301,32 @@ def _peek_columns(bucket, key):
     return None
 
 
-def _validar_contrato(bucket, key):
+def _validar_objeto(bucket, key):
     esperado = CONTRACTS.get(key.rsplit("/", 1)[-1])
     if esperado is None:
-        return
+        raise ContractViolation(f"objeto no permitido en manifest: {key}")
     columnas = _peek_columns(bucket, key)
     if columnas is None:
         return
     faltan = esperado - columnas
     if faltan:
         raise ContractViolation(f"{key}: faltan columnas {sorted(faltan)} (esperadas {sorted(esperado)})")
+
+
+def _validar_manifest(bucket, key):
+    if not key.startswith("raw/manifests/customer_etl/") or not key.endswith(".json"):
+        raise ContractViolation(f"manifest fuera de ruta: {key}")
+    manifest = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+    objects = manifest.get("objects")
+    run_date = manifest.get("run_date")
+    if not isinstance(objects, list) or not objects or not isinstance(run_date, str):
+        raise ContractViolation("manifest requiere run_date y objects no vacío")
+    names = {obj.rsplit("/", 1)[-1] for obj in objects}
+    if names != set(CONTRACTS):
+        raise ContractViolation(f"manifest debe declarar exactamente {sorted(CONTRACTS)}")
+    for object_key in objects:
+        _validar_objeto(bucket, object_key)
+    return run_date
 
 
 def _ec2_lista(instance_id):
@@ -4248,24 +4394,19 @@ def handler(event, context):
     bucket = key = run_id = None
     if "Records" in event and event["Records"] and "body" in event["Records"][0]:
         # batch_size=1 (§7.3): un mensaje SQS = un evento S3 = una invocación.
-        rec = json.loads(event["Records"][0]["body"])["Records"][0]["s3"]
+        s3_event = json.loads(event["Records"][0]["body"])["Records"][0]
+        rec = s3_event["s3"]
         key = urllib.parse.unquote_plus(rec["object"]["key"])  # S3 codifica espacios/especiales
         bucket = rec["bucket"]["name"]
-        dag, conf = DEFAULT_DAG, {"bucket": bucket, "key": key}
-        # run_id determinístico por archivo: un reintento del MISMO objeto
-        # produce el MISMO run_id, así que un doble-trigger no crea un doble dagrun. El cron
-        # (rama de abajo) no lo necesita tanto: dispara una vez al día, y su propio retry async
-        # de Lambda es 1-2 intentos en minutos, no una cola que puede reintentar 5 veces.
-        run_id = "s3-" + hashlib.sha256(f"{bucket}/{key}".encode()).hexdigest()[:16]
+        sequencer = rec["object"].get("sequencer", "")
+        version_id = rec["object"].get("versionId", "")
+        run_date = _validar_manifest(bucket, key)
+        dag, conf = DEFAULT_DAG, {"bucket": bucket, "key": key, "run_date": run_date}
+        # El mismo mensaje conserva identidad; una nueva versión de la misma key sí puede correr.
+        identity = f"{bucket}/{key}/{version_id}/{sequencer}"
+        run_id = "s3-" + hashlib.sha256(identity.encode()).hexdigest()[:20]
     else:
         dag, conf = event.get("dag", DEFAULT_DAG), {}
-
-    try:
-        if bucket and key:
-            _validar_contrato(bucket, key)  # ContractViolation: NO reintentar, no tiene sentido
-    except ContractViolation as e:
-        print(f"RECHAZADO por contrato de datos: {e}")  # puede alimentar un filtro métrico y una alerta
-        return {"status": "rejected", "reason": str(e)}
 
     if not _ec2_lista(INSTANCE_ID):
         # Se propaga sin capturar: dispara el retry de SQS (evento S3) o el retry async de Lambda
@@ -4630,7 +4771,8 @@ resource "aws_s3_bucket_notification" "on_upload" {
   queue {
     queue_arn     = aws_sqs_queue.trigger_events.arn
     events        = ["s3:ObjectCreated:*"]
-    filter_prefix = "raw/"
+    filter_prefix = "raw/manifests/customer_etl/"
+    filter_suffix = ".json"
   }
   depends_on = [aws_sqs_queue_policy.trigger_events]
 }
@@ -4640,7 +4782,7 @@ resource "aws_s3_bucket_notification" "on_upload" {
 resource "aws_lambda_event_source_mapping" "trigger_events" {
   event_source_arn = aws_sqs_queue.trigger_events.arn
   function_name    = aws_lambda_function.trigger_airflow.arn
-  batch_size       = 1   # 1 archivo = 1 invocación: así un archivo lento/rechazado no bloquea a los demás
+  batch_size       = 1   # 1 manifest completo = 1 invocación
 }
 ```
 
@@ -4666,17 +4808,17 @@ queda creado pero en estado `Disabled` y los mensajes se acumulan sin que nadie 
 2. En esa cola → **Access policy** → copie el statement que permite `s3.amazonaws.com` con
    `aws:SourceArn` = el ARN del bucket datalake (el JSON del Terraform de arriba).
 3. **S3 → bucket `pyspark-stack-datalake-…` → Properties → Event notifications → Create event
-   notification** → nombre `on-upload-raw` · *Prefix*: `raw/` · *Event types*: **All object create
+   notification** → nombre `customer-etl-ready` · *Prefix*: `raw/manifests/customer_etl/` ·
+   *Suffix*: `.json` · *Event types*: **All object create
    events** · *Destination*: **SQS queue** → `pyspark-stack-trigger-events`.
 4. **Lambda → `pyspark-stack-trigger-airflow` → Configuration → Triggers → Add trigger** → **SQS**
    → la misma cola → *Batch size* **1** → **Add**.
 
 </details>
 
-> Los dos disparadores apuntan al DAG de producción `customer_etl_emr` (§6.6), no al dev-local.
-> Tal como viene procesa por `{{ ds }}` y **no lee `dag_run.conf`**: el evento S3 lo corre pero
-> ignora el archivo individual. Para el flujo event-driven, utilice
-> `{{ dag_run.conf['bucket'] }}` / `['key']` y pasalos como `entryPointArguments`.
+> El evento se emite solamente al publicar un manifest JSON después de cargar los tres objetos.
+> El DAG recibe bucket, key y run_date por `dag_run.conf`; archivos parciales, marcadores y nombres
+> desconocidos no disparan EMR. Una sobreescritura legítima obtiene otro `sequencer` y otro run id.
 
 **Terraform — outputs.** La URL de la cola incluye región y account ID: publíquela en lugar de
 componerla a mano.
@@ -4760,12 +4902,15 @@ subsección desde este punto:
           --query 'application.state' --output text
       - |
         {{.CTX}}
-        PARAMS="$(jq -nc --arg dir "$REMOTE_DIR" --arg compose "$COMPOSE_PROD" '{commands: [
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
+        PARAMS="$(jq -nc --arg dir "$REMOTE_DIR" --arg compose "$COMPOSE_ARGS" '{commands: [
           "cd \($dir)",
           "mountpoint /data",
-          "docker compose -f \($compose) config --quiet",
-          "docker compose -f \($compose) ps",
-          "docker compose -f \($compose) exec -T airflow-scheduler airflow dags list-import-errors --output json"
+          "docker compose \($compose) config --quiet",
+          "docker compose \($compose) ps",
+          "docker compose \($compose) exec -T airflow-scheduler airflow dags list-import-errors --output json"
         ]}')"
         CMD_ID="$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
           --document-name AWS-RunShellScript --parameters "$PARAMS" \
@@ -4827,9 +4972,12 @@ subsección desde este punto:
     cmds:
       - |
         {{.CTX}}
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
         aws emr-serverless list-job-runs --application-id "$EMR_APP_ID" \
           --query 'sort_by(jobRuns,&createdAt)[-1].[id,state,stateDetails]' --output text
-        $SSH "$SSH_TARGET" "cd $REMOTE_DIR && docker compose -f $COMPOSE_PROD logs --tail=50"
+        $SSH "$SSH_TARGET" "cd $REMOTE_DIR && docker compose $COMPOSE_ARGS logs --tail=50"
 ```
 
 ### 8.1 Cargar el contexto de producción
@@ -5002,7 +5150,7 @@ aws ssm get-command-invocation \
 Para validar el camino por archivo:
 
 ```bash
-printf 'ready\n' | aws s3 cp - "$RAW_URI/_smoke/$(date -u +%Y%m%dT%H%M%SZ)/_SUCCESS"
+printf 'ready\n' | aws s3 cp - "s3://${DATALAKE_BUCKET}/diagnostics/$(date -u +%Y%m%dT%H%M%SZ)/iam.txt"
 
 aws sqs get-queue-attributes \
   --queue-url "$SQS_TRIGGER_QUEUE_URL" \
@@ -5148,7 +5296,7 @@ flowchart TD
 | 13 | `StartJobRun` falla con `ValidationException` | `$EMR_APP_ID` vacío: falta aplicar [§6.4](#64-cómputo-spark-emr-serverless), o el contexto es anterior a ese apply | `PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh`. Es el caso canónico de por qué existe §3.1 |
 | 14 | El job de EMR queda en `PENDING` mucho tiempo | Cuota de vCPU de la cuenta, o límite de concurrencia de la aplicación | Revisar Service Quotas para EMR Serverless y `maximumCapacity` de la app ([§6.4](#64-cómputo-spark-emr-serverless)) |
 | 15 | El job de EMR termina en `FAILED` | Los permisos S3 se asignaron al rol de EC2, pero el job usa su propio rol de ejecución. Otras causas: código o memoria | Revise primero `stateDetails` y después los logs de S3. Ante `AccessDenied`, corrija el rol de [§6.4](#64-cómputo-spark-emr-serverless), no el de [§6.2](#62-iam-permitir-s3a-a-la-ec2-sin-keys) |
-| 16 | Se carga un archivo en `raw/` y no ocurre nada. La DLQ está vacía | El archivo no coincide con el filtro de prefijo/sufijo de S3; el mensaje **nunca se generó** | Una DLQ vacía no demuestra que el pipeline funcione. Verifique el DAG run y el filtro de [§7.3](#73-disparo-por-evento-archivo-nuevo-en-s3-vía-sqs) |
+| 16 | Se cargan datos pero no ocurre nada. La DLQ está vacía | Falta publicar el manifest o no coincide con `raw/manifests/customer_etl/*.json`; el evento **nunca se generó** | Publique el manifest al final del lote y verifique el filtro de [§7.3](#73-disparo-por-evento-archivo-nuevo-en-s3-vía-sqs) |
 | 17 | Hay mensajes en la DLQ | La Lambda falló al procesar el evento: permisos, SSM offline o DAG inexistente | Lea el mensaje, corrija la causa y reprocese con el mismo `bucket`+`key`+`sequencer`. La alarma se define en [§18.1](#181-dlq-según-el-origen) |
 | 18 | GitHub Actions: `Could not assume role` | El `sub` del trust policy no coincide con `repo:<org>/<repo>:*` reales | Corrija `github_org`/`github_repo` y vuelva a aplicar. Un error aquí no falla al aplicar: aparece en el primer workflow ([§11.4](#114-workflow-de-despliegue)) |
 | 19 | GitHub Actions: `Unable to locate credentials` | Falta `permissions: id-token: write` en el job | Agregarlo al YAML. Parece un problema de AWS y es de GitHub: sin eso no se emite el token OIDC ([§11.4](#114-workflow-de-despliegue)) |
@@ -5251,7 +5399,7 @@ El job debe escribir un resultado repetible. Para una partición Parquet:
 
 ```python
 (
-    dataframe.dropDuplicates(["customer_id", "event_id"])
+    dataframe.dropDuplicates(["customer_id"])
     .write.mode("overwrite")
     .partitionBy("dt")
     .parquet(f"s3a://{datalake}/curated/customer")
@@ -5430,8 +5578,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with: { python-version: "3.12", cache: pip }
       - run: pip install ruff==0.14.3
       - run: ruff check dags spark-apps tests
@@ -5441,8 +5589,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with: { python-version: "3.12", cache: pip }
       - name: Airflow 3.2.2 + providers (con constraints, igual que la imagen de prod)
         env:
@@ -5458,9 +5606,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
-      - uses: go-task/setup-task@v1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e888155d616ced269862dd # v3.1.2
+        with: { terraform_version: "1.10.5" }
+      - run: go install github.com/go-task/task/v3/cmd/task@v3.45.4
       # Una sola línea: la misma task que usa el operador (§3.0b). Si CI duplicara los comandos,
       # a la tercera edición de la guía las dos copias dirían cosas distintas.
       - run: task infra:validate
@@ -5469,15 +5618,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: go-task/setup-task@v1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: go install github.com/go-task/task/v3/cmd/task@v3.45.4
       - run: task doc:check   # enlaces, anclas, § y contrato de variables
 
   compose:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Validar el Compose de producción con valores de prueba
         # `config` interpola el .env: sin estas variables falla por indefinidas, y con secretos
         # reales no puede correr en CI. Valores dummy, nunca los de producción.
@@ -5489,22 +5638,32 @@ jobs:
           AIRFLOW_JWT_SECRET=ci
           AIRFLOW_ADMIN_USER=ci
           AIRFLOW_ADMIN_PASSWORD=ci
+          AIRFLOW_DOMAIN=airflow.example.invalid
+          AIRFLOW_BASE_URL=https://airflow.example.invalid:8080
+          AIRFLOW_EXECUTION_API_URL=https://airflow.example.invalid:8080/execution/
+          AIRFLOW_SSL_CERT=/run/tls/cert.pem
+          AIRFLOW_SSL_KEY=/run/tls/key.pem
           GRAFANA_ADMIN_PASSWORD=ci
           EMR_APP_ID=ci
           EMR_JOB_ROLE_ARN=arn:aws:iam::000000000000:role/ci
+          EMR_LOG_GROUP=/aws/emr-serverless/ci
+          STARTSTOP_LAMBDA_NAME=ci
           DATALAKE_BUCKET=ci
           ARTIFACTS_BUCKET=ci
           EOF
           docker compose -f docker-compose.prod.yml config --quiet
+          test ! -f docker-compose.prod.https.yml || docker compose -f docker-compose.prod.yml -f docker-compose.prod.https.yml config --quiet
+          test ! -f docker-compose.prod.monitoring.yml || docker compose -f docker-compose.prod.yml -f docker-compose.prod.monitoring.yml config --quiet
+          test ! -f docker-compose.prod.https.yml || test ! -f docker-compose.prod.monitoring.yml || docker compose -f docker-compose.prod.yml -f docker-compose.prod.https.yml -f docker-compose.prod.monitoring.yml config --quiet
 
   security:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with: { fetch-depth: 0 }
-      - uses: gitleaks/gitleaks-action@v2
-        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+      - run: go install github.com/zricethezav/gitleaks/v8@v8.28.0
+      - run: "$(go env GOPATH)/bin/gitleaks git --redact --verbose"
 ```
 
 Ningún job de CI recibe credenciales de AWS: `id-token: write` aparece únicamente en el workflow de
@@ -5723,9 +5882,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -5915,12 +6074,20 @@ groups:
   - name: platform
     rules:
       - alert: HostDiskAlmostFull
-        expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/data"} / node_filesystem_size_bytes{mountpoint="/data"}) > 85
-        for: 10m
+        expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/data"} / node_filesystem_size_bytes{mountpoint="/data"}) > 80
+        for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "/data supera 85%"
+          summary: "/data supera 80%"
+
+      - alert: HostDiskCritical
+        expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/data"} / node_filesystem_size_bytes{mountpoint="/data"}) > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "/data supera 90%; riesgo de parada de Postgres y Airflow"
 
       - alert: AirflowSchedulerMissing
         expr: absent(airflow_scheduler_heartbeat)
@@ -5933,6 +6100,69 @@ groups:
 
 Valide el nombre real de la métrica del scheduler en StatsD exporter antes de activar la segunda
 regla; el mapping puede cambiar según la versión de Airflow.
+
+**Archivo:** `monitoring/alloy/config.alloy`. Alloy reemplaza a Promtail, que ya terminó su ciclo
+de vida, y descubre únicamente los contenedores del daemon local.
+
+```alloy
+discovery.docker "local" {
+  host = "unix:///var/run/docker.sock"
+}
+
+loki.source.docker "local" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.docker.local.targets
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint { url = "http://loki:3100/loki/api/v1/push" }
+}
+```
+
+**Archivo:** `monitoring/loki/loki-config.yml`. La retención debe estar activada explícitamente:
+montar `/data/loki` sin este bloque solo hace persistente un crecimiento ilimitado.
+
+```yaml
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  filesystem:
+    directory: /loki/chunks
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  retention_delete_delay: 2h
+  delete_request_store: filesystem
+
+limits_config:
+  retention_period: 168h  # 7 dias; subir a 15d solo si el EBS y el uso lo justifican
+```
+
+La política queda por fuente: Docker `3 × 10 MiB` por contenedor, Loki 7 días, Prometheus 15 días
+y 5 GiB, CloudWatch Lambda 14 días, CloudWatch EMR 30 días y S3 Airflow/EMR 90 días. Backups y
+CloudTrail no comparten estas reglas: tienen su propio RPO o requisito de auditoría.
 
 ### 12.3 Acceso
 
@@ -6245,8 +6475,13 @@ Dos propiedades que hacen que esto escale sin volver a tocar el script:
 set -euo pipefail
 umask 077
 
-# Único dato que el host necesita de antemano; lo inyecta el user_data (§5.3).
-PREFIX="${PARAMETER_PREFIX:-/pyspark-stack}"
+# Único dato que el host necesita de antemano; lo inyecta el user_data (§5.3). Sin fallback:
+# leer el prefijo de otro stack sería peor que abortar.
+[ -r /etc/pyspark-stack.env ] || { echo "load-secrets: falta /etc/pyspark-stack.env" >&2; exit 1; }
+PARAMETER_PREFIX=""
+. /etc/pyspark-stack.env
+: "${PARAMETER_PREFIX:?PARAMETER_PREFIX vacío en /etc/pyspark-stack.env}"
+PREFIX="$PARAMETER_PREFIX"
 
 # Región desde IMDSv2 (exige token, §13.1): mover el stack de región no toca el script.
 IMDS_TOKEN="$(curl -sX PUT http://169.254.169.254/latest/api/token \
@@ -6258,34 +6493,38 @@ export AWS_REGION="${AWS_REGION:-$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_T
 render_params() {
   aws ssm get-parameters-by-path \
     --path "$PREFIX" --recursive --with-decryption \
-    --query 'Parameters[].[Name,Value]' --output text |
-  while IFS=$'\t' read -r name value; do
-    key="${name##*/}"                       # basename del path
-    key="$(printf '%s' "$key" | tr '[:lower:]-' '[:upper:]_')"
-    printf '%s=%s\n' "$key" "$value"
-  done
+    --output json |
+  jq -r '.Parameters[] | ((.Name | split("/")[-1] | ascii_upcase | gsub("-"; "_")) + "=" + (.Value | @json))'
 }
 
 PARAMS="$(render_params)"
 [ -n "$PARAMS" ] || { echo "load-secrets: SSM no devolvió nada bajo $PREFIX" >&2; exit 1; }
 
+TMP_ENV="$(mktemp .env.tmp.XXXXXX)"
+trap 'rm -f "$TMP_ENV"' EXIT
 {
   # Ni secreto ni infra: no justifican un parámetro en SSM.
   echo "POSTGRES_USER=airflow"
   echo "POSTGRES_DB=airflow"
   echo "AIRFLOW_ADMIN_USER=admin"
   echo "$PARAMS"
-} > .env
+} > "$TMP_ENV"
 
-chmod 600 .env
+chmod 600 "$TMP_ENV"
+
+# Un basename repetido en /secrets y /config sería ambiguo: se rechaza antes de tocar .env.
+DUPLICATES="$(cut -d= -f1 "$TMP_ENV" | sort | uniq -d)"
+[ -z "$DUPLICATES" ] || { echo "load-secrets: claves duplicadas: $DUPLICATES" >&2; exit 1; }
 
 # Falla acá y no en la primera corrida del DAG.
 for required in POSTGRES_PASSWORD AIRFLOW_JWT_SECRET AIRFLOW_ADMIN_PASSWORD \
                 EMR_APP_ID EMR_JOB_ROLE_ARN EMR_LOG_GROUP STARTSTOP_LAMBDA_NAME \
                 DATALAKE_BUCKET ARTIFACTS_BUCKET; do
-  grep -q "^${required}=." .env || { echo "load-secrets: falta $required en $PREFIX" >&2; exit 1; }
+  grep -q "^${required}=." "$TMP_ENV" || { echo "load-secrets: falta $required en $PREFIX" >&2; exit 1; }
 done
-echo "load-secrets: .env generado con $(grep -c '=' .env) variables"
+mv -f "$TMP_ENV" .env
+trap - EXIT
+echo "load-secrets: .env generado atómicamente con $(grep -c '=' .env) variables"
 ```
 
 **Cómo se nombra cada variable.** Solo el último segmento del path cuenta, así que secretos y
@@ -6329,17 +6568,68 @@ resincronizar el repositorio, agregue esta task:
 
 ```yaml
   prod:secrets:
-    desc: "§13.4 — regenera el .env desde SSM y reinicia el stack"
+    desc: "§13.4 — rematerializa .env desde SSM; no rota credenciales"
     cmds:
       - |
         {{.CTX}}
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
         $SSH "$SSH_TARGET" "cd $REMOTE_DIR && ./scripts/load-secrets.sh && \
-          docker compose -f $COMPOSE_PROD up -d"
+          docker compose $COMPOSE_ARGS up -d"
 ```
+
+`prod:secrets` materializa configuración: **no es una rotación**. Cambiar únicamente el parámetro
+de PostgreSQL desincroniza el secreto del rol persistido en el volumen y deja Airflow sin conexión.
+
+#### 13.4.1 Rotación coordinada
+
+Para PostgreSQL haga una transacción operativa: guarde el valor anterior, cambie el rol dentro del
+motor, actualice SSM, rematerialice y compruebe Airflow. Si falla un paso, restaure motor y SSM con
+el valor anterior antes de salir de la ventana.
+
+<details>
+<summary>Procedimiento reproducible para POSTGRES_PASSWORD</summary>
+
+```bash
+source ./scripts/prod-env.sh
+OLD_PASSWORD="$(aws ssm get-parameter --name "/${NAME_PREFIX}/secrets/postgres_password" --with-decryption --query Parameter.Value --output text)"
+NEW_PASSWORD="$(openssl rand -hex 24)"
+
+set_db_password() {
+  local encoded
+  encoded="$(printf "ALTER ROLE airflow PASSWORD '%s';" "$1" | base64 -w0)"
+  $SSH "$SSH_TARGET" "printf %s '$encoded' | base64 -d | docker exec -i airflow-db psql -v ON_ERROR_STOP=1 -U airflow -d airflow"
+}
+
+set_db_password "$NEW_PASSWORD"
+if ! aws ssm put-parameter --name "/${NAME_PREFIX}/secrets/postgres_password" \
+  --type SecureString --value "$NEW_PASSWORD" --overwrite; then
+  set_db_password "$OLD_PASSWORD"
+  exit 1
+fi
+
+if ! task prod:secrets || ! task prod:smoke; then
+  set_db_password "$OLD_PASSWORD"
+  aws ssm put-parameter --name "/${NAME_PREFIX}/secrets/postgres_password" \
+    --type SecureString --value "$OLD_PASSWORD" --overwrite
+  task prod:secrets
+  exit 1
+fi
+unset OLD_PASSWORD NEW_PASSWORD
+```
+
+</details>
+
+- **Airflow:** actualice `airflow_admin_password`, ejecute `task prod:secrets` y fuerce
+  `docker compose ... run --rm airflow-init`; el init usa `reset-password` si el usuario existe.
+- **Grafana:** actualice `grafana_admin_password`, rematerialice y ejecute dentro del servicio
+  `grafana cli admin reset-admin-password "$GF_SECURITY_ADMIN_PASSWORD"`; la variable de arranque
+  no cambia por sí sola un usuario persistido en `/data/grafana`.
 
 ### 13.5 Riesgos aceptados
 
-`cAdvisor` se ejecuta con privilegios y Promtail lee `docker.sock`: no publique sus puertos ni
+`cAdvisor` se ejecuta con privilegios y Alloy lee `docker.sock`: no publique sus puertos ni
 ejecute workloads de usuario dentro. Mantenga versiones fijas y elimínelos si CloudWatch
 Container Insights cubre los requisitos.
 
@@ -6353,17 +6643,22 @@ Container Insights cubre los requisitos.
 Los overrides son aditivos y se combinan con `-f`: base + HTTPS
 ([§5.6](#56-exponer-la-web-de-airflow-https-nativo-acceso-desde-la-ip-del-operador)) + monitoreo
 ([§14.2](#142-docker-composeprodmonitoringyml--override-de-observabilidad)); ninguno arranca por
-separado. Spark, HDFS y Jupyter no corren en la EC2. Son **dos archivos**:
+separado. Spark, HDFS y Jupyter no corren en la EC2. Son **tres archivos**:
 
 | Archivo | Contiene | Estado |
 |---|---|---|
 | `docker-compose.prod.yml` | Airflow + Postgres | Ejecutable hoy |
+| `docker-compose.prod.https.yml` | TLS nativo y URL compartida del Execution API | Opcional; requiere §5.6 |
 | `docker-compose.prod.monitoring.yml` | Prometheus, Grafana, Alertmanager, Loki y exporters | Requiere `monitoring/` (§12, roadmap) |
 
 La separación no es cosmética: el monitoreo monta archivos de `./monitoring/**` que todavía no
 existen. En un solo archivo, Docker crearía esas rutas como directorios vacíos de root y
 Prometheus, Grafana y Loki entrarían en crash-loop con un error que no nombra la causa. Como
 override, el stack base arranca limpio y el monitoreo se suma cuando su config exista y valide.
+
+Las tasks usan un selector único: `PROD_HTTPS=1` agrega `.https.yml` y `PROD_MONITORING=1` agrega
+`.monitoring.yml` en deploy, secretos, smoke, logs y `release:check`. Exporte las mismas flags durante
+toda la promoción; con ambas apagadas se opera solamente el base.
 
 ### 14.1 `docker-compose.prod.yml` — base
 
@@ -6396,6 +6691,13 @@ x-airflow-common: &airflow-common
     AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
     AIRFLOW__METRICS__STATSD_PORT: "9125"
     AIRFLOW__METRICS__STATSD_PREFIX: airflow
+    # Task logs durables sin llenar /data: boto3 usa el instance profile mediante aws_default.
+    AIRFLOW_CONN_AWS_DEFAULT: aws://
+    AIRFLOW__LOGGING__REMOTE_LOGGING: "True"
+    AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: s3://${ARTIFACTS_BUCKET:?falta en .env, se publica en §6.1}/logs/airflow
+    AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: aws_default
+    AIRFLOW__LOGGING__DELETE_LOCAL_LOGS: "True"
+    AIRFLOW__LOGGING__ENCRYPT_S3_LOGS: "True"
     # Vacías, el DAG de §6.6 fallaría recién en la primera corrida (ValidationException de EMR),
     # no al levantar el stack. `:?` adelanta el error al `docker compose config`.
     AIRFLOW_VAR_EMR_APP_ID: ${EMR_APP_ID:?falta en .env, se publica en §6.4}
@@ -6406,6 +6708,7 @@ x-airflow-common: &airflow-common
     AIRFLOW_VAR_ARTIFACTS: ${ARTIFACTS_BUCKET:?falta en .env, se publica en §6.1}
   volumes:
     - ./dags:/opt/airflow/dags:ro
+    - /data/airflow-logs:/opt/airflow/logs
   restart: unless-stopped
   logging:
     driver: json-file
@@ -6427,7 +6730,7 @@ x-common-logging: &common-logging
 
 services:
   airflow-db:
-    image: postgres:16
+    image: postgres:16.14-bookworm
     container_name: airflow-db
     restart: unless-stopped
     <<: *common-logging
@@ -6459,14 +6762,19 @@ services:
       bash -euc '
         airflow db migrate;
         airflow fab-db migrate;
-        airflow users list | grep -q "$${AIRFLOW_ADMIN_USER}" ||
-        airflow users create
-          --username "$${AIRFLOW_ADMIN_USER}"
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email admin@example.com
-          --password "$${AIRFLOW_ADMIN_PASSWORD}"
+        if airflow users list | grep -q "$${AIRFLOW_ADMIN_USER}"; then
+          airflow users reset-password
+            --username "$${AIRFLOW_ADMIN_USER}"
+            --password "$${AIRFLOW_ADMIN_PASSWORD}";
+        else
+          airflow users create
+            --username "$${AIRFLOW_ADMIN_USER}"
+            --firstname Admin
+            --lastname User
+            --role Admin
+            --email admin@example.com
+            --password "$${AIRFLOW_ADMIN_PASSWORD}";
+        fi
       '
 
   airflow-apiserver:
@@ -6510,9 +6818,32 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # S3 es el historico durable. Esta defensa secundaria limita archivos que no pudieron subirse
+  # (fallo de red/IAM) para que /data no se llene antes de que intervenga una alarma.
+  airflow-log-cleaner:
+    <<: *airflow-common
+    container_name: airflow-log-cleaner
+    command: ["bash", "/opt/pyspark-stack/scripts/prune-airflow-logs.sh"]
+    environment:
+      <<: *airflow-env
+      AIRFLOW_LOCAL_LOG_RETENTION_DAYS: "7"
+      AIRFLOW_LOCAL_LOG_MAX_SIZE_MB: "1024"
+      AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES: "15"
+    volumes:
+      - /data/airflow-logs:/opt/airflow/logs
+      - ./scripts/prune-airflow-logs.sh:/opt/pyspark-stack/scripts/prune-airflow-logs.sh:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
 networks:
   platform:
 ```
+
+El flujo normal es `task → S3 cifrado → borrar copia local`; el cleaner y `systemd-tmpfiles` son
+defensas para cargas fallidas, no el archivo histórico. El prefijo `logs/airflow/` expira a 90 días
+por el lifecycle de §6.1. Verifique después del primer DAG que el objeto exista en S3 y que el log
+continúe visible desde la UI de Airflow antes de considerar habilitado este control.
 
 **Arranque del stack base.** Reemplaza la versión mínima de §5.5. Primero publique el archivo
 nuevo y luego inicie los servicios. Los dos primeros comandos se ejecutan localmente:
@@ -6603,6 +6934,7 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=5GB
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -6691,14 +7023,14 @@ services:
       - 127.0.0.1:3100:3100
     networks: [platform]
 
-  promtail:
-    image: grafana/promtail:3.1.1
-    container_name: promtail
+  alloy:
+    image: grafana/alloy:v1.12.2
+    container_name: alloy
     restart: unless-stopped
     <<: *common-logging
-    command: ["-config.file=/etc/promtail/promtail-config.yml"]
+    command: ["run", "/etc/alloy/config.alloy"]
     volumes:
-      - ./monitoring/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks: [platform]
 
@@ -6786,16 +7118,23 @@ flowchart TD
       - task: infra:plan
       - |
         {{.CTX}}
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
         CHECK_ENV="$(mktemp)"
         trap 'rm -f "$CHECK_ENV"' EXIT
         printf '%s\n' \
           'POSTGRES_USER=check' 'POSTGRES_PASSWORD=check' 'POSTGRES_DB=check' \
           'AIRFLOW_JWT_SECRET=check' 'AIRFLOW_ADMIN_USER=check' 'AIRFLOW_ADMIN_PASSWORD=check' \
+          'AIRFLOW_DOMAIN=airflow.example.invalid' 'AIRFLOW_BASE_URL=https://airflow.example.invalid:8080' \
+          'AIRFLOW_EXECUTION_API_URL=https://airflow.example.invalid:8080/execution/' \
+          'AIRFLOW_SSL_CERT=/run/tls/cert.pem' 'AIRFLOW_SSL_KEY=/run/tls/key.pem' \
+          'GRAFANA_ADMIN_PASSWORD=check' \
           'EMR_APP_ID=check' 'EMR_JOB_ROLE_ARN=arn:aws:iam::000000000000:role/check' \
           'EMR_LOG_GROUP=/aws/emr-serverless/check' 'STARTSTOP_LAMBDA_NAME=check' \
           'DATALAKE_BUCKET=check' 'ARTIFACTS_BUCKET=check' > "$CHECK_ENV"
         PROD_ENV_FILE="$CHECK_ENV" docker compose --env-file "$CHECK_ENV" \
-          -f "$COMPOSE_PROD" config --quiet
+          $COMPOSE_ARGS config --quiet
       - pytest -q
 
   release:apply:
@@ -6809,6 +7148,7 @@ flowchart TD
   release:deploy:
     desc: "§15 pasos 3-5 — esperar el host, desplegar y publicar los entrypoints"
     cmds:
+      - task: prod:trust-host
       - task: prod:wait
       - task: prod:deploy
       - task: emr:sync
@@ -7038,8 +7378,8 @@ Control de calidad:
 SELECT
   count(*) AS filas,
   count_if(customer_id IS NULL) AS customer_id_nulo,
-  count(*) - count(DISTINCT event_id) AS duplicados
-FROM pyspark_stack_analytics.customer
+  count(*) - count(DISTINCT customer_id) AS duplicados
+FROM pyspark_stack_analytics.customer_loyalty
 WHERE dt = current_date;
 ```
 
@@ -7094,7 +7434,7 @@ from pyspark.sql import functions as F
 
 clean = (
     raw.filter(F.col("customer_id").isNotNull())
-    .dropDuplicates(["event_id"])
+    .dropDuplicates(["order_id"])
     .withColumn("dt", F.to_date("event_time"))
 )
 ```
@@ -7419,6 +7759,25 @@ resource "aws_ce_anomaly_monitor" "services" {
   monitor_dimension = "SERVICE"
 }
 
+resource "aws_ce_anomaly_subscription" "daily_email" {
+  name             = "${var.name_prefix}-daily-anomalies"
+  frequency        = "DAILY"
+  monitor_arn_list = [aws_ce_anomaly_monitor.services.arn]
+
+  subscriber {
+    type    = "EMAIL"
+    address = var.alert_email
+  }
+
+  threshold_expression {
+    dimension {
+      key           = "ANOMALY_TOTAL_IMPACT_ABSOLUTE"
+      match_options = ["GREATER_THAN_OR_EQUAL"]
+      values        = ["10"]
+    }
+  }
+}
+
 resource "aws_accessanalyzer_analyzer" "account" {
   analyzer_name = "${var.name_prefix}-external-access"
   type          = "ACCOUNT"
@@ -7545,9 +7904,9 @@ En CI, database y prefijo S3 separados: un pull request nunca escribe en las tab
 > es *roadmap*; los controles mínimos son obligatorios. **Resultado:** gate SQL que detiene el pipeline antes de
 > publicar en `curated/`, en vez de descubrir el problema en un dashboard tres días después.
 
-La calidad es una puerta entre `curated` y `analytics`, no un reporte posterior: validar **antes**
-de publicar ([§20.3](#203-orden-del-pipeline)). Un gate que corre después de escribir es un
-informe.
+La calidad es una puerta antes de `curated`, no un reporte posterior: escriba primero en staging,
+valide y promueva después ([§20.3](#203-orden-del-pipeline)). Un gate que consulta una tabla ya
+publicada es un informe, no protección.
 
 ### 20.1 Controles mínimos
 
@@ -7573,23 +7932,26 @@ quality_gate = SQLCheckOperator(
     SELECT
       count(*) > 0 AS tiene_filas,
       count_if(customer_id IS NULL) = 0 AS clave_completa,
-      count(*) = count(DISTINCT event_id) AS sin_duplicados
-    FROM pyspark_stack_analytics.customer
+      count(*) = count(DISTINCT customer_id) AS sin_duplicados
+    FROM pyspark_stack_staging.customer_loyalty
     WHERE dt = DATE '{{ ds }}'
     """,
 )
 ```
 
 `SQLCheckOperator` convierte cada valor de la primera fila a booleano y falla si alguno es falso.
-Para suites grandes, Great Expectations con versión fijada y el checkpoint como task aparte.
+La tabla/vista de staging y su promoción todavía no están implementadas en la guía: son un bloqueo
+de producción, no un nombre para copiar a ciegas. Para suites grandes, Great Expectations con
+versión fijada y el checkpoint como task aparte.
 
 ### 20.3 Orden del pipeline
 
 ```text
-ingesta → validación básica → ETL → calidad → dbt → publicación → lineage
+ingesta raw → validación básica → ETL a staging → calidad/reconciliación
+            → promoción a curated → dbt/analytics → lineage
 ```
 
-Los datos que no pasan calidad no deben promoverse a `analytics`.
+Los datos que no pasan calidad no deben promoverse a `curated` ni `analytics`.
 
 ---
 
@@ -7649,11 +8011,11 @@ Pruebe trimestralmente:
 
 1. crear una EC2 de recuperación;
 2. adjuntar un snapshot de `/data`;
-3. regenerar `.env` desde SSM;
-4. levantar Postgres y Airflow;
-5. sincronizar DAGs desde artifacts;
-6. disparar un DAG de prueba;
-7. registrar RTO y problemas encontrados.
+3. restaurar el último dump lógico de PostgreSQL desde `artifacts/backups/postgres/`;
+4. regenerar `.env` desde SSM y levantar Airflow;
+5. sincronizar DAGs desde artifacts y disparar un DAG de prueba;
+6. comprobar **RPO ≤24 h** y **RTO ≤2 h**;
+7. registrar tiempos, evidencia y problemas encontrados.
 
 ### 21.4 Teardown
 
@@ -7751,7 +8113,7 @@ flowchart TD
 | **AL2023** | Amazon Linux 2023, la AMI base de la EC2. Su paquete `docker` no trae buildx moderno: por eso el `user_data` lo instala aparte. |
 | **AZ** (Availability Zone) | Datacenter dentro de una región. Un volumen EBS **no se mueve** entre AZ: por eso la AZ va fija y explícita ([§5.1](#51-variables-y-red)). |
 | **Cost Anomaly Detection** | Servicio que aprende el patrón de gasto y alerta ante desvíos. Complementa el presupuesto: detecta cambios de comportamiento, no solo un techo ([§18.4](#184-cost-anomaly-detection-y-access-analyzer)). |
-| **DLM** (Data Lifecycle Manager) | Crea snapshots del EBS por política, sin cron ni script. Permite recuperar `/data` ([§6.3](#63-backups-snapshots-ebs-automáticos-dlm)). |
+| **DLM** (Data Lifecycle Manager) | Crea snapshots del EBS por política; el dump lógico protege PostgreSQL ([§6.3](#63-backups-dump-postgresql--snapshots-ebs-dlm)). |
 | **DLQ** (Dead Letter Queue) | Cola donde caen los mensajes que fallaron después de agotar reintentos. Sin ella, un evento que falla se pierde en silencio ([§18.1](#181-dlq-según-el-origen)). |
 | **EBS gp3** | Disco de bloques. `gp3` desacopla IOPS del tamaño: rinde igual que `gp2` costando menos a este volumen. |
 | **EIP** (Elastic IP) | IPv4 pública fija. Sobrevive a stop/start, lo que mantiene estables los túneles y el registro DNS. AWS la cobra **esté asociada o no**. |
