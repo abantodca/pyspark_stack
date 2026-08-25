@@ -1,6 +1,6 @@
 # pyspark_stack
 
-Plataforma de datos local y reproducible: **Airflow 3.2 + Spark 4.0.3 + HDFS + Jupyter**, orquestada
+Plataforma de datos local y reproducible: **Airflow 3.2 + Spark 4.2.0 + HDFS + Jupyter**, orquestada
 con Docker Compose, más las guías para llevarla a producción en AWS.
 
 El ciclo es: se desarrolla en local con el stack completo y se despliega en una arquitectura
@@ -9,25 +9,26 @@ EMR Serverless y el data lake a S3, sin HDFS.
 
 ```
 Airflow 3.2 (5 procesos) + Postgres 16  →  orquestación
-Spark 4.0.3 (master + worker)           →  cómputo
+Spark 4.2.0 (master + worker)           →  cómputo
 HDFS (namenode + datanode)              →  almacenamiento
 Jupyter (PySpark 4)                     →  notebooks (solo dev)
 ```
 
 ## Arranque rápido
 
-Requisitos: Docker y Docker Compose. Recomendado 16 GB de RAM para el stack completo.
+Requisitos: Docker y Docker Compose. Reservá al menos 20 GiB de RAM para Docker: los límites del
+stack completo suman aproximadamente 18.25 GiB.
 
 ```bash
 cp .env.example .env
 chmod 600 .env
 # Generá y pegá cuatro valores distintos con `openssl rand -hex 32`.
 task local:up
+task local:smoke
 ```
 
 `task local:up` rechaza secretos vacíos/débiles, valida el Compose efectivo y usa el override local
-con límites, healthchecks y política de reinicio. `task test` ejecuta los contratos y las
-transformaciones en la misma imagen de Airflow que usa el pipeline.
+con límites, healthchecks y política de reinicio.
 
 | UI | URL |
 |---|---|
@@ -43,26 +44,24 @@ Jupyter vive en el perfil `dev` de Compose y en producción no arranca. Copiar `
 ## Contenido del repositorio
 
 ```
-dags/            DAGs de Airflow del stack local
-spark-apps/      jobs PySpark, shell del pipeline customer_etl y datos de landing
-notebooks/       notebooks de práctica y del pipeline
-tests/           controles de integridad de los DAGs
+dags/
+  medallion_dags/  15 proyectos end-to-end Source → Bronze → Silver → Gold
+  medallion/       runtime, almacenamiento y contratos compartidos
+spark-apps/      ubicación para jobs Spark externos; los 15 DAGs locales son autocontenidos
+notebooks/       bind mount para notebooks locales
 hadoop-config/   core-site.xml del cliente HDFS
 spark-events/    configuración de eventLog de Spark
-scripts/         utilidades: prod-env.sh (contexto de producción) y validadores de las guías
-Taskfile.yml     los comandos repetidos: infra, deploy, validadores (task --list)
-docs/            documentación: cuatro guías centrales, adr/ (decisiones) y referencia/
+ops/             utilidades operativas y sources.env: el origen de datos de cada proyecto
+Taskfile.yml     comandos repetibles del stack local (task --list)
+docs/            cinco guías, decisiones ADR y referencia de arquitectura AWS
 ```
 
-El repositorio contiene el proyecto local y una **composición Terraform parcial** (`network` y
-`orchestrator`) que puede validarse sin credenciales. El resto de la infraestructura de producción,
-Lambdas, Compose productivo, workflows y jobs de EMR siguen siendo guía de implementación: no se
-consideran desplegables ni probados de punta a punta.
+Convención inequívoca: los 15 pipelines end-to-end usan
+`dags/medallion_dags/<dominio>_medallion_dag.py`.
 
-La excepción es `scripts/prod-env.sh`: sí se versiona, porque corre en **tu** máquina. Convierte los
-outputs de Terraform en variables de entorno, y es lo que hace que cada comando de las guías se
-copie y funcione tal cual, sin editar IDs, IPs ni nombres de bucket
-([contrato completo](docs/02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando)).
+Este checkout implementa únicamente el stack local. La guía de AWS describe una arquitectura
+objetivo, pero los módulos Terraform, scripts, Compose productivo, workflows y jobs de EMR no están
+presentes: no hay un despliegue de producción ejecutable desde este árbol.
 
 ## Documentación
 
@@ -73,17 +72,9 @@ copie y funcione tal cual, sin editar IDs, IPs ni nombres de bucket
   operación, en un solo documento — fundamentos y costo (§1–§4), el núcleo EC2 (§5), data lake y EMR Serverless
   (§6–§7), operación y diagnóstico (§8–§10), CI/CD, secretos y runbook (§11–§15), y la evolución (§16–§22).
 - [03 — Arquitectura](docs/03-arquitectura.md): componentes, flujos, seguridad y costos.
-- [04 — Ejemplos locales](docs/04-ejemplos-locales.md): 21 ejercicios progresivos sobre este stack.
-
-Material de consulta en [`docs/referencia/`](docs/referencia):
-
-- [02b — Producción en AWS por consola](docs/referencia/02b-produccion-aws-consola.md): el mismo camino, sin IaC.
-- [05 — Production readiness](docs/referencia/05-production-readiness.md): controles previos al primer despliegue.
-- [06 — Historial de incidentes](docs/referencia/06-historial-de-incidentes.md): fallos del stack local y sus fixes.
-- [07 — Secuencia de ejecución](docs/referencia/07-secuencia-de-ejecucion.md): por qué cada comando va donde va, cuáles
-  dejan de hacer falta al avanzar, y en qué se diferencia la secuencia de lo que haría un operador.
-- [Gobierno y operaciones de datos](docs/referencia/08-gobierno-operaciones-datos.md): ownership,
-  contratos, calidad, SLO, incidentes, retención y gate para datos reales.
+- [04 — DataOps local](docs/04-dataops-local.md): 15 ETL medallion end-to-end.
+- [05 — HDFS desde la terminal](docs/05-hdfs-desde-la-terminal.md): ver, buscar, subir, consultar y
+  exportar data del lakehouse a mano, con los comandos crudos.
 
 ## Seguridad
 

@@ -1,15 +1,16 @@
 # Arquitectura de producción — híbrida en AWS
 
-Mapa conceptual del camino de producción: responsabilidades, fronteras y flujos. El *cómo*
-ejecutable está en la [guía 02](02-produccion-aws-terraform.md); acá está el porqué.
+Mapa conceptual del camino de producción: responsabilidades, fronteras y flujos. En este checkout
+es una arquitectura de referencia: no existen los artefactos AWS para ejecutarla. La
+[guía 02](02-produccion-aws-terraform.md) conserva el diseño detallado.
 
 > **En este documento: LEER, ~25 min. No hay nada que ejecutar.**
 > **Salís con**: entender **por qué** el stack de producción está armado así —y, más
-> útil, qué se descartó y con qué criterio. El *cómo* ejecutable está en la
+> útil, qué se descartó y con qué criterio. El diseño detallado está en la
 > [guía 02](02-produccion-aws-terraform.md).
 
 > [!IMPORTANT]
-> **Leé esto ANTES de la guía 02, no después.** La guía 02 pide explícitamente que no
+> **Leé esto ANTES de implementar la guía 02, no después.** La guía 02 pide explícitamente que no
 > rediscutas las decisiones mientras la seguís, y este es el documento donde esas
 > decisiones se justifican. Si empezás a aplicar Terraform preguntándote «¿por qué EMR
 > Serverless y no un cluster?», vas a interrumpir el stand-up para resolver algo que
@@ -23,11 +24,11 @@ SSM y CI de validación sin permisos de escritura sobre AWS.
 OpenLineage y observabilidad con Prometheus, Grafana, Alertmanager, Loki y Grafana Alloy. Aparecen en los
 diagramas para mostrar la evolución prevista; hoy son roadmap, no inventario desplegable.
 
-**Cómo leer los diagramas, entonces**: mezclan las dos capas a propósito. Lo que está
-desplegable y lo que es diseño lo separa la [matriz de estado](README.md), que es la
-fuente de verdad — no estos diagramas. Ante una diferencia entre ambos, gana la matriz.
-El [estándar de gobierno y operaciones](referencia/08-gobierno-operaciones-datos.md) define además
-los controles humanos y de datos que ningún diagrama de infraestructura puede sustituir.
+**Cómo leer los diagramas, entonces**: describen el diseño objetivo. El stack local implementado y
+lo que sigue siendo referencia se separan en la [matriz de estado](README.md), que es la fuente de
+verdad — no estos diagramas. Ante una diferencia entre ambos, gana la matriz.
+Los controles humanos, ownership y SLO deben definirse explícitamente; ningún diagrama de
+infraestructura puede sustituirlos.
 
 ## Configuración de referencia
 
@@ -181,7 +182,7 @@ Spark UI vive en la consola de EMR Serverless, y en producción no hay Jupyter.
 | GitHub Actions + OIDC | AWS + GitHub | CI/CD: valida en PRs y despliega DAGs |
 | Snapshots EBS (DLM) | AWS | Backups automáticos de `/data` |
 | SSM Parameter Store | AWS | Secretos (`SecureString`) y config no secreta (`config/`) que la EC2 lee sin acceso al state (guía 02 §13.3b) |
-| Outputs de Terraform + `scripts/prod-env.sh` | Repo | Contrato que convierte el state en variables de entorno: ningún comando lleva IDs ni IPs escritos (guía 02 §3.1) |
+| Outputs de Terraform + cargador de contexto | Arquitectura objetivo | Contrato que convertiría el state en variables de entorno (guía 02 §3.1); no está materializado en este checkout |
 | Budgets · Cost Anomaly Detection · Access Analyzer | AWS | Gobierno de costo y seguridad, sin costo (guía 02 §18) |
 
 > El Terraform de cada componente y los archivos Compose están, listos para copiar, en la
@@ -382,9 +383,8 @@ compactación periódica el *planning time* de las queries se degrada mes a mes.
 del pipeline crítico. Detalle en
 [guía 02 §16.3](02-produccion-aws-terraform.md#163-mantenimiento-iceberg).
 
-> Se puede practicar todo esto sin AWS: el
-> [ejemplo 21 de la guía 04](04-ejemplos-locales.md) monta un catálogo Iceberg local con el mismo
-> SQL.
+> El laboratorio medallion local actual persiste Parquet en HDFS. Iceberg permanece como evolución
+> de producción y no forma parte del smoke test local documentado en [la guía 04](04-dataops-local.md).
 
 ---
 
@@ -407,8 +407,8 @@ nuevo—. Detalle completo en la [guía 02](02-produccion-aws-terraform.md).
 Cuatro piezas AWS-nativas que cierran huecos operativos. Detalle en la
 [guía 02 §18](02-produccion-aws-terraform.md#18-gobierno-resiliencia-y-costos):
 
-Ownership, clasificación, SLO, incidentes y autorización de datos reales se gobiernan en la
-[referencia 08](referencia/08-gobierno-operaciones-datos.md); crear alarmas no asigna responsables.
+Ownership, clasificación, SLO, incidentes y autorización de datos reales requieren responsables
+designados; crear alarmas no asigna responsables.
 
 | Pieza | Qué resuelve |
 |---|---|

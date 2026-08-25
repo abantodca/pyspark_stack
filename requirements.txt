@@ -1,9 +1,9 @@
-# Providers para Airflow 3.2.2 (Python 3.12).
-# Versiones tomadas del constraints file oficial constraints-3.2.2/constraints-3.12.txt.
+# Providers para Airflow 3.2.2 (Python 3.14).
+# Versiones tomadas del constraints file oficial constraints-3.2.2/constraints-3.14.txt.
 # - apache-spark: SparkSubmitOperator para lanzar los jobs contra el cluster standalone.
 # - fab: necesario en Airflow 3 para el FabAuthManager y el comando `airflow users create`.
-# pyspark==4.0.3 se instala aparte en Dockerfile.airflow (sin constraints) para casar con el cluster Spark 4.0.3.
+# pyspark==4.2.0 se instala aparte en Dockerfile.airflow (sin constraints) para casar con el cluster Spark 4.2.0.
 apache-airflow-providers-apache-spark==6.0.2
 apache-airflow-providers-fab==3.6.4
-# Producción: EmrServerlessStartJobOperator. Pin compatible con Airflow 3.2.2/Python 3.12.
+# Producción: EmrServerlessStartJobOperator. Pin compatible con Airflow 3.2.2/Python 3.14.
 apache-airflow-providers-amazon[aiobotocore]==9.29.0

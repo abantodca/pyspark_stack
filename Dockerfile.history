@@ -1,8 +1,8 @@
-# Spark History Server 4.0.3 — misma imagen oficial que el cluster (Java 17), para poder
-# leer los event logs que generan master/worker/driver 4.0.3.
+# Spark History Server 4.2.0 — misma imagen oficial que el cluster (Java 17), para poder
+# leer los event logs que generan master/worker/driver 4.2.0.
 # Se arranca la clase en foreground con spark-class: sbin/start-history-server.sh daemoniza
 # y el contenedor saldria con Exited(0) (mismo patron que master/worker en el compose).
-FROM apache/spark:4.0.3-scala2.13-java17-python3-ubuntu
+FROM apache/spark:4.2.0-scala2.13-java17-python3-ubuntu
 
 # Lee los event logs de /tmp/spark-events (bind-mount de ./spark-events en el compose).
 ENV SPARK_HISTORY_OPTS="-Dspark.history.fs.logDirectory=file:/tmp/spark-events"

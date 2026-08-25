@@ -29,10 +29,25 @@ x-airflow-common: &airflow-common
     # Reemplaza al viejo WEBSERVER__SECRET_KEY: el api-server firma tokens JWT.
     AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:?define AIRFLOW_JWT_SECRET en .env}'
     AIRFLOW_UID: 50000
+    # Contrato de persistencia de los DAGs medallion: todas las capas y archivos
+    # operativos se escriben en HDFS, nunca en el filesystem efimero de Airflow.
+    LAKEHOUSE_ROOT: 'hdfs://hdfs-namenode:9000/lakehouse'
+    HADOOP_CONF_DIR: /opt/hadoop/etc/hadoop
+    SPARK_MASTER: 'spark://spark-master:7077'
+    # El driver Airflow corre con Python 3.14. Spark propaga este ejecutable a
+    # cada executor; sin declararlo usaría `python3` (3.10 en la imagen base).
+    PYSPARK_PYTHON: python3.14
+    PYSPARK_DRIVER_PYTHON: python3.14
+    # dags/ contiene el paquete medallion compartido; spark-apps/projects queda
+    # disponible para entrypoints externos sin mezclar ambos tipos de codigo.
+    PYTHONPATH: /opt/airflow/dags:/opt/spark-apps/projects
+  # Origenes de datos propios: <PROYECTO>_SOURCE_URI se define en ops/sources.env,
+  # sin editar el Compose. Vacio o comentado -> el DAG usa su fixture de ejemplo.
+  env_file:
+    - ./ops/sources.env
   volumes:
     - ./dags:/opt/airflow/dags
     - ./spark-apps:/opt/spark-apps
-    - ./tests:/opt/tests:ro
     - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
     # Persiste los task logs entre recreaciones. airflow-log-cleaner aplica la retencion.
     - airflow_logs:/opt/airflow/logs
@@ -54,6 +69,32 @@ services:
     volumes:
       - hdfs-nn-data:/hadoop/dfs/name
       - ./spark-apps:/opt/spark-apps
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+    networks:
+      - hadoopnet
+
+  # Inicializacion idempotente del namespace local. HDFS simple-auth resuelve el
+  # usuario desde cada contenedor; 0777 se limita a este laboratorio local y
+  # permite que los executors Spark creen los directorios de staging/commit.
+  hdfs-init:
+    image: chandravenkat/hadoop-namenode@sha256:51ad9293ec52083c5003ef0aaab00c3dd7d6335ddf495cc1257f97a272cab4c0
+    container_name: hdfs-init
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        until hdfs dfs -fs hdfs://hdfs-namenode:9000 -ls / >/dev/null 2>&1; do sleep 2; done
+        hdfs dfs -fs hdfs://hdfs-namenode:9000 -mkdir -p /lakehouse
+        hdfs dfs -fs hdfs://hdfs-namenode:9000 -chmod 0777 /lakehouse
+        hdfs dfs -fs hdfs://hdfs-namenode:9000 -mkdir -p /lakehouse/landing
+        hdfs dfs -fs hdfs://hdfs-namenode:9000 -chmod 0777 /lakehouse/landing
+    depends_on:
+      hdfs-namenode:
+        condition: service_healthy
     logging: *default-logging
     networks:
       - hadoopnet
@@ -81,14 +122,14 @@ services:
     networks:
       - hadoopnet
 
-  # Cluster Spark 4.0.3 (imagen oficial Apache, Java 17 + Python 3 para los executors PySpark).
+  # Cluster Spark 4.2.0 (imagen oficial Apache, Java 17 + Python 3 para los executors PySpark).
   # La imagen apache/spark esta pensada para spark-submit/k8s, asi que se arranca el master/worker
   # standalone en foreground con spark-class (sbin/start-*.sh daemonizan y el contenedor saldria).
   spark-master:
     build:
       context: .
       dockerfile: Dockerfile.spark
-    image: pyspark_stack-spark:4.0.3
+    image: pyspark_stack-spark:4.2.0
     container_name: spark-master
     entrypoint: ["/opt/spark/bin/spark-class"]
     command: ["org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
@@ -106,12 +147,20 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.spark
-    image: pyspark_stack-spark:4.0.3
+    image: pyspark_stack-spark:4.2.0
     container_name: spark-worker
     depends_on:
       - spark-master
     entrypoint: ["/opt/spark/bin/spark-class"]
-    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    # No anunciar todos los cores del portatil: cada task PySpark crea procesos
+    # Python. Cuatro cores y 3 GiB mantienen estable este laboratorio.
+    command:
+      - org.apache.spark.deploy.worker.Worker
+      - --cores
+      - ${SPARK_WORKER_CORES:-4}
+      - --memory
+      - ${SPARK_WORKER_MEMORY:-3g}
+      - spark://spark-master:7077
     volumes:
       - ./spark-apps:/opt/spark-apps
     networks:
@@ -127,7 +176,7 @@ services:
 #    build:
 #      context: .
 #      dockerfile: Dockerfile.history
-#    image: pyspark_stack-spark-history:4.0.3
+#    image: pyspark_stack-spark-history:4.2.0
 #    container_name: spark-history
 #    entrypoint: ["/opt/spark/bin/spark-class"]
 #    command: ["org.apache.spark.deploy.history.HistoryServer"]
@@ -141,13 +190,13 @@ services:
 #    networks:
 #      - hadoopnet
 
-  # Jupyter con pyspark 4.0.3 (mismo Spark que el cluster). Se construye desde Dockerfile.jupyter
-  # (base apache/spark:4.0.3) porque jupyter/pyspark-notebook solo ofrece hasta Spark 3.5.
+  # Jupyter con pyspark 4.2.0 (mismo Spark que el cluster). Se construye desde Dockerfile.jupyter
+  # (base apache/spark:4.2.0) porque jupyter/pyspark-notebook solo ofrece hasta Spark 3.5.
   jupyter:
     build:
       context: .
       dockerfile: Dockerfile.jupyter
-    image: pyspark_stack-jupyter:4.0.3
+    image: pyspark_stack-jupyter:4.2.0
     container_name: jupyter-notebook
     # Jupyter es herramienta de DESARROLLO (explorar/depurar antes de promover a DAG).
     # En prod el ETL corre por Airflow y los .ipynb por papermill (headless, sin este server),
@@ -159,7 +208,6 @@ services:
       - "127.0.0.1:4055:4040"
     volumes:
       - ./notebooks:/opt/notebooks
-      - ./tests:/opt/tests:ro
       - ./spark-apps:/opt/spark-apps
       - ./spark-events:/tmp/spark-events
     depends_on:
@@ -169,16 +217,16 @@ services:
     environment:
       # Notebook driver -> conecta al master standalone y a HDFS.
       - SPARK_MASTER=spark://spark-master:7077
-      # python3.12 explicito: 'python3' en esta base (Ubuntu 22.04) es 3.10 y pisaria el ENV
-      # del Dockerfile -> [PYTHON_VERSION_MISMATCH] contra los executors (3.12) del cluster.
-      - PYSPARK_PYTHON=python3.12
-      - PYSPARK_DRIVER_PYTHON=python3.12
+      # python3.14 explicito: 'python3' en esta base (Ubuntu 22.04) es 3.10 y pisaria el ENV
+      # del Dockerfile -> [PYTHON_VERSION_MISMATCH] contra los executors (3.14) del cluster.
+      - PYSPARK_PYTHON=python3.14
+      - PYSPARK_DRIVER_PYTHON=python3.14
       # Sin esta línea el token del .env nunca llega al contenedor: compose usa el .env para
       # sustituir en el YAML, no lo inyecta en el proceso. Dockerfile.jupyter lo lee como
       # --ServerApp.token="${JUPYTER_TOKEN:-}" y, vacío, levanta JupyterLab SIN token.
       - JUPYTER_TOKEN=${JUPYTER_TOKEN:?define JUPYTER_TOKEN en .env}
     healthcheck:
-      test: ["CMD", "python3.12", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/api', timeout=5)"]
+      test: ["CMD", "python3.14", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/api', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -211,6 +259,8 @@ services:
     depends_on:
       airflow-db:
         condition: service_healthy
+      hdfs-init:
+        condition: service_completed_successfully
     command: >
       bash -c "
         airflow db migrate &&
@@ -280,8 +330,8 @@ services:
       AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES: ${AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES:-15}
     volumes:
       - airflow_logs:/opt/airflow/logs
-      - ./scripts/prune-airflow-logs.sh:/opt/pyspark-stack/scripts/prune-airflow-logs.sh:ro
-    command: ["bash", "/opt/pyspark-stack/scripts/prune-airflow-logs.sh"]
+      - ./ops/airflow_log_retention.sh:/opt/pyspark-stack/ops/airflow_log_retention.sh:ro
+    command: ["bash", "/opt/pyspark-stack/ops/airflow_log_retention.sh"]
     depends_on:
       airflow-init:
         condition: service_completed_successfully

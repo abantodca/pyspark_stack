@@ -15,13 +15,82 @@
 > [02](02-produccion-aws-terraform.md) y [03](03-arquitectura.md).
 >
 > **Qué implica en la práctica**: un job que dependa de rutas `hdfs://` escritas a
-> mano funciona acá y falla allá. Parametrizá la URI base desde el principio (el
-> ejemplo 13 de [04](04-ejemplos-locales.md) muestra cómo).
+> mano funciona acá y falla allá. Parametrizá la URI base desde el principio; el
+> contrato local está en [04 — DataOps local](04-dataops-local.md).
 
 > **En este documento: LEER (~40 min) y EJECUTAR el endurecimiento de la sección 8.**
 > **Salís con**: entender por qué cada servicio está donde está —no solo cómo
 > levantarlo—, y con el stack endurecido lo suficiente para que sea un laboratorio y
 > no una máquina abierta.
+
+## Cómo ejecutar esta guía (contrato de copy-paste)
+
+### Antes de empezar
+
+Necesitás Docker Engine con Compose v2, `task` y al menos **20 GiB de RAM disponibles para Docker**.
+El stack completo tiene límites de memoria que suman aproximadamente 18.25 GiB; con menos memoria, Docker puede
+detener servicios. Reservá también espacio libre para imágenes, volúmenes y logs.
+
+**EJECUTAR** desde la raíz del proyecto (la carpeta que contiene `docker-compose.yml`) para comprobar las herramientas:
+
+```bash
+docker --version
+docker compose version
+task --version
+```
+
+Si alguno de los tres comandos falla, instalá esa herramienta antes de continuar. No ejecutes todavía
+`docker compose up`: primero necesitás crear `.env` en §8.1.
+
+Los apartados 1–7 explican archivos que **ya existen** en el repositorio: no copies sus
+fragmentos YAML al Compose ni crees archivos a partir de ellos. Los pasos ejecutables están en
+§8 y §9 y usan siempre la raíz del repositorio como directorio de trabajo:
+la carpeta que contiene `docker-compose.yml` y `Taskfile.yml`.
+
+Cada instrucción que modifica algo indica una de estas acciones:
+
+| Marca | Acción exacta |
+|---|---|
+| **CREAR** | Creá el archivo en la ruta indicada. Si ya existe, no ejecutes el bloque: seguí la instrucción de editar. |
+| **REEMPLAZAR** | Sustituí el contenido completo del archivo indicado. Es una operación destructiva y se señala antes. |
+| **EDITAR** | Abrí el archivo existente en la ruta indicada y cambiá solo la línea o bloque citado. No pegues el fragmento al final. |
+| **EJECUTAR** | Pegá el bloque en una terminal ubicada en la raíz del proyecto; no crea ni edita archivos salvo que el texto lo diga. |
+
+Antes de cada bloque, verificá dónde estás:
+
+```bash
+pwd                         # debe terminar en /pyspark_stack
+test -f docker-compose.yml  # debe imprimir nada y devolver éxito
+```
+
+No uses los bloques YAML de las secciones 2–7 como archivos completos: son recortes para explicar
+el Compose que ya está versionado. La única configuración local que debés crear manualmente es
+`.env` en la raíz; `docker-compose.local-hardened.yml` ya existe y no se copia ni se edita en el
+camino normal.
+
+### Cómo leer los bloques de la guía
+
+Cada bloque indica su archivo y su tipo. La regla es simple:
+
+| Si dice | Significa |
+|---|---|
+| **Configuración Compose** | Es un recorte de `docker-compose.yml` en la raíz. No es código PySpark y no se pega en otro `.yml`. |
+| **Configuración Dockerfile** | Es un recorte de un `Dockerfile` de la raíz. Define cómo se construye una imagen; no se ejecuta en Python. |
+| **Código propio** | Es un `.py` de `dags/` o `spark-apps/`. Ese sí es código del proyecto. |
+| **Comando** | Se ejecuta en una terminal desde la raíz del proyecto. |
+
+En las secciones 2–7 todos los YAML son **Configuración Compose**. Son el mismo archivo
+`docker-compose.yml` en la raíz del proyecto, mostrado por partes para poder leerlo.
+
+### Ruta corta para usar el stack
+
+Si tu objetivo es usarlo hoy y no estudiar cada servicio, seguí solo este orden:
+
+1. Creá y completá `.env` en [§8.1](#81-secretos-en-un-env).
+2. Ejecutá [§9.1](#91-arrancar) para levantarlo y [§9.1.1](#911-gate-confirmar-que-el-stack-completo-está-listo) para validarlo.
+3. Abrí una URL de [§9.2](#92-urls). Para apagarlo sin perder datos, usá [§9.4](#94-bajar).
+
+Las secciones 1–7 quedan como referencia para entender o diagnosticar el stack.
 
 **Qué hacés en cada sección:**
 
@@ -30,13 +99,13 @@
 | **1–2** | **Leer** (~10 min) | El mapa de los 4 subsistemas y el patrón de anclas YAML que evita repetir configuración |
 | **3–6** | **Leer** (~20 min) | Un subsistema por sección: HDFS, Spark, Jupyter, Airflow. Se leen en orden: cada uno asume el anterior |
 | **7** | **Leer** (~5 min) | Red, volúmenes y orden de arranque — por qué `depends_on` no alcanza |
-| **8** | **Ejecutar** (~20 min) | Endurecimiento: secretos, límites, healthchecks, `docker.sock`. Es lo único que cambia archivos |
-| **9** | **Consultar** | El checklist de calidad, para verificar antes de pasar a producción |
+| **8** | **Ejecutar** (~20 min) | Creás `.env` y validás el endurecimiento que ya está versionado |
+| **9** | **Ejecutar** (~5 min) | Arrancás, verificás, accedés y bajás el stack |
 
 > [!TIP]
 > **Si lo que querés es *usar* el stack, no entenderlo**, este no es el documento:
-> andá a [04 — Ejemplos locales](04-ejemplos-locales.md), que arranca con levantar,
-> verificar, apagar y reanudar. Volvé acá cuando algo no haga lo que esperabas.
+> andá a [04 — DataOps local](04-dataops-local.md), que resume cómo levantar y probar
+> los quince pipelines medallion. Volvé acá cuando algo no haga lo que esperabas.
 
 ## Índice
 
@@ -64,25 +133,26 @@ El Compose levanta cuatro subsistemas en una sola red de Docker (`hadoopnet`):
 | Subsistema | Servicios | Rol |
 |---|---|---|
 | Almacenamiento | `hdfs-namenode`, `hdfs-datanode` | Sistema de archivos distribuido |
-| Cómputo | `spark-master`, `spark-worker` | Cluster Spark 4.0.3 standalone |
+| Cómputo | `spark-master`, `spark-worker` | Cluster Spark 4.2.0 standalone |
 | Interactivo | `jupyter` | Driver PySpark para trabajo exploratorio |
-| Orquestación | `airflow-*` (5) + `airflow-db` | Airflow 3.2.2 + Postgres 16 |
+| Orquestación | `airflow-*` (6) + `airflow-db` | Airflow 3.2.2 + Postgres 16 |
 
 **Los comandos del día a día están en el `Taskfile.yml` de la raíz**, versionado, para que sean los
-mismos en tu máquina y en el CI. Estas son las tasks locales; el archivo ya incluye también las de
-producción, cuyo orden explica la [guía 02 §3.0b](02-produccion-aws-terraform.md#30b-el-orquestador-de-comandos-taskfileyml):
+mismos en tu máquina y en el CI. Este checkout expone únicamente tasks locales; los comandos AWS de
+la guía 02 son referencia y requieren los artefactos de producción que no están en este árbol:
 
 | Task | Qué hace |
 |---|---|
 | `task local:check` | Valida secretos, permisos y el Compose efectivo sin arrancar servicios |
 | `task local:up` | Valida y levanta los cuatro subsistemas con el override endurecido |
+| `task local:smoke` | Ejecuta Web Events end-to-end y exige evidencias en las cinco capas HDFS |
 | `task local:down` | Baja el stack **conservando** los volúmenes (los datos de HDFS y Postgres siguen ahí) |
-| `task test` | Pruebas reproducibles de DAGs, contratos y transformaciones dentro de la imagen Airflow |
-| `task doc:check` | Los dos validadores de la documentación — no tocan AWS |
+| `task local:credentials` | Muestra los accesos locales de Airflow y la URL con token de Jupyter |
+| `task local:urls` | Lista las URLs locales y marca qué servicio está arriba |
 | `task --list` | El catálogo completo, incluidas las tasks de producción de la [guía 02](02-produccion-aws-terraform.md) |
 
-No son obligatorias: cada bloque de esta guía muestra el comando `docker compose` completo, porque
-lo que se explica acá es el Compose, no el atajo. El Taskfile es para después, cuando ya lo conocés.
+No son obligatorias: cuando la guía invoca Compose directamente muestra los dos archivos que lo
+componen. El Taskfile es un atajo versionado para el uso diario, una vez que ya conocés el stack.
 
 Regla base: dentro de una red de Compose, el nombre del servicio **es** el hostname DNS. Por eso
 `spark://spark-master:7077` y `hdfs://hdfs-namenode:9000` resuelven solos. Nunca uses `localhost`
@@ -112,6 +182,10 @@ entre contenedores: dentro de un contenedor, `localhost` es ese mismo contenedor
 Es la sección que hace legible todo lo que viene después: si no reconocés `&anchor` y
 `<<: *anchor`, los bloques de las secciones 3–6 van a parecer incompletos.
 
+**Archivo:** `docker-compose.yml`
+**Tipo:** configuración Compose compartida; no es un servicio ni código propio.
+**Acción:** solo leer.
+
 ```yaml
 x-airflow-common: &airflow-common
   image: pyspark_stack-airflow:3.2.2
@@ -130,12 +204,12 @@ x-airflow-common: &airflow-common
 - `&airflow-common` — define un ancla YAML: «guardá este bloque».
 - `<<: *airflow-common` — el *merge* en cada servicio: «pegá acá el bloque anclado».
 
-Airflow 3 partió el monolito en cinco procesos que comparten imagen, entorno y volúmenes. Sin este
-patrón habría cinco copias idénticas de unas 40 líneas.
+Los cuatro procesos persistentes de Airflow y el inicializador comparten imagen, entorno y
+volúmenes. Sin este patrón habría cinco copias idénticas de unas 40 líneas.
 
 **Por qué `image:` y `build:` juntos:** con ambos, Compose construye la imagen una vez y le asigna
-ese tag; los cinco servicios `airflow-*` la reutilizan. Sin el `image:` explícito, cada servicio
-podría construir la suya: cinco imágenes duplicadas de unos 7 GB, y el riesgo de que un `up` agarre
+ese tag; los cinco servicios principales de Airflow la reutilizan. Sin el `image:` explícito, cada
+servicio podría construir la suya: cinco imágenes duplicadas de unos 7 GB, y el riesgo de que un `up` agarre
 una imagen vieja.
 
 Variables de entorno clave:
@@ -152,6 +226,10 @@ Variables de entorno clave:
 
 Volúmenes compartidos:
 
+**Archivo:** `docker-compose.yml`, dentro de `x-airflow-common`.
+**Tipo:** configuración Compose; los directorios de la izquierda (`./dags` y
+`./spark-apps`) sí contienen código propio, pero estas líneas solo los montan dentro de Airflow.
+
 ```yaml
   volumes:
     - ./dags:/opt/airflow/dags
@@ -160,7 +238,7 @@ Volúmenes compartidos:
 ```
 
 > El stack **no** monta `docker.sock`: ningún DAG usa `DockerOperator`. Montarlo daría control del
-> host a los cinco procesos de Airflow que heredan este ancla (§8.4).
+> host a los servicios de Airflow que heredan este ancla (§8.4).
 
 ---
 
@@ -173,20 +251,24 @@ Volúmenes compartidos:
 > [!NOTE]
 > **HDFS es solo local.** En producción no existe: el storage es S3 (`s3a://`). Está
 > acá para que puedas practicar el modelo de archivos distribuido sin pagar nada, no
-> porque sea el destino. Los ejemplos que lo usan lo dicen explícitamente
-> ([04 — ejemplo 6](04-ejemplos-locales.md)).
+> porque sea el destino. El layout obligatorio se documenta en
+> [04 — DataOps local](04-dataops-local.md#contrato-obligatorio-de-almacenamiento-hdfs).
+
+**Archivo:** `docker-compose.yml`, servicios `hdfs-namenode` y `hdfs-datanode`.
+**Tipo:** configuración Compose; no es código HDFS ni hay que crear un segundo YAML.
+**Acción:** solo leer.
 
 ```yaml
   hdfs-namenode:
-    image: chandravenkat/hadoop-namenode@sha256:51ad92...   # el "índice" (metadatos)
+    image: chandravenkat/hadoop-namenode@sha256:51ad92...
     environment:
       - CLUSTER_NAME=hadoop-cluster
       - CORE_CONF_fs_defaultFS=hdfs://hdfs-namenode:9000
-    ports: ["9870:9870"]                                    # UI web de HDFS
+    ports: ["127.0.0.1:9870:9870"]
     volumes: [hdfs-nn-data:/hadoop/dfs/name, ./spark-apps:/opt/spark-apps]
 
   hdfs-datanode:
-    image: chandravenkat/hadoop-datanode@sha256:ddf6e9...   # guarda los bloques reales
+    image: chandravenkat/hadoop-datanode@sha256:ddf6e9...
     depends_on: [hdfs-namenode]
     environment:
       - CORE_CONF_fs_defaultFS=hdfs://hdfs-namenode:9000
@@ -216,19 +298,24 @@ Volúmenes compartidos:
 > **En producción este cluster no existe**: el cómputo se delega a EMR Serverless
 > ([02 §6.4](02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless)). Lo que **sí** viaja
 > es tu código: la lógica de transformación es la misma y por eso conviene mantenerla
-> sin I/O acoplado (ejemplo 20 de [04](04-ejemplos-locales.md)).
+> desacoplada del I/O mediante el runtime compartido.
+
+**Archivo:** `docker-compose.yml`, servicios `spark-master` y `spark-worker`.
+**Tipo:** configuración Compose; inicia procesos de Spark, no contiene una transformación PySpark.
+**Acción:** solo leer.
 
 ```yaml
   spark-master:
     build: { context: ., dockerfile: Dockerfile.spark }
-    image: pyspark_stack-spark:4.0.3
+    image: pyspark_stack-spark:4.2.0
     entrypoint: ["/opt/spark/bin/spark-class"]
     command: ["org.apache.spark.deploy.master.Master",
               "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
-    ports: ["7077:7077", "8081:8080"]
+    ports: ["127.0.0.1:7077:7077", "127.0.0.1:8081:8080"]
 
   spark-worker:
-    image: pyspark_stack-spark:4.0.3
+    build: { context: ., dockerfile: Dockerfile.spark }
+    image: pyspark_stack-spark:4.2.0
     depends_on: [spark-master]
     entrypoint: ["/opt/spark/bin/spark-class"]
     command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
@@ -244,9 +331,16 @@ contenedor (PID 1 terminado → `Exited(0)`). La solución es arrancar la clase 
   encuentren; debe coincidir con el nombre del servicio.
 - `8081:8080`: la UI del master corre en el `8080` interno y se publica en `8081` para evitar
   colisiones con otras herramientas; Airflow se publica por separado en el host `8082`.
-- `Dockerfile.spark` instala Python 3.12 (la base trae 3.10) y fija `PYSPARK_PYTHON=python3.12`: los
+- `Dockerfile.spark` instala Python 3.14 (la base trae 3.10) y fija `PYSPARK_PYTHON=python3.14`: los
   executors deben correr el mismo minor de Python que el driver o Spark aborta con
   `[PYTHON_VERSION_MISMATCH]`.
+- El worker anuncia por defecto 4 cores y 3 GiB para no crear un proceso Python por cada core del
+  portátil. `SPARK_WORKER_CORES` y `SPARK_WORKER_MEMORY` permiten ampliar esa capacidad desde
+  `.env` sin modificar el Compose.
+
+**Archivo relacionado:** `Dockerfile.spark`.
+**Tipo:** configuración Docker propia. Define la imagen `pyspark_stack-spark:4.2.0`; no es un job
+de Spark ni se ejecuta con `spark-submit`.
 
 > `spark-history-server` está comentado en el Compose. Descomentarlo da la UI de jobs terminados
 > leyendo `./spark-events` (§8.5).
@@ -266,12 +360,16 @@ contenedor (PID 1 terminado → `Exited(0)`). La solución es arrancar la clase 
 > producción ([02 §14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)) no lo
 > incluye.
 
+**Archivo:** `docker-compose.yml`, servicio `jupyter`.
+**Tipo:** configuración Compose; el contenido que escribas en `./notebooks` sí será código propio.
+**Acción:** solo leer.
+
 ```yaml
   jupyter:
     build: { context: ., dockerfile: Dockerfile.jupyter }
-    image: pyspark_stack-jupyter:4.0.3
+    image: pyspark_stack-jupyter:4.2.0
     profiles: ["dev"]                      # solo arranca bajo el perfil dev
-    ports: ["8888:8888", "4055:4040"]
+    ports: ["127.0.0.1:8888:8888", "127.0.0.1:4055:4040"]
     depends_on: [spark-master]
     volumes:
       - ./notebooks:/opt/notebooks
@@ -279,36 +377,38 @@ contenedor (PID 1 terminado → `Exited(0)`). La solución es arrancar la clase 
       - ./spark-events:/tmp/spark-events
     environment:
       - SPARK_MASTER=spark://spark-master:7077
-      - PYSPARK_PYTHON=python3.12
-      - PYSPARK_DRIVER_PYTHON=python3.12
-      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-}
+      - PYSPARK_PYTHON=python3.14
+      - PYSPARK_DRIVER_PYTHON=python3.14
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:?define JUPYTER_TOKEN en .env}
 ```
 
 - **`profiles: ["dev"]`:** Jupyter es una herramienta de desarrollo. Un `docker compose up` pelado no
   lo levanta: hace falta `COMPOSE_PROFILES=dev` en el `.env` (así viene en `.env.example`) o
   `docker compose --profile dev up`.
 
-  > **Es la primera vez que hace falta un `.env`.** Si todavía no lo creaste, alcanza con
-  > `cp .env.example .env` para seguir leyendo: el resto del Compose usa `${VAR:-default}`, así que
-  > el stack levanta igual sin él. Los valores fuertes —y el `JUPYTER_TOKEN` de acá abajo— se
-  > completan en [§8.1](#81-secretos-en-un-env), que es donde el `.env` local queda cerrado.
-  > A diferencia del `.env` de producción (guía 02 §13.4), este es un solo archivo escrito a mano:
-  > no se genera ni crece por secciones.
-- **`Dockerfile.jupyter` se construye sobre `apache/spark:4.0.3`**, no sobre la clásica
+  > **No crees el `.env` todavía solo para leer esta sección.** La creación completa y verificable
+  > está en [§8.1](#81-secretos-en-un-env). A diferencia del `.env` de producción (guía 02 §13.4),
+  > este es un único archivo local: se crea una vez en la raíz del repositorio y no crece por
+  > secciones.
+- **`Dockerfile.jupyter` se construye sobre `apache/spark:4.2.0`**, no sobre la clásica
   `jupyter/pyspark-notebook`, que solo llega a Spark 3.5. Así el driver corre exactamente el mismo
-  Spark que el cluster; encima se agregan JupyterLab y Python 3.12.
+  Spark que el cluster; encima se agregan JupyterLab y Python 3.14.
 - **`4055:4040`:** la Spark UI del driver vive en el `4040` interno y se publica en `4055` para no
   chocar con otros drivers.
 - **`JUPYTER_TOKEN` explícito:** Compose usa el `.env` para sustituir en el YAML, no lo inyecta en el
   proceso. Sin esta línea el token nunca llega al contenedor y JupyterLab levanta **sin
   autenticación**.
 
+**Archivo relacionado:** `Dockerfile.jupyter`.
+**Tipo:** configuración Docker propia. Construye la imagen de Jupyter; los notebooks reales están
+en `notebooks/` y son los que contienen tu código.
+
 ---
 
 ## 6. Orquestación: Airflow 3
 
 > **En esta sección: LEER, ~10 min.** Es la más densa del documento.
-> **Salís con**: saber qué hace cada uno de los 5 procesos de Airflow 3 y por qué el
+> **Salís con**: saber qué hace cada proceso de Airflow 3 y por qué el
 > monolito `webserver`+`scheduler` de Airflow 2 ya no existe.
 
 Importa más que las otras porque **Airflow es lo único de este Compose que sobrevive
@@ -317,10 +417,15 @@ tal cual a producción**: la EC2 corre estos mismos procesos
 lo que los rodea, no ellos.
 
 Airflow 3 separó el viejo monolito (`webserver` + `scheduler`) en procesos independientes; todos
-heredan de `*airflow-common`:
+heredan de `*airflow-common`.
+
+**Archivo:** `docker-compose.yml`, servicios `airflow-*`.
+**Tipo:** configuración Compose; los DAGs que Airflow lee son código propio dentro de
+`dags/`, pero no aparecen en este bloque.
+**Acción:** solo leer.
 
 ```yaml
-  airflow-init:          # one-shot: migra el esquema y crea el admin, luego termina
+  airflow-init:
     <<: *airflow-common
     depends_on: { airflow-db: { condition: service_healthy } }
     command: >
@@ -330,17 +435,17 @@ heredan de `*airflow-common`:
         (airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} ... ||
          airflow users reset-password --username ${AIRFLOW_ADMIN_USER:-admin} ...)"
 
-  airflow-apiserver:     # UI + API REST (antes 'webserver'); 8080 interno
+  airflow-apiserver:
     <<: *airflow-common
     restart: always
     command: api-server
-    ports: ["8082:8080"]
+    ports: ["127.0.0.1:8082:8080"]
     depends_on:
       airflow-init: { condition: service_completed_successfully }
 
-  airflow-scheduler:     { command: scheduler }       # decide qué corre y cuándo
-  airflow-dag-processor: { command: dag-processor }   # parsea los DAGs (nuevo en Airflow 3)
-  airflow-triggerer:     { command: triggerer }       # operadores deferrables
+  airflow-scheduler:     { command: scheduler }
+  airflow-dag-processor: { command: dag-processor }
+  airflow-triggerer:     { command: triggerer }
 ```
 
 | Servicio | Rol | Nota de Airflow 3 |
@@ -358,6 +463,10 @@ Dependencias de arranque:
   (`pg_isready`), no solo a que el contenedor exista.
 - `airflow-init: condition: service_completed_successfully` → los procesos long-running esperan a que
   la migración termine bien. Evita el clásico «la tabla no existe».
+
+**Archivo:** `docker-compose.yml`, servicio `airflow-db`.
+**Tipo:** configuración Compose de Postgres; no es SQL ni código propio.
+**Acción:** solo leer.
 
 ```yaml
   airflow-db:
@@ -390,6 +499,10 @@ sabe que el contenedor arrancó, no que la base acepta conexiones.
 > contra un Postgres que todavía no acepta conexiones, fallar, y dejarte un error que
 > no menciona a Postgres por ningún lado. Es exactamente lo que resuelve la
 > sección 8.2.
+
+**Archivo:** `docker-compose.yml`, secciones finales `volumes` y `networks`.
+**Tipo:** configuración Compose global; no se agrega dentro de un servicio.
+**Acción:** solo leer.
 
 ```yaml
 volumes:
@@ -427,7 +540,8 @@ pronto queda esperando executors.
 
 ## 8. Endurecimiento del stack local
 
-> **En esta sección: EJECUTAR, ~20 min.** Es la única que cambia archivos.
+> **En esta sección: EJECUTAR, ~20 min.** Creás el único archivo local no versionado (`.env`);
+> el resto del endurecimiento ya está en archivos versionados.
 > **Salís con**: secretos propios en un `.env` fuera de git, límites de memoria,
 > healthchecks reales, logs persistentes pero acotados y `docker.sock` fuera del stack.
 
@@ -503,8 +617,8 @@ AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES=15
 Una poda inmediata y una comprobación de espacio se pueden ejecutar así:
 
 ```bash
-docker compose run --rm --no-deps airflow-log-cleaner bash /opt/pyspark-stack/scripts/prune-airflow-logs.sh --once
-docker compose exec airflow-log-cleaner du -sh /opt/airflow/logs
+docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml run --rm --no-deps airflow-log-cleaner bash /opt/pyspark-stack/ops/airflow_log_retention.sh --once
+docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml exec airflow-log-cleaner du -sh /opt/airflow/logs
 ```
 
 `docker compose down -v` sí elimina deliberadamente `airflow_logs`, Postgres y HDFS; no lo use
@@ -514,41 +628,74 @@ los contenedores. En producción, la copia durable va a S3 y se elimina del host
 
 ### 8.1 Secretos en un `.env`
 
-El Compose base exige los secretos por interpolación (§8.3); generá un valor distinto para cada
-variable y protegé el archivo:
+**Ubicación:** `.env` (la raíz del repositorio, junto a
+`docker-compose.yml`). **No** va dentro de `docs/`, `dags/` ni `scripts/`.
+
+#### Primera instalación — CREAR `.env`
+
+**Precondición:** no debe existir `.env`. El bloque crea el archivo desde el template, conserva
+los comentarios y deja en blanco únicamente los cuatro valores secretos. Después los completás en
+el mismo archivo; no crees un segundo `.env`.
 
 ```bash
+test ! -e .env || { echo '.env ya existe: usá el procedimiento EDITAR de abajo'; exit 1; }
 cp .env.example .env
 chmod 600 .env
-openssl rand -hex 32      # ejecutar cuatro veces y pegar un valor diferente en cada secreto
 ```
 
+#### Completar secretos — EDITAR `.env`
+
+Abrí **el archivo que acabás de crear** y reemplazá solo el texto vacío después de `=` en estas
+cuatro líneas. Conservá los demás nombres y valores del template. Para cada valor, ejecutá el
+comando indicado en una terminal, copiá su salida y pegala a la derecha del `=`.
+
+| Línea que editás en `.env` | Ejecutá para generar el valor | Resultado esperado |
+|---|---|---|
+| `POSTGRES_PASSWORD=` | `openssl rand -hex 24` | 48 caracteres hexadecimales |
+| `AIRFLOW_JWT_SECRET=` | `openssl rand -hex 32` | 64 caracteres hexadecimales |
+| `AIRFLOW_ADMIN_PASSWORD=` | `openssl rand -hex 24` | 48 caracteres hexadecimales |
+| `JUPYTER_TOKEN=` | `openssl rand -hex 32` | 64 caracteres hexadecimales |
+
+Al terminar, las cuatro líneas tienen este aspecto (los valores mostrados son marcadores: no los
+copies literalmente):
+
 ```dotenv
-COMPOSE_PROFILES=dev                 # "dev" levanta Jupyter; vacío para no levantarlo
-POSTGRES_USER=airflow
-POSTGRES_PASSWORD=<openssl rand -hex 24>
-POSTGRES_DB=airflow
-AIRFLOW_JWT_SECRET=<openssl rand -hex 32>
-AIRFLOW_ADMIN_USER=admin
-AIRFLOW_ADMIN_PASSWORD=<valor fuerte>
-AIRFLOW_LOCAL_LOG_RETENTION_DAYS=30
-AIRFLOW_LOCAL_LOG_MAX_SIZE_MB=1024
-AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES=15
-JUPYTER_TOKEN=<token largo>
+POSTGRES_PASSWORD=<valor-generado-para-postgres>
+AIRFLOW_JWT_SECRET=<valor-generado-para-jwt>
+AIRFLOW_ADMIN_PASSWORD=<valor-generado-para-admin>
+JUPYTER_TOKEN=<valor-generado-para-jupyter>
 ```
+
+#### Si `.env` ya existe — EDITAR, no copiar ni reemplazar
+
+No vuelvas a ejecutar `cp .env.example .env`: sobreescribiría tu configuración local. Abrí
+`.env`, completá solo los valores que estén vacíos y mantené el permiso privado:
+
+```bash
+chmod 600 .env
+task local:check
+```
+
+Si `task local:check` falla, corregí la línea que indique y repetilo. No avances a §8.2 hasta que
+termine correctamente.
 
 ### 8.2 Override de endurecimiento
 
 Usá un override que Compose fusiona para añadir `restart`, healthchecks y límites de memoria. La
 rotación y retención de logs ya están en el Compose base y no se duplican aquí.
 
-El archivo [`docker-compose.local-hardened.yml`](../docker-compose.local-hardened.yml) ya está
-versionado. `task local:up` siempre lo combina con el Compose base:
+**Archivo existente, no editar ni copiar:**
+[`docker-compose.local-hardened.yml`](../docker-compose.local-hardened.yml). Ya está
+versionado y `task local:up` siempre lo combina con el Compose base. En el camino normal de esta
+guía, solo verificás que Docker pueda fusionarlo; no pegues sus servicios dentro de
+`docker-compose.yml`:
 
 ```bash
 task local:check
-task local:up
 ```
+
+**Resultado esperado:** el comando termina con código 0 y no imprime errores de interpolación ni
+de YAML. El arranque viene en §9.1, después de terminar las decisiones opcionales de esta sección.
 
 > Este override endurece el **stack local completo**, útil si querés correrlo así en una sola
 > máquina. No confundir con producción: el Compose de producción de la
@@ -557,8 +704,12 @@ task local:up
 
 ### 8.3 Secretos parametrizados en el Compose base
 
-Ya está aplicado: el Compose usa `${VAR:?mensaje}` para los cuatro secretos. Sin `.env`, o con un
-valor vacío, la expansión falla antes de arrancar.
+**Archivo existente, solo lectura:** `docker-compose.yml`. Ya está aplicado: el
+Compose usa `${VAR:?mensaje}` para los cuatro secretos. No pegues estos fragmentos ni añadas otra
+sección `environment:`; son evidencia de lo que validaste en §8.1. Sin `.env`, o con un valor
+vacío, la expansión falla antes de arrancar.
+
+**Recorte 1:** servicio `airflow-db` del mismo archivo. **Tipo:** configuración Compose.
 
 ```yaml
   airflow-db:
@@ -567,6 +718,8 @@ valor vacío, la expansión falla antes de arrancar.
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
       - POSTGRES_DB=${POSTGRES_DB:-airflow}
 ```
+
+**Recorte 2:** ancla `x-airflow-common` del mismo archivo. **Tipo:** configuración Compose.
 
 ```yaml
 x-airflow-common: &airflow-common
@@ -581,7 +734,10 @@ x-airflow-common: &airflow-common
 
 ### 8.4 Mantener `docker.sock` fuera del stack
 
-El Compose actual no monta el socket, y no conviene agregarlo:
+**No hay acción de archivo.** El Compose actual no monta el socket; verificá que no agregaste esta
+línea en `docker-compose.yml` ni en `docker-compose.local-hardened.yml`:
+
+**Tipo:** ejemplo de configuración prohibida; esta línea no debe existir en ningún archivo.
 
 ```yaml
     - /var/run/docker.sock:/var/run/docker.sock   # no agregar
@@ -592,10 +748,30 @@ con API limitada. No lo heredes en api-server, scheduler, triggerer y dag-proces
 
 ### 8.5 Añadir el history-server (opcional)
 
-Descomentá el bloque `spark-history-server` del Compose y arrancalo: leerá `./spark-events` y dará la
-UI de jobs terminados en `:18080`. Acordate de poner `spark.eventLog.enabled true` en
-`spark-events/spark-defaults.conf` — hoy está en `false` porque sin History Server los event logs
-quedaban huérfanos ([06 §2, incidente #4](referencia/06-historial-de-incidentes.md)).
+Elegí esta opción solo si necesitás consultar jobs de Spark **ya terminados**. Cambia dos archivos
+versionados, por lo que conviene hacerla en una rama y conservar el cambio en Git.
+
+1. **EDITAR** `docker-compose.yml`. Buscá el bloque completo que comienza con
+   `#  spark-history-server:` (cerca del servicio `spark-worker`) y quitá el `#` inicial de **cada
+   una de sus líneas**, hasta antes del comentario `# Jupyter con pyspark`. No pegues un segundo
+   servicio al final del archivo. Dentro de ese bloque, reemplazá la publicación
+   `"18080:18080"` por `"127.0.0.1:18080:18080"` para que la UI quede limitada a tu máquina.
+2. **EDITAR** `spark-events/spark-defaults.conf`. Reemplazá exactamente la línea
+   existente `spark.eventLog.enabled           false` por:
+
+   ```properties
+   spark.eventLog.enabled           true
+   ```
+
+3. **EJECUTAR** desde la raíz del proyecto para reconstruir/arrancar el servicio nuevo:
+
+   ```bash
+   task local:up
+   docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml ps spark-history-server
+   ```
+
+   El servicio queda disponible en <http://localhost:18080>. Si no vas a usar el History Server,
+   dejá ambos archivos como están: los event logs quedarían sin consumidor.
 
 ---
 
@@ -605,21 +781,28 @@ quedaban huérfanos ([06 §2, incidente #4](referencia/06-historial-de-incidente
 > **Salís con**: el stack corriendo, las cuatro UIs abiertas con sus credenciales, y
 > el comando de apagado que conserva tus datos.
 
+**Directorio para todos los comandos de esta sección:** la raíz del proyecto. Esta sección no crea
+ni edita archivos: usa el `.env` que creaste y validaste en §8.1.
+
 ### 9.1 Arrancar
+
+**EJECUTAR:**
 
 ```bash
 task local:check   # valida los cuatro secretos, el chmod 600 y el Compose combinado
-task local:up      # construye lo que falte y levanta los 11 servicios en segundo plano
+task local:up      # construye lo que falte y levanta el stack en segundo plano
 ```
 
 `local:up` depende de `local:check`: si falta el `.env`, un secreto es débil o el archivo no es
 privado, aborta antes de tocar Docker.
 
-La primera vez construye las tres imágenes propias y descarga cerca de 600 MB —los wheels de
-Jupyter y el bundle del AWS SDK, de 532 MB él solo—, así que puede tardar entre 20 y 30 minutos
-según tu conexión. Las corridas siguientes reutilizan la caché y tardan segundos.
+La primera vez construye las tres imágenes propias y descarga las imágenes base, dependencias de
+Python y el bundle del SDK de AWS; puede mover varios GiB y tardar varios minutos según tu conexión.
+Las corridas siguientes reutilizan la caché y suelen ser mucho más rápidas.
 
 Un build largo no muestra nada hasta terminar. Para verlo avanzar en vivo:
+
+**EJECUTAR solo si necesitás ver el progreso del primer build:**
 
 ```bash
 # --progress va ANTES del subcomando: en "up" es una flag desconocida
@@ -628,12 +811,37 @@ docker compose --progress plain -f docker-compose.yml -f docker-compose.local-ha
 
 Verificá el resultado:
 
+**EJECUTAR para verificar el arranque:**
+
 ```bash
-docker compose ps   # los 11 servicios; airflow-init debe figurar Exited (0)
+docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml ps
+# los servicios persistentes; airflow-init y hdfs-init terminan con código 0
 ```
 
 `airflow-init` corre las migraciones y crea el usuario admin: sale con código 0 y no vuelve a
-levantar. Los cinco servicios de Airflow arrancan recién cuando ese init termina.
+levantar. Los cuatro procesos persistentes de Airflow y el servicio de retención de logs arrancan
+recién cuando ese init termina.
+
+### 9.1.1 Gate: confirmar que el stack completo está listo
+
+No abras Jupyter ni ejecutes un ejemplo todavía. Con `COMPOSE_PROFILES=dev` (el valor del template),
+**EJECUTAR** estos cuatro comandos, en este orden; cada uno debe terminar sin error:
+
+```bash
+docker exec spark-master curl -fsS http://localhost:8080 >/dev/null
+docker exec hdfs-namenode hdfs dfs -ls /
+docker exec airflow-scheduler airflow dags list
+docker exec jupyter-notebook python3.14 -c 'import os; from pyspark.sql import SparkSession; spark = SparkSession.builder.master(os.environ["SPARK_MASTER"]).getOrCreate(); print(spark.range(1).count()); spark.stop()'
+```
+
+El último comando crea un trabajo mínimo: confirma que Jupyter llega al master y que Spark tiene un
+worker disponible. Si dejaste `COMPOSE_PROFILES` vacío, Jupyter no arranca por diseño: omití ese
+cuarto comando y no uses su URL.
+
+Si los comandos que correspondan terminan correctamente, están listos Spark, HDFS, Airflow y Jupyter.
+Después ejecutá `task local:smoke`, descrito en [04 — DataOps local](04-dataops-local.md#operación-local).
+Si uno falla, no ejecutes los pipelines: revisá `docker compose -f docker-compose.yml -f
+docker-compose.local-hardened.yml ps` y resolvé ese servicio primero.
 
 ### 9.2 URLs
 
@@ -653,19 +861,23 @@ resto en contestar después de figurar `Up`.
 
 ### 9.3 Credenciales
 
-Viven en el `.env`, que está fuera de git (§8.1). Leelas de ahí en vez de copiarlas a ningún lado:
+Viven en el `.env`, que está fuera de git (§8.1). Para mostrarlas cuando las necesites, ejecutá:
 
 ```bash
-grep -E '^(AIRFLOW_ADMIN_USER|AIRFLOW_ADMIN_PASSWORD)=' .env   # login de Airflow
+task local:credentials
 ```
 
-Para Jupyter conviene armar la URL con el token ya incluido y saltear la pantalla de login:
+La tarea imprime el usuario y contraseña de Airflow, y la URL de Jupyter con su token. No compartas
+su salida ni la pegues en tickets, chats o capturas.
+
+Si necesitás leer los valores directamente desde `.env`:
 
 ```bash
+grep -E '^(AIRFLOW_ADMIN_USER|AIRFLOW_ADMIN_PASSWORD)=' .env
 echo "http://localhost:8888/?token=$(grep '^JUPYTER_TOKEN=' .env | cut -d= -f2)"
 ```
 
-Los tres DAGs se cargan **pausados**, que es el default de Airflow: hay que activarlos desde la UI
+Los veinte DAGs se cargan **pausados**, que es el default de Airflow: hay que activarlos desde la UI
 para que corran.
 
 ### 9.4 Bajar
@@ -706,5 +918,6 @@ DAGs, su historial y los datos en HDFS.
 - [x] Imágenes base externas pineadas por versión y `@sha256`.
 - [ ] Backup de los volúmenes de Postgres y del namenode de HDFS.
 
-> **Siguiente paso:** [02 — Producción en AWS](02-produccion-aws-terraform.md) para el despliegue
-> completo, o [03 — Arquitectura](03-arquitectura.md) para el mapa conceptual.
+> **Siguiente paso:** [03 — Arquitectura](03-arquitectura.md) para el mapa conceptual. La guía
+> [02 — Producción en AWS](02-produccion-aws-terraform.md) es arquitectura objetivo y no un
+> despliegue ejecutable desde este checkout.

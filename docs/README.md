@@ -18,7 +18,7 @@ repetible. Lo marcado como **roadmap** no forma parte todavía del runbook de pr
 
 ### Cómo está ordenada la carpeta
 
-Arriba quedan **solo los cuatro documentos que se leen de punta a punta**. Lo que se
+Arriba quedan **solo los cinco documentos que se leen de punta a punta**. Lo que se
 consulta —el material de referencia— vive un nivel adentro, para que abrir `docs/`
 muestre el camino y no el inventario.
 
@@ -27,30 +27,22 @@ docs/
 ├── 01-stack-local.md                  desarrollo local
 ├── 02-produccion-aws-terraform.md     producción en AWS: la guía completa
 ├── 03-arquitectura.md                 el porqué
-├── 04-ejemplos-locales.md             tutorial
+├── 04-dataops-local.md                proyectos medallion y operación local
+├── 05-hdfs-desde-la-terminal.md       operar el lakehouse a mano, sin tasks
 ├── adr/                               decisiones estructurales, con sus alternativas descartadas
-└── referencia/                        consulta: readiness, incidentes, secuencia y gobierno
+└── README.md                          este índice
 ```
 
 | Documento | Propósito | Estado |
 |---|---|---|
 | [01 — Stack local](01-stack-local.md) | Anatomía del Compose y de los contenedores | Implementado |
-| [02 — Producción con Terraform](02-produccion-aws-terraform.md) | Arquitectura objetivo y runbook IaC, §1–§22 en un solo documento | Guía completa; sin desplegar |
+| [02 — Producción con Terraform](02-produccion-aws-terraform.md) | Arquitectura objetivo y runbook IaC, §1–§22 en un solo documento | Referencia; artefactos no presentes |
 | [03 — Arquitectura](03-arquitectura.md) | Vista lógica, seguridad y evolución | Implementado + roadmap |
-| [04 — Ejemplos locales](04-ejemplos-locales.md) | Tutorial progresivo de 21 ejercicios | Implementado |
+| [04 — DataOps local](04-dataops-local.md) | Operación de 15 pipelines medallion | Implementado |
+| [05 — HDFS desde la terminal](05-hdfs-desde-la-terminal.md) | Ver, buscar, subir, consultar y exportar data del lakehouse con los comandos crudos | Implementado; comandos verificados contra el stack |
 
 Las decisiones que no se rediscuten mientras seguís las guías están en
 [`adr/`](adr/README.md) — ocho ADR con su contexto, sus consecuencias y lo que se descartó.
-
-Y en [`referencia/`](referencia), lo que se abre cuando hace falta:
-
-| Documento | Propósito | Estado |
-|---|---|---|
-| [02b — Producción por consola](referencia/02b-produccion-aws-consola.md) | El mismo camino, sin IaC | Referencia; sin desplegar |
-| [05 — Production readiness](referencia/05-production-readiness.md) | Controles previos al primer despliegue | Implementado |
-| [06 — Historial de incidentes](referencia/06-historial-de-incidentes.md) | Fallos del stack local y sus fixes | Histórico |
-| [07 — Secuencia de ejecución](referencia/07-secuencia-de-ejecucion.md) | Dependencias entre comandos y lectura DevOps de la guía 02 | Análisis |
-| [08 — Gobierno y operaciones](referencia/08-gobierno-operaciones-datos.md) | Ownership, contratos, calidad, SLO, incidentes y gate de datos reales | Estándar; owners por designar |
 
 ### Cómo está organizada la guía 02
 
@@ -58,9 +50,9 @@ Es **un solo documento** con numeración continua de §1 a §22, en el orden en 
 construye la plataforma: cada sección usa lo que dejó la anterior. Se recorre en seis
 tramos, y el [índice](02-produccion-aws-terraform.md#índice) enlaza sección por sección.
 
-La infraestructura objetivo se escribe como **composición Terraform**. En el repositorio sólo están
-materializados `network` y `orchestrator`; los demás módulos siguen siendo contenido de la guía. El
-uso de `-target` es andamio de construcción: toda promoción exige un plan completo posterior.
+La infraestructura objetivo se describe como **composición Terraform**, pero este checkout no
+incluye `infra/` ni los scripts o Compose de producción. La guía 02 es una referencia de diseño:
+no es un runbook ejecutable ni debe promoverse desde este árbol.
 
 | Tramo | Secciones | Qué resuelve |
 |---|---|---|
@@ -81,26 +73,25 @@ flowchart TD
 
     Q --> L{"Aprender / desarrollar<br/>en mi máquina"}
     L --> L1["01 · Stack local<br/><i>cómo está armado el Compose</i>"]
-    L1 --> L2["04 · Ejemplos locales<br/><i>21 ejercicios, de un DataFrame a pytest</i>"]
+    L1 --> L2["04 · DataOps local<br/><i>los 20 proyectos y cómo se operan</i>"]
+    L2 --> L3["05 · HDFS desde la terminal<br/><i>subir, buscar y sacar TU data</i>"]
 
     Q --> P{"Desplegar en AWS"}
     P --> P0["03 · Arquitectura<br/><i>el porqué, antes del cómo</i>"]
     P0 --> P1["02 · Producción con Terraform<br/><i>el camino principal</i>"]
-    P1 --> P2["05 · Production readiness<br/><i>el gate antes del primer apply</i>"]
-    P1 -.->|"para ver qué crea cada bloque"| P3["02b · Producción por consola"]
 
     Q --> O{"Operar / diagnosticar<br/>algo que ya corre"}
     O --> O1["02 · Operación y diagnóstico<br/><i>sección 8, con el catálogo de 8.6</i>"]
 
     Q --> H{"Entender por qué<br/>algo está así"}
     H --> H1["03 · Arquitectura"]
-    H --> H2["06 · Historial de incidentes<br/><i>los fallos reales y sus fixes</i>"]
+    H --> H2["adr/<br/><i>las ocho decisiones y lo descartado</i>"]
 
     style P1 fill:#d1ecf1,stroke:#0c5460
     style L1 fill:#d1ecf1,stroke:#0c5460
 ```
 
-**El orden que sí importa**: 01 → 04 → 03 → 02 → 05. El stack local es el
+**El orden que sí importa**: 01 → 04 → 05 → 03 → 02. El stack local es el
 prerrequisito real del de producción —se desarrolla acá y se despliega allá—, y la
 guía 02 arranca con un gate explícito que lo verifica. Saltar directo a 02 sin un DAG
 que corra en local funciona hasta el primer error, y ahí se paga en minutos de EMR lo
@@ -126,16 +117,14 @@ Terraform, va `terraform import` antes del siguiente `apply`.
 
 ## Qué contiene el repositorio
 
-El repositorio versiona el proyecto local y una base Terraform **parcial**. Que un bloque figure en
-la guía no significa que exista, esté desplegado o haya pasado una prueba integrada en AWS.
+El repositorio versiona el proyecto local. Que un bloque figure en la guía de producción no
+significa que exista, esté desplegado o haya pasado una prueba integrada en AWS.
 
 | Capacidad | Dónde vive |
 |---|---|
 | Spark, HDFS, Jupyter y Airflow en local | Repositorio — implementado |
-| Contexto de producción en variables de entorno (`scripts/prod-env.sh`) | Repositorio — implementado; contrato en guía 02 §3.1 |
-| Orquestador de comandos (`Taskfile.yml`) | Repositorio — implementación completa; guía 02 explica su crecimiento por etapas |
-| Terraform de red y EC2/orquestador | Repositorio — parcial, validación estática |
-| Terraform de S3, EMR Serverless y automatización | Guía 02 §4–§7 — no materializado |
+| Orquestador de comandos (`Taskfile.yml`) | Repositorio — implementación completa para local |
+| Terraform de red, EC2, S3, EMR Serverless y automatización | Arquitectura objetivo — no materializado |
 | DAG de Airflow contra EMR Serverless | Guía 02 §9.4 |
 | Jobs Spark para EMR Serverless | Guía 02 §6.4 |
 | Compose de producción y carga de secretos desde SSM | Guía 02 §13.4 y §14.1 |
@@ -143,7 +132,6 @@ la guía no significa que exista, esté desplegado o haya pasado una prueba inte
 | Observabilidad Prometheus/Grafana/Loki | Guía 02 §12 y §14.2 — roadmap |
 | Tablas Iceberg | Guía 02 §16 — roadmap; el job de referencia escribe Parquet |
 | dbt, Great Expectations y OpenLineage | Guía 02 §19–§22 — roadmap |
-| Gobierno, ownership, SLO y gate de datos reales | Referencia 08 — estándar; responsables pendientes |
 
 ## Regla de mantenimiento
 
@@ -151,36 +139,6 @@ Los comandos, políticas y configuraciones ejecutables viven en sus archivos can
 documentación explica decisiones y enlaza esos archivos; no mantiene una segunda copia que pueda
 divergir. Cada cambio de arquitectura debe actualizar esta matriz.
 
-Los comandos de las guías **no llevan valores escritos a mano**: leen variables de entorno que
-produce Terraform (contrato en la [guía 02 §3.1](02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando)).
-Dos validadores lo mantienen sano y corren sin credenciales AWS:
-
-```bash
-task doc:check                        # los dos, y es lo que corre el CI
-```
-
-```bash
-python3 scripts/check-doc-links.py    # enlaces, anclas y referencias §
-python3 scripts/check-doc-env.py      # contrato de variables y bloques de comandos
-```
-
-`check-doc-links.py` comprueba que los enlaces relativos apunten a archivos que existen, que las
-anclas `#seccion` correspondan a un encabezado real (con las reglas de slug de GitHub) y que cada
-`§X.Y` exista — sea local o cruzada (`guía 02 §13.4`, `docs/01 §8.5`). Las guías se renumeran al
-editarlas y una referencia rota es invisible leyendo de corrido.
-
-`check-doc-env.py` verifica que ninguna variable se use antes de la sección que la crea (las guías
-son incrementales), que todo `$VAR` exista como output o venga de `prod-env.sh`, que los bloques
-` ``` ` estén balanceados, que cada bloque bash parsee con `bash -n`, que ningún comando lleve un
-nombre de recurso, un account id o una ruta SSH escritos a mano, que `prod-env.sh` no vuelva a
-pegarse dentro de la guía (es un archivo versionado: se enlaza) y que cada task del bloque de §11
-esté **literal** en `Taskfile.yml` (ese bloque es la fuente de verdad; el archivo se pega, no se
-reescribe). También limita los pasos visibles a dos comandos y las explicaciones a cuatro líneas.
-Al agregar un recurso, declarás su `output` donde se crea y usás la variable en MAYÚSCULAS.
-
-Los dos leen cada guía **en su orden de secciones**, que es el orden de dependencias: un `output`
-declarado en §5 está disponible para los comandos de §8, pero usarlo al revés sigue siendo un error,
-y el mensaje dice en qué sección aparece recién. Si agregás, movés o renombrás un documento,
-actualizá la lista `GUIDES` de `check-doc-links.py` y `DOC_ORDER` de `check-doc-env.py`: ahí las
-entradas son **rutas relativas a `docs/`** (`referencia/02b-produccion-aws-consola.md`), y ambos
-validadores recorren el árbol completo, subcarpetas incluidas.
+Los comandos locales no llevan valores escritos a mano: leen las variables de `.env` y el Compose
+versionado. La guía 02 conserva su contrato de variables como referencia de diseño, no como
+automatización activa. La documentación se revisa junto con cada cambio de contrato u operación.

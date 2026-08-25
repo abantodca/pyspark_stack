@@ -1,15 +1,15 @@
-# Airflow 3.2.2 (rama 3.2, la mas madura a jul-2026) sobre Python 3.12 + Spark 4.0.3.
-# Stack "lo mas actual manteniendo estabilidad": Python 3.12 obliga a PySpark >= 3.5 (el
-# cloudpickle de PySpark 3.2.1 no serializa lambdas en Python 3.11+). Se usa Spark 4.0.3,
-# que requiere Java 17 -> se instala Temurin (Adoptium) JDK 17 desde tarball (bookworm no
-# trae openjdk-11; y Spark 4 ya no soporta Java 11).
-FROM apache/spark:4.0.3-scala2.13-java17-python3-ubuntu@sha256:7112c0c0ca07b7d2605163ba91a05e53af39ba7cfcf9886e63141ade3f850456 AS spark-runtime
+# Airflow 3.2.2 (rama 3.2, la mas madura a jul-2026) sobre Python 3.14 + Spark 4.2.0.
+# Stack "lo mas actual manteniendo estabilidad": Python 3.14 obliga a PySpark >= 4.1 (4.0.x
+# solo declara soporte hasta 3.13 y su cloudpickle no serializa contra el bytecode de 3.14).
+# Se usa Spark 4.2.0, que requiere Java 17 -> se instala Temurin (Adoptium) JDK 17 desde
+# tarball (bookworm no trae openjdk-11; y Spark 4 ya no soporta Java 11).
+FROM apache/spark:4.2.0-scala2.13-java17-python3-ubuntu@sha256:84a4eedb1abcf36a90808d5a1310e3e910b78c85d85aaa1599e31af5f862ed59 AS spark-runtime
 
-FROM apache/airflow:3.2.2-python3.12@sha256:bbe58e3204d550ab98dbf738a42c0e6663c455357ecd0e2d1440ef9cb6a75f00
+FROM apache/airflow:3.2.2-python3.14@sha256:db1b6917b2460637faa28fda794fa2c419f4618c7a79062f2e863a62cfc1132f
 
 ARG AIRFLOW_VERSION=3.2.2
-ARG PYTHON_VERSION=3.12
-ARG SPARK_VERSION=4.0.3
+ARG PYTHON_VERSION=3.14
+ARG SPARK_VERSION=4.2.0
 # JDK 17 (x86_64). Si cambias de arquitectura, ajusta esta URL de Adoptium.
 ARG TEMURIN_JDK_URL=https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.18%2B8/OpenJDK17U-jdk_x64_linux_hotspot_17.0.18_8.tar.gz
 
@@ -43,5 +43,5 @@ COPY requirements.txt /
 RUN pip install --no-cache-dir -r /requirements.txt \
       --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
 
-# pyspark 4.0.3 SIN constraints: debe casar con el cluster Spark 4.0.3.
-RUN pip install --no-cache-dir 'pyspark[sql]==4.0.3' 'pytest==8.4.2'
+# pyspark 4.2.0 SIN constraints: debe casar con el cluster Spark 4.2.0.
+RUN pip install --no-cache-dir 'pyspark[sql]==4.2.0' 'pytest==8.4.2'

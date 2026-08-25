@@ -1,13 +1,19 @@
-# Producción en AWS para DataOps
+# Producción en AWS para DataOps — arquitectura de referencia
+
+> [!CAUTION]
+> **No ejecutable desde este checkout.** El árbol actual no contiene `infra/`, los scripts de
+> producción, los Compose productivos ni los entrypoints de EMR que esta guía ilustra. Conservá este
+> documento como diseño y referencia de implementación; no ejecutes sus `task`, `terraform`, `aws`
+> ni comandos de despliegue hasta restaurar y validar esos artefactos en una rama de producción.
 
 > [!WARNING]
 > **Laboratorio controlado, no exposición productiva segura** ([ADR-002](adr/ADR-002-plano-de-control-single-node.md)). Airflow, Postgres y monitoreo comparten una EC2.
 > Las UIs usan túnel SSH; §5.6 permite HTTPS únicamente desde la IP `/32` del operador.
-> Para datos reales son obligatorias [§13](#13-hardening-y-secretos), [§18](#18-gobierno-resiliencia-y-costos) y el [estándar de gobierno y operaciones](referencia/08-gobierno-operaciones-datos.md).
+> Para datos reales son obligatorias [§13](#13-hardening-y-secretos), [§18](#18-gobierno-resiliencia-y-costos) y un estándar de gobierno y operaciones formal.
 > No incluye alta disponibilidad: la EC2 sigue siendo un punto único de fallo.
 
 > Este tramo promueve a AWS el **contrato del orquestador** validado en [local](01-stack-local.md).
-> Spark cambia de runtime: local usa 4.0.3 y `emr-7.13.0`, Spark 3.5.6; §6.4 prueba compatibilidad.
+> Spark cambia de runtime: local usa 4.2.0 y `emr-7.13.0`, Spark 3.5.6; §6.4 prueba compatibilidad.
 > Terraform se construye por módulos con state S3 bloqueado y apply incremental.
 > La EC2 se apaga fuera de horario para que el costo siga al uso.
 
@@ -67,7 +73,7 @@ permisos faltantes del rol real.
 1. **Terraform es la fuente de verdad.** Nada a mano en la consola: el próximo `apply`
    revierte el cambio en silencio. Si el recurso ya se creó manualmente, ejecute `terraform import` antes
    del siguiente apply. Los desplegables «🖱️ A mano en la consola AWS» y la
-   [guía 02b](referencia/02b-produccion-aws-consola.md) sirven para entender qué crea
+   camino equivalente por consola (retirado de este checkout) sirve para entender qué crea
    cada bloque, no para mezclar los dos caminos sobre el mismo recurso.
 2. **Los comandos no se editan.** IDs, IPs, cuentas y buckets salen de variables ([§3.1](#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando)).
    Un `<valor>` representa únicamente una decisión humana, como un dominio o job id.
@@ -106,7 +112,7 @@ permisos faltantes del rol real.
 > [!IMPORTANT]
 > **Gate de entrada:** no inicie el Tramo II sin el stack local en estado correcto:
 > `task local:up` sano ([`01-stack-local.md`](01-stack-local.md)), `task test` en verde y una
-> ejecución local completa ([`04-ejemplos-locales.md`](04-ejemplos-locales.md)).
+> ejecución local completa ([`04-dataops-local.md`](04-dataops-local.md)).
 > Diagnosticar un DAG con errores en AWS consume tiempo de EMR y es más lento que hacerlo en Docker.
 
 ## Índice
@@ -788,7 +794,7 @@ state, local**, y por eso no comparte ni el backend ni las tasks `infra:plan`/`i
 > **`apply` sin `plan -out` solo durante la construcción (§4–§7)**: es interactivo, muestra
 > el plan y todavía no hay datos que perder. Con el stack en producción, todo cambio pasa por
 > `plan -out=tfplan` + `apply tfplan` (§15, §21.2), y el
-> [checklist de readiness](referencia/05-production-readiness.md) exige esa evidencia.
+> checklist de readiness externo exige esa evidencia.
 
 <details>
 <summary>🖱️ A mano en la consola AWS — backend del state (S3)</summary>
@@ -2355,7 +2361,7 @@ networks:
 ```
 
 **Paso 0c — `scripts/prod-env.sh`: nada que crear.** Ya está en el repo
-([`../scripts/prod-env.sh`](../scripts/prod-env.sh)) y no se toca en toda la guía: las secciones
+(un cargador de contexto que debe restaurarse junto con la infraestructura) y no se toca en toda la guía: las secciones
 siguientes agregan `output`s a Terraform, nunca código al script. Se omite deliberadamente porque
 duplicarlo permitiría que la documentación divergiera del archivo ejecutado.
 
@@ -2365,7 +2371,7 @@ Sus seis piezas, todas comentadas en el archivo:
 |---|---|
 | El bucle de `jq` sobre `terraform output -json` | **El motor.** No tiene una lista de variables: exporta en MAYÚSCULAS *todo* output que exista (`public_ip` → `$PUBLIC_IP`). Agregar un recurso es declarar su `output`; el cargador no se modifica |
 | Caché con TTL (`PROD_ENV_TTL`, 900 s) | `terraform output` baja el state de S3 en cada llamada (~1-2 s). Con 20 comandos por sesión se nota. `PROD_ENV_REFRESH=1` la ignora |
-| `PROD_ENV_SOURCE=discover` | El mismo contrato **sin** Terraform: descubre la infra por tags y nombres. Es lo que hace que la [guía 02b](referencia/02b-produccion-aws-consola.md) use los mismos comandos que ésta |
+| `PROD_ENV_SOURCE=discover` | El mismo contrato **sin** Terraform: descubre la infra por tags y nombres. El equivalente por consola fue retirado de este checkout |
 | Derivadas (`SSH_TARGET`, `RAW_URI`, `EMR_ENTRYPOINTS_URI`, …) | Se calculan una vez y solo si existe su base; una sección pendiente deja la variable vacía en lugar de producir una URI inválida |
 | Contexto parcial | Si `infra/envs/prod` aún no existe o el state no publicó outputs, **informa y continúa**: el mismo `source` sirve desde §1 y comienza a obtener valores cuando están disponibles |
 | `prod-env.sh --check` | Muestra qué quedó definido y qué falta. La lista de obligatorias crece con la guía |
@@ -3510,7 +3516,7 @@ en **EMR Serverless**, que arranca solo cuando llega un job, escala a cero al qu
 por vCPU-seg + GB-seg. Cuesta ~1–2 min de cold start y ahorra el cluster. Airflow dispara con
 `EmrServerlessStartJobOperator` en modo deferrable (§6.6).
 
-> **Compatibilidad y soporte:** `emr-7.13.0` ejecuta Spark 3.5.6, no el Spark 4.0.3 local, y su
+> **Compatibilidad y soporte:** `emr-7.13.0` ejecuta Spark 3.5.6, no el Spark 4.2.0 local, y su
 > soporte estándar termina el 21-abr-2028. Antes del primer despliegue verifique el
 > [ciclo de soporte](https://docs.aws.amazon.com/emr/latest/ReleaseGuide/emr-7130-release.html),
 > seleccione una release soportada y repita `wordcount` y ETL antes de promoverla.
@@ -7066,7 +7072,7 @@ Las UIs quedan en `127.0.0.1` y se acceden por túnel SSH (§12.3): ninguna se p
 
 - El árbol de producción completo: `infra/`, `docker-compose.prod.yml`, `scripts/` y
   los workflows. El checklist que lo verifica está en
-  [`05-production-readiness.md`](referencia/05-production-readiness.md).
+  un checklist de readiness mantenido junto a los artefactos de producción.
 - Árbol de trabajo limpio y commit etiquetado: si no se identifica el commit desplegado, el
   paso 7 no puede registrar nada.
 - Ventana acordada: el paso 2 puede reemplazar la EC2 y cortar lo que esté corriendo.
@@ -8155,7 +8161,7 @@ no simplemente…?».
 #### B.1 Por qué Terraform y no la consola
 
 La consola no muestra «qué cambió». Un `plan` permite revisar antes de modificar y el state mantiene el inventario.
-Terraform exige aprendizaje y cuidado del state; la [guía 02b](referencia/02b-produccion-aws-consola.md) enseña el equivalente manual.
+Terraform exige aprendizaje y cuidado del state; el equivalente manual fue retirado de este checkout.
 No mezcle ambos métodos sobre el mismo recurso.
 
 #### B.2 Por qué EMR Serverless y no un cluster
