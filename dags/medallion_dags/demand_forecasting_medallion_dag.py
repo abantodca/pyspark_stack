@@ -13,22 +13,8 @@ SAMPLE_SCHEMA = (
     "updated_at string, lifetime_value double"
 )
 SAMPLE_CUSTOMERS = [
-    (
-        "C001",
-        "Ana Torres",
-        "ana@example.com",
-        "retail",
-        "2026-01-05T10:00:00Z",
-        1250.50,
-    ),
-    (
-        "C002",
-        "Luis Pérez",
-        "luis@example.com",
-        "business",
-        "2026-01-05T11:00:00Z",
-        4890.00,
-    ),
+    ("C001", "Ana Torres", "ana@example.com", "retail", "2026-01-05T10:00:00Z", 1250.50),
+    ("C002", "Luis Pérez", "luis@example.com", "business", "2026-01-05T11:00:00Z", 4890.00),
 ]
 
 
@@ -139,5 +125,4 @@ with DAG(
         python_callable=gold_publish,
         op_kwargs={"run_date": "{{ ds }}"},
     )
-    
     bronze >> silver >> gold

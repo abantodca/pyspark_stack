@@ -112,24 +112,24 @@ reprocesás; sin Bronze, perdiste el dato original y no hay vuelta atrás.
 
 Los quince proyectos, en el orden en que los vas a escribir:
 
-| # | Proyecto | La técnica nueva que trae |
-|---|---|---|
-| 00 | `hello_lakehouse` | Airflow dispara, Spark calcula, HDFS guarda |
-| 01 | Customer 360 | Las tres capas, la cuarentena y el gate de calidad |
-| 02 | Daily Sales | CSV, `decimal` para dinero, deduplicación por clave compuesta |
-| 03 | Web Events | Cadencia horaria, taxonomía cerrada, particiones derivadas |
-| 04 | Product Catalog | Quedarse con la última versión de una entidad |
-| 05 | Inventory Snapshot | Invariantes de balance: rechazar lo aritméticamente imposible |
-| 06 | Support Tickets | Aritmética de tiempo y SLA variable por prioridad |
-| 07 | Payment Reconciliation | Tolerancia de redondeo y clasificación del descuadre |
-| 08 | Supplier Performance | Cadencia semanal y scorecard acumulado |
-| 09 | Marketing Attribution | Pesos fraccionarios y reparto de un importe |
-| 10 | Fraud Signals | Bandas construidas en Python, ventanas de tiempo con `F.window` |
-| 11 | Demand Forecasting | Multi-fuente, join por rango de fechas, ventanas móviles y **fuga de datos** |
-| 12 | Customer Churn Features | Feature store, PII hasheada, score explicable |
-| 13 | Order Fulfillment OTIF | Reconciliar tres sistemas y `left_anti` |
-| 14 | AML Transaction Monitoring | Ventana por tiempo real (`rangeBetween`), reglas con nombre |
-| 15 | Subscription Revenue | CDC compactado por secuencia, conversión FX, dos tablas Gold |
+| # | Proyecto | Modo de carga | La técnica nueva que trae |
+|---|---|---|---|
+| 00 | `hello_lakehouse` | Ejercicio aislado | Airflow dispara, Spark calcula, HDFS guarda |
+| 01 | Customer 360 | Snapshot | Las tres capas, la cuarentena y el gate de calidad |
+| 02 | Daily Sales | Incremental | CSV, `decimal` para dinero, deduplicación por clave compuesta |
+| 03 | Web Events | Incremental | Cadencia horaria, taxonomía cerrada, particiones derivadas |
+| 04 | Product Catalog | Snapshot | Quedarse con la última versión de una entidad |
+| 05 | Inventory Snapshot | Snapshot | Invariantes de balance: rechazar lo aritméticamente imposible |
+| 06 | Support Tickets | Incremental | Aritmética de tiempo y SLA variable por prioridad |
+| 07 | Payment Reconciliation | Snapshot | Tolerancia de redondeo y clasificación del descuadre |
+| 08 | Supplier Performance | Incremental | Cadencia semanal y scorecard acumulado |
+| 09 | Marketing Attribution | Snapshot | Pesos fraccionarios y reparto de un importe |
+| 10 | Fraud Signals | Incremental | Bandas construidas en Python, ventanas de tiempo con `F.window` |
+| 11 | Demand Forecasting | Snapshot | Multi-fuente, join por rango de fechas, ventanas móviles y **fuga de datos** |
+| 12 | Customer Churn Features | Snapshot | Feature store, PII hasheada, score explicable |
+| 13 | Order Fulfillment OTIF | Incremental | Reconciliar tres sistemas y `left_anti` |
+| 14 | AML Transaction Monitoring | Incremental | Ventana por tiempo real (`rangeBetween`), reglas con nombre |
+| 15 | Subscription Revenue | Incremental | CDC compactado por secuencia, conversión FX, dos tablas Gold |
 
 La dificultad sube de forma deliberada: del 01 al 10 cada proyecto tiene **una** fuente
 y agrega **un** concepto; del 11 al 15 aparecen varias fuentes por proyecto y la
@@ -199,6 +199,46 @@ Es lo que te permite reprocesar sin miedo. Sin idempotencia, cada reintento —y
 reintenta solo— duplicaría filas, y un pipeline que duplica en silencio es peor que uno
 que se cae.
 
+### Incremental no significa `append`
+
+Ocho de los quince proyectos de Medallion (02, 03, 06, 08, 10, 13, 14 y 15) procesan
+**solo el delta que llegó para la corrida**: ventas, eventos, cambios de tickets,
+recepciones, señales, eventos logísticos, transacciones o CDC. Es aproximadamente el
+53 % de los ejemplos. Los otros siete mantienen el comportamiento de **snapshot**:
+recalculan el estado o la foto completa de su fecha porque ese es el contrato natural de
+un maestro, inventario, conciliación, atribución o feature store.
+
+El código de ambos modos conserva la misma escritura:
+
+```python
+RUNTIME.write(frame, "silver", run_date)
+```
+
+No hay `mode("append")`. El delta de `2026-01-06` queda en su propia partición y el
+reintento de esa fecha hace `overwrite` **solo sobre esa partición**. Así se acumula el
+histórico sin duplicar filas:
+
+```text
+silver/daily_sales/run_date=2026-01-05  ← delta ya confirmado
+silver/daily_sales/run_date=2026-01-06  ← delta de la corrida actual
+```
+
+En los ejemplos incrementales, la URI de entrada debe apuntar al lote de la ventana de
+la corrida —no a todo el histórico— y debe incluir un identificador estable
+(`order_id`, `event_id`, `ticket_id`, etc.). Silver deduplica ese lote antes de
+publicarlo. Para consultar el acumulado, Spark puede leer las particiones del proyecto:
+
+```python
+history = spark.read.parquet(
+    "hdfs://hdfs-namenode:9000/lakehouse/silver/daily_sales"
+)
+```
+
+La partición `run_date` queda disponible como columna. Un snapshot también conserva
+histórico por fecha, pero su entrada representa una foto completa, no novedades. No se
+mezclan ambos contratos: hacerlo convertiría borrados y correcciones en filas
+duplicadas o, peor, en estado viejo sin aviso.
+
 ## 3. Preparar el entorno, una sola vez
 
 Necesitás Docker. El stack completo tiene un techo aproximado de 11.1 GiB; el detalle y el escalado
@@ -257,6 +297,10 @@ credenciales que imprime `task local:credentials`.
 # Parte 1 · El primer contacto
 
 ## 4. Proyecto 00 · `hello_lakehouse`
+
+> **Todavía no usa `runtime.py`.** Este primer ejercicio solo demuestra el recorrido
+> Airflow → Spark → HDFS. La infraestructura compartida se construye después; por eso
+> este archivo crea Spark y su ruta de salida de forma explícita.
 
 **El problema.** Ninguno todavía. Este archivo existe para probar que las tres piezas
 se hablan: Airflow arranca una tarea, la tarea abre Spark, Spark escribe en HDFS. Son
@@ -438,6 +482,11 @@ copiás directo la versión final, te vas a llevar código que funciona y ningun
 para que sea así.
 
 ## 6. Proyecto 01a · Customer 360, versión ingenua
+
+> **Todavía no usa `runtime.py`, a propósito.** Esta v0 repite la creación de Spark y
+> las rutas HDFS para que los defectos sean visibles. En las secciones §8–§13 se extrae
+> esa repetición a `runtime.py`; el Customer 360 definitivo y los proyectos 02–15 sí lo
+> importan mediante `from medallion import MedallionRuntime`.
 
 **El problema.** El CRM exporta el maestro de clientes. Marketing quiere el valor de
 vida acumulado por segmento, todos los días. Tres capas, una fuente, cero sutilezas.
@@ -1370,6 +1419,20 @@ from medallion.runtime import MedallionRuntime
 __all__ = ["MedallionRuntime"]
 ```
 
+### Qué ejemplos lo usan
+
+La separación es deliberada y queda así:
+
+| Ejemplo | ¿Importa `MedallionRuntime`? | Motivo |
+|---|---|---|
+| Proyecto 00 · `hello_lakehouse` | No | Es el primer contacto: muestra Spark y HDFS sin abstracciones. |
+| Proyecto 01a · Customer 360 v0 | No | Expone la duplicación que el runtime viene a eliminar. |
+| Proyecto 01 definitivo y proyectos 02–15 | Sí | Todos declaran `RUNTIME = MedallionRuntime(PROJECT)` y usan `spark`, `path`, `write` y `enforce_quality`. |
+
+Por eso, antes de copiar el proyecto 01 definitivo, creá los dos archivos de esta
+sección: `dags/medallion/runtime.py` y `dags/medallion/__init__.py`. Si falta uno, el
+import del DAG fallará; no hay que reemplazarlo por rutas HDFS escritas a mano.
+
 ✅ **Gate**: el import resuelve dentro del contenedor.
 
 ```bash
@@ -1805,6 +1868,9 @@ aporta.
 **El problema.** El POS de las tiendas y el ecommerce exportan líneas de venta. Comercial
 quiere ingresos, unidades y ticket medio por canal, todos los días a las 3 AM.
 
+**Modo de carga: incremental.** La URI contiene únicamente las líneas nuevas o
+corregidas de la fecha lógica; la clave `(order_id, sku)` hace seguro reintentar el lote.
+
 **Nuevo en este proyecto**
 
 - CSV con encabezado en vez de JSON.
@@ -1851,6 +1917,7 @@ def bronze_ingest(run_date: str) -> None:
     spark = RUNTIME.spark("bronze")
     try:
         uri = os.getenv(SOURCE_ENV_VAR)
+        # Incremental: la URI corresponde únicamente al lote de esta fecha lógica.
         source = (
             spark.read.option("header", True).csv(uri)
             if uri
@@ -2067,6 +2134,9 @@ cambio de negocio en una alerta en vez de en un número mal sumado.**
 **El problema.** El SDK de tracking manda eventos de navegación. Producto quiere tráfico
 y engagement por hora, dispositivo y tipo de evento. Corre cada hora.
 
+**Modo de carga: incremental.** Cada ejecución recibe los eventos de su ventana horaria;
+`event_id` evita republicar un evento repetido dentro del lote.
+
 **Nuevo en este proyecto**
 
 - Cadencia horaria y lo que eso rompe.
@@ -2113,6 +2183,7 @@ def bronze_ingest(run_date: str) -> None:
     spark = RUNTIME.spark("bronze")
     try:
         uri = os.getenv(SOURCE_ENV_VAR)
+        # Incremental: la URI corresponde únicamente a la ventana horaria del DAG.
         source = (
             spark.read.json(uri)
             if uri
@@ -2821,6 +2892,9 @@ la reimplementara en su consulta, en seis meses habría cuatro definiciones dist
 cumplimiento de SLA por categoría y prioridad. El SLA no es uno solo: depende de la
 prioridad del caso.
 
+**Modo de carga: incremental.** La fuente entrega tickets creados o modificados desde la
+última ventana; Silver elige la versión más reciente de cada `ticket_id` del lote.
+
 **Nuevo en este proyecto**
 
 - Aritmética de tiempo real (horas entre dos timestamps).
@@ -2869,6 +2943,7 @@ def bronze_ingest(run_date: str) -> None:
     spark = RUNTIME.spark("bronze")
     try:
         uri = os.getenv(SOURCE_ENV_VAR)
+        # Incremental: la URI trae altas y cambios desde la ventana anterior.
         source = (
             spark.read.json(uri)
             if uri
@@ -3388,6 +3463,9 @@ dinero está en disputa con el gateway B?*— sea un filtro, no un cálculo.
 **El problema.** El ERP registra las recepciones de mercadería. Compras revisa a los
 proveedores una vez por semana, los lunes a las 6 AM.
 
+**Modo de carga: incremental.** Cada lunes entra la semana de recepciones cerrada; el
+scorecard de Gold conserva una partición por semana para construir la tendencia.
+
 **Nuevo en este proyecto**
 
 - Cadencia semanal, y qué significa `{{ ds }}` cuando el DAG no es diario.
@@ -3432,6 +3510,7 @@ def bronze_ingest(run_date: str) -> None:
     spark = RUNTIME.spark("bronze")
     try:
         uri = os.getenv(SOURCE_ENV_VAR)
+        # Incremental: una corrida semanal recibe solo sus nuevas recepciones.
         source = (
             spark.read.option("header", True).csv(uri)
             if uri
@@ -3890,6 +3969,9 @@ investigación.
 **El problema.** El modelo de fraude emite alertas scoreadas. Riesgo quiere la exposición
 por ventana de 15 minutos, banda de riesgo, país y método de pago. Corre cada 15 minutos.
 
+**Modo de carga: incremental.** La entrada es el micro-lote de quince minutos y no un
+histórico completo; `signal_id` identifica de forma estable cada señal.
+
 **Nuevo en este proyecto**
 
 - Ventanas de tiempo con `F.window` (agrupar por intervalo, no por fila).
@@ -3936,6 +4018,7 @@ def bronze_ingest(run_date: str) -> None:
     spark = RUNTIME.spark("bronze")
     try:
         uri = os.getenv(SOURCE_ENV_VAR)
+        # Incremental: la fuente entrega el micro-lote de los últimos 15 minutos.
         source = (
             spark.read.json(uri)
             if uri
@@ -5006,6 +5089,10 @@ transportista (entrega)— describen el mismo pedido. Logística quiere saber cu
 pedidos llegaron **a tiempo y completos** (OTIF: *on time, in full*), quién falla y
 cuánto dinero está en juego.
 
+**Modo de carga: incremental.** OMS, WMS y transportista entregan los eventos nuevos o
+actualizados de cada ventana; la reconciliación publica la partición del lote sin volver
+a calcular los pedidos cerrados de fechas anteriores.
+
 **Nuevo en este proyecto**
 
 - Reconciliar tres sistemas en una fila de ciclo de vida por pedido.
@@ -5045,6 +5132,7 @@ def bronze_ingest(run_date: str) -> None:
         orders_uri = os.getenv("OTIF_ORDERS_SOURCE_URI")
         fulfillment_uri = os.getenv("OTIF_FULFILLMENT_SOURCE_URI")
         delivery_uri = os.getenv("OTIF_DELIVERY_SOURCE_URI")
+        # Incremental: cada URI contiene solo eventos nuevos o actualizados del lote.
         # Sin URIs configuradas corre con estas filas: el segundo pedido llega
         # incompleto y fuera de fecha, que es el caso que mide el OTIF.
         orders = (
@@ -5415,6 +5503,9 @@ el subtotal en riesgo.
 jurisdicciones vigiladas, hay que producir alertas **explicables**: cada una tiene que
 decir qué reglas la dispararon. Corre cada 30 minutos.
 
+**Modo de carga: incremental.** Los pagos son el delta de treinta minutos; KYC y la
+watchlist son referencias que pueden refrescarse como snapshot junto con ese micro-lote.
+
 **Nuevo en este proyecto**
 
 - La tercera clase de ventana: `rangeBetween` sobre tiempo real.
@@ -5458,6 +5549,7 @@ def bronze_ingest(run_date: str) -> None:
         transactions_uri = os.getenv("AML_TRANSACTIONS_SOURCE_URI")
         customers_uri = os.getenv("AML_CUSTOMERS_SOURCE_URI")
         watchlist_uri = os.getenv("AML_WATCHLIST_SOURCE_URI")
+        # Incremental en pagos; KYC y watchlist son referencias refrescables.
         # Sin URIs configuradas corre con estas filas: dos transferencias a una
         # jurisdicción vigilada, justo por debajo del umbral de reporte.
         transactions = (
@@ -5859,6 +5951,9 @@ por eso son dos constantes y no un `if` anidado en medio del código.
 cambio diarios. Finanzas quiere MRR y ARR en dólares por segmento, plan y país, más el
 puente que explica **por qué** el ingreso recurrente se movió.
 
+**Modo de carga: incremental.** Los eventos de suscripción son CDC; `source_sequence`
+permite compactar cambios nuevos sin confundirlos con una foto completa del estado.
+
 **Nuevo en este proyecto**
 
 - CDC: compactar un flujo de cambios de estado.
@@ -5909,6 +6004,7 @@ def bronze_ingest(run_date: str) -> None:
         invoices_uri = os.getenv("SUBSCRIPTION_INVOICES_SOURCE_URI")
         accounts_uri = os.getenv("SUBSCRIPTION_ACCOUNTS_SOURCE_URI")
         fx_uri = os.getenv("SUBSCRIPTION_FX_SOURCE_URI")
+        # Incremental: los eventos llegan como CDC y conservan source_sequence.
         # Sin URIs configuradas corre con estas filas: S-1002 se crea y se
         # cancela el mismo día, que es el caso que compacta el CDC.
         events = (
@@ -6584,6 +6680,8 @@ hacía algo, es acá.
 
 | Patrón | Cuándo lo usás | Dónde está |
 |---|---|---|
+| Incremental por partición `run_date` | La fuente entrega el delta de cada ventana | §2, §15, §16, §19, §21, §23, §26, §27, §28 |
+| Snapshot por partición `run_date` | La fuente representa el estado completo de la fecha | §2, §14, §17, §18, §20, §22, §24, §25 |
 | Bronze inmutable con linaje | Siempre | §14 |
 | `_record_hash` con `sorted` y centinela | Detectar cambios reales entre corridas | §14 |
 | Cascada de `when` para `_reject_reason` | Siempre que valides | §14 |
@@ -6717,7 +6815,7 @@ Cada uno de estos produce código que funciona hoy y falla de forma silenciosa d
 |---|---|---|
 | `filter()` que descarta sin registrar | Nadie sabe qué se perdió ni por qué | Cuarentena con motivo (§7) |
 | `date.today()` dentro de la tarea | Reprocesar pisa la partición equivocada | `{{ ds }}` (§5.4) |
-| `mode("append")` | Cada reintento duplica | `overwrite` sobre ruta con fecha (§5.6) |
+| `mode("append")` sobre una ruta ya publicada | Cada reintento duplica | Delta en una partición `run_date` nueva y `overwrite` sobre esa fecha (§2, §5.6) |
 | `dropDuplicates(["id"])` | No elegís cuál fila gana | `row_number` sobre ventana (§14) |
 | `double` para dinero | Los centavos se van y la conciliación no cierra | `decimal(18,2)` (§15) |
 | `inferSchema=True` | El esquema cambia según el dato del día | Leer texto, castear en Silver (§15) |
