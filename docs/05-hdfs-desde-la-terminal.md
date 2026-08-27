@@ -2,32 +2,36 @@
 
 > **En este documento: ejecutar, ~30 min.** Son comandos de terminal, sin scripts nuevos ni
 > automatización escondida. Al terminar podés inspeccionar, buscar, subir, consultar y exportar
-> datos del lakehouse con criterio para saber cuándo conviene crear una task.
+> datos del lakehouse con los mismos comandos Docker Compose que usarías para operar el entorno.
 
-Esta guía parte de un stack ya levantado con `task local:up`. Los ejemplos no suponen que exista una
-fecha concreta: primero localizás una corrida y luego trabajás con esa ruta. Así siguen funcionando
-mañana, en un volumen nuevo o con tus propios datos.
+Esta guía parte de un stack ya levantado. Si todavía no lo está, desde la raíz del repositorio
+levantalo con `dc up -d --build` después de definir `dc` abajo. Los ejemplos no suponen que exista
+una fecha concreta: primero localizás una corrida y luego trabajás con esa ruta. Así siguen
+funcionando mañana, en un volumen nuevo o con tus propios datos.
 
 ## 1. Confirmar el contexto antes de ejecutar
 
-El `Taskfile.yml` usa los dos archivos Compose. Definí esta función una vez en la terminal para que
-los comandos de Compose de la guía usen exactamente esa misma composición:
+Este laboratorio se compone de un archivo base y un override local. Definí esta función de Bash,
+llamada `dc`, una vez en la terminal: es un atajo para `docker compose` que siempre carga ambos
+archivos.
 
 ```bash
 dc() { docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml "$@"; }
 ```
 
-La imagen de HDFS contiene el cliente, pero no lo agrega al `PATH` de los procesos iniciados con
-`docker exec`. Esta segunda función evita repetir una ruta interna de la imagen; no crea ningún
-script ni cambia el contenedor:
+La imagen del NameNode ya tiene el cliente HDFS. Esta segunda función lo ejecuta por el servicio de
+Compose: no depende del nombre físico del contenedor ni de una ruta interna de la imagen, no crea
+scripts y no cambia el contenedor:
 
 ```bash
-hdfs() { docker exec hdfs-namenode /opt/hadoop-3.2.1/bin/hdfs "$@"; }
+hdfs() { dc exec -T hdfs-namenode hdfs "$@"; }
 ```
 
-Comprobá los hechos de los que salen los comandos siguientes:
+Si el stack aún no está arriba, arrancalo; después inspeccioná la composición y el contexto desde
+el que salen los comandos siguientes:
 
 ```bash
+dc up -d --build                                           # solo si el stack está apagado
 dc config --services                                      # servicios declarados
 dc ps                                                      # servicios que están arriba
 dc port hdfs-namenode 9870                                 # puerto real del NameNode en el host
@@ -54,8 +58,9 @@ que también quieras reiniciar esos componentes.
 | `core-site.xml` se monta solo en Airflow | En Spark master y Jupyter usá una URI completa `hdfs://hdfs-namenode:9000/...` o configurá `fs.defaultFS`. |
 | `./spark-apps` es un bind mount | Un archivo allí aparece como `/opt/spark-apps/<archivo>` en los contenedores que lo montan. |
 
-`docker exec airflow-scheduler command -v hdfs` no devuelve nada: el cliente de línea de comandos
-se ejecuta desde el NameNode. Para SQL o Parquet usás Spark en `spark-master`, Airflow o Jupyter.
+El cliente de línea de comandos se ejecuta desde el NameNode. Para SQL o Parquet usás Spark en
+`spark-master`, Airflow o Jupyter. `dc exec` conserva esa distinción y resuelve el servicio por su
+nombre lógico, aunque Compose vuelva a crear el contenedor.
 
 ## 2. URLs y WebHDFS
 
@@ -73,8 +78,9 @@ dc ps --format 'table {{.Service}}\t{{.Ports}}'
 | Spark driver de Jupyter | http://localhost:4055 | Stages y plan de una sesión de notebook abierta. |
 | Jupyter | http://localhost:8888 | Exploración interactiva; solo perfil `dev`. |
 
-`task local:urls` muestra las mismas URLs y su estado; `task local:credentials` muestra los accesos
-locales.
+`dc ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}'` muestra los mismos servicios, estado
+y puertos. Las credenciales de Airflow y el token de Jupyter están en `.env`; no los copies a logs,
+capturas ni tickets.
 
 **WebHDFS** es la API HTTP del NameNode. Desde el host sirve para metadatos:
 
@@ -96,7 +102,7 @@ esta imagen requiere identificar el usuario simple:
 
 ```bash
 # Requiere que /tmp/ventas.csv exista en el NameNode; la sección 5 lo prepara.
-docker exec hdfs-namenode curl -fsS -L -X PUT -T /tmp/ventas.csv \
+dc exec -T hdfs-namenode curl -fsS -L -X PUT -T /tmp/ventas.csv \
   'http://hdfs-namenode:9870/webhdfs/v1/lakehouse/landing/daily_sales/ventas.csv?op=CREATE&overwrite=true&user.name=root'
 ```
 
@@ -177,15 +183,14 @@ ruta del host.
 dc cp "$SRC" hdfs-namenode:/tmp/ventas.csv
 hdfs dfs -mkdir -p "$LANDING_DIR"
 hdfs dfs -put -f /tmp/ventas.csv "$LANDING_FILE"
-docker exec hdfs-namenode rm -f /tmp/ventas.csv
+dc exec -T hdfs-namenode rm -f /tmp/ventas.csv
 hdfs dfs -ls -h "$LANDING_FILE"
 ```
 
 **b) Sin copia intermedia, por entrada estándar.** El `-` final le indica a `-put` que lea stdin.
 
 ```bash
-cat "$SRC" | docker exec -i hdfs-namenode /opt/hadoop-3.2.1/bin/hdfs \
-  dfs -put -f - "$LANDING_FILE"
+cat "$SRC" | dc exec -T hdfs-namenode hdfs dfs -put -f - "$LANDING_FILE"
 ```
 
 **c) Por el bind mount.** Es práctico si el archivo ya vive dentro de `spark-apps/`.
@@ -214,7 +219,9 @@ no representan un modelo de autorización para producción.
 ## 6. Hacer que un DAG lea el archivo
 
 Cada DAG medallion tiene una variable de entorno de origen. Sin ella usa su fixture mínimo. Para
-`daily_sales`, comprobá el contrato, declaralo y recreá los procesos de Airflow que leen `env_file`:
+`daily_sales`, comprobá el contrato, declaralo y recreá los procesos de Airflow que leen `env_file`
+—esto asume que ya escribiste ese proyecto siguiendo la
+[guía 06 §15](06-medallion-desde-cero.md):
 
 ```bash
 sed -n '1,/^def silver/p' dags/medallion_dags/daily_sales_medallion_dag.py
@@ -244,7 +251,7 @@ modo que un `file:///home/...` de tu host no existe para el cluster. Los orígen
 Con `GOLD_URI` definido en la sección 3, `spark-sql` puede leer un path Parquet sin catálogo:
 
 ```bash
-docker exec -w /tmp spark-master /opt/spark/bin/spark-sql --master 'local[1]' \
+dc exec -T -w /tmp spark-master /opt/spark/bin/spark-sql --master 'local[1]' \
   --conf spark.ui.enabled=false \
   -e "select channel, sum(gross_revenue) as ingreso
       from parquet.\`$GOLD_URI\`
@@ -257,7 +264,7 @@ ejecuta esta consulta de inspección dentro del contenedor, no como un job distr
 Cuando la exploración crece, usá PySpark. Pasar `GOLD_URI` como variable evita editar el bloque:
 
 ```bash
-docker exec -e GOLD_URI="$GOLD_URI" -i airflow-scheduler python - <<'PY'
+dc exec -T -e GOLD_URI="$GOLD_URI" airflow-scheduler python - <<'PY'
 import os
 from pyspark.sql import SparkSession
 
@@ -306,7 +313,7 @@ copialo:
 HDFS_EXPORT="/lakehouse/exports/$PROJECT/run_date=$RUN_DATE"
 EXPORT_URI="hdfs://hdfs-namenode:9000$HDFS_EXPORT"
 
-docker exec -e GOLD_URI="$GOLD_URI" -e EXPORT_URI="$EXPORT_URI" -i airflow-scheduler python - <<'PY'
+dc exec -T -e GOLD_URI="$GOLD_URI" -e EXPORT_URI="$EXPORT_URI" airflow-scheduler python - <<'PY'
 import os
 from pyspark.sql import SparkSession
 
@@ -329,16 +336,22 @@ contenedor. Para el disco local de un contenedor escribí `file:///tmp/export` d
 
 ## 9. Higiene y réplicas del laboratorio
 
-Primero listá el objetivo; después elegí entre papelera y borrado definitivo. `-expunge` vacía la
-papelera completa del usuario: no lo ejecutes como parte de una limpieza rutinaria sin revisarla.
+Primero listá el objetivo; después decidí si necesitás conservar una copia. Este Compose no define
+`fs.trash.interval`, por lo que no hay una papelera operativa que debas asumir como red de
+seguridad: en esta instalación, `-rm` es un borrado efectivo. `-skipTrash` lo deja explícito, pero
+no lo hace más recuperable. Antes de borrar una ruta valiosa, exportala o copiala a una ruta de
+archivo con una política de retención conocida.
 
 ```bash
 # Sustituí la ruta por un dato desechable y comprobalo antes con -ls.
 hdfs dfs -ls /lakehouse/landing/prueba.csv
-hdfs dfs -rm -r /lakehouse/landing/prueba.csv                 # envía a la papelera
-hdfs dfs -rm -r -skipTrash /lakehouse/landing/prueba.csv      # borra definitivamente
-hdfs dfs -expunge                                              # vacía la papelera del usuario actual
+hdfs dfs -rm -r /lakehouse/landing/prueba.csv                 # borrado efectivo en este laboratorio
+hdfs dfs -rm -r -skipTrash /lakehouse/landing/prueba.csv      # deja explícita la intención irreversible
 ```
+
+Si en el futuro habilitás papelera en la configuración de **cada cliente**, revisá su contenido
+antes de usar `-expunge`: ese comando vacía la papelera completa del usuario actual, no solo la
+ruta que estabas limpiando.
 
 El stack tiene un DataNode y el cliente predeterminado usa réplica 3; por eso aparecen *under
 replicated blocks*. Para ajustar datos ya escritos, decidilo explícitamente y ejecutá:
@@ -352,20 +365,22 @@ Para que los datos nuevos nazcan con una sola réplica, configurá `dfs.replicat
 `spark-submit`). No lo pongas como una corrección casual en `core-site.xml`: es una propiedad HDFS y
 el cliente que escribe decide el factor inicial.
 
-## 10. Qué merece una task
+## 10. Cuándo automatizar y cuándo conservar el comando visible
 
-Una task se gana su lugar cuando reúne varios pasos en un orden fácil de olvidar, cuando aporta
-validación útil o cuando también la ejecuta CI. Un comando de una línea conviene aprenderlo y dejarlo
-visible.
+Un operador experto no esconde una consulta diagnóstica de una línea detrás de una capa adicional:
+la deja visible, con `dc` y `hdfs`, para que sea evidente qué servicio, cliente y ruta intervienen.
+Automatizá solo un flujo repetitivo que tenga precondiciones, varias acciones ordenadas y una salida
+operativa clara. Esta guía no agrega ni modifica automatizaciones del repositorio.
 
-| Operación | ¿Task? | Motivo |
+| Operación | ¿Automatizar? | Motivo |
 |---|---|---|
 | `-ls`, `-du`, `-find`, `-cat`, `-stat` | No | Son comandos unitarios y de diagnóstico. |
-| Ver data por capa y proyecto | No — sección 3 | Usa el cliente HDFS y no depende de tasks auxiliares. |
+| Ver data por capa y proyecto | No — sección 3 | Usa el cliente HDFS y no depende de automatización auxiliar. |
 | Previsualizar Parquet | No — sección 7 | Requiere una sesión Spark configurada, pero el comando es explícito. |
 | Subir un archivo | Discutible | Con stdin es una línea; el flujo con verificación tiene varios pasos. |
 | Exportar Parquet a CSV | Discutible | Requiere Spark, HDFS y una copia al host. |
-| Levantar, validar y probar el stack | Sí — `local:up`, `local:check`, `local:smoke` | Son operaciones repetibles y parte de la calidad del proyecto. |
+| Arrancar o detener el stack | Sí, si se repite en el equipo | Es un ciclo operativo con composición, dependencias y estado. |
 
-Escribí un flujo a mano tres veces. Si a la tercera seguís buscando orden, escapes o rutas, ahí se
-ganó su lugar en el `Taskfile.yml`.
+Primero ejecutá y entendé el flujo a mano. Si se vuelve una operación de equipo frecuente, definí
+su contrato y su dueño antes de automatizarlo; no automatices una secuencia cuyo comportamiento no
+podés explicar con comandos Compose.

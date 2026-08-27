@@ -21,10 +21,16 @@ tasks:
         echo "  4  task local:up"
         echo "  5  task local:smoke"
         echo
-        echo "Necesitás Docker y Docker Compose; reservá 20 GiB de RAM para Docker."
+        echo "Necesitás Docker y Docker Compose; el stack completo tiene un techo de ~11.1 GiB."
+        echo
+        echo "── ESCRIBIR LOS PIPELINES ────────────────────────────────────────────────"
+        echo "  dags/ arranca vacío. El código de los 15 proyectos está en la guía:"
+        echo "      docs/06-medallion-desde-cero.md   (copy-paste, en orden)"
+        echo "  task local:gate             verifica que los 15 estén escritos"
         echo
         echo "── OPERACIÓN LOCAL ───────────────────────────────────────────────────────"
-        echo "  task local:up               levanta o reconstruye el stack"
+        echo "  task local:up               levanta el stack completo (incluido Jupyter)"
+        echo "  task local:up-dev           levanta núcleo + Jupyter para notebooks"
         echo "  task local:smoke            valida Web Events contra Spark + HDFS"
         echo "  task local:down             lo apaga y conserva los volúmenes"
         echo "  task local:check            valida .env, estructura y Compose"
@@ -43,36 +49,54 @@ tasks:
           value="$(sed -n "s/^$key=//p" .env | tail -n 1)"
           test "${#value}" -ge 24 || { echo "$key falta o es corto" >&2; exit 1; }
         done
-        check_count() {
-          count="$(find "$2" -maxdepth 1 -name "$3" -type f | wc -l)"
-          test "$count" -eq "$1" || { echo "$4" >&2; exit 1; }
-        }
-        test "$(find dags/medallion_dags -maxdepth 1 -name '*_medallion_dag.py' -type f | wc -l)" -eq 15 || {
-          echo "Se requieren exactamente 15 DAGs medallion" >&2; exit 1;
-        }
-        check_count 15 dags/medallion_dags '*_medallion_dag.py' "Se requieren exactamente 15 DAGs en dags/medallion_dags"
+        # dags/ empieza vacío: el código de los pipelines se escribe siguiendo la guía 06.
+        test -d dags || { echo "Falta la carpeta dags/" >&2; exit 1; }
         test "$(find dags -maxdepth 1 -name '*_dag.py' -type f | wc -l)" -eq 0 || {
-          echo "Los DAGs deben estar clasificados en medallion_dags/" >&2; exit 1;
+          echo "Los DAGs deben estar clasificados en dags/medallion_dags/ o dags/guia/" >&2; exit 1;
         }
-        test -f dags/medallion/runtime.py || { echo "Falta el runtime medallion" >&2; exit 1; }
         test -f ops/airflow_log_retention.sh || { echo "Falta el limpiador de logs" >&2; exit 1; }
         test -f ops/sources.env || { echo "Falta ops/sources.env con los orígenes de datos" >&2; exit 1; }
       - '{{.LOCAL_COMPOSE}} config --quiet'
 
+  local:gate:
+    desc: "Verifica que los 15 proyectos de la guía 06 están escritos"
+    cmds:
+      - |
+        test -f dags/medallion/runtime.py || { echo "Falta dags/medallion/runtime.py (guía 06 §13)" >&2; exit 1; }
+        count="$(find dags/medallion_dags -maxdepth 1 -name '*_medallion_dag.py' -type f 2>/dev/null | wc -l)"
+        test "$count" -eq 15 || { echo "Hay $count de 15 proyectos en dags/medallion_dags (guía 06)" >&2; exit 1; }
+        echo "Guía 06 completa: runtime + 15 proyectos medallion"
+
   local:up:
-    desc: "Valida el entorno y levanta el stack local endurecido"
+    desc: "Valida el entorno y levanta el stack local completo"
     deps: [local:check]
     cmds:
       - '{{.LOCAL_COMPOSE}} up -d --build'
 
-  local:down:
-    desc: "Baja el stack local conservando los volúmenes"
+  local:up-dev:
+    desc: "Valida el entorno y levanta el núcleo más Jupyter para trabajar con notebooks"
+    deps: [local:check]
     cmds:
-      - '{{.LOCAL_COMPOSE}} down'
+      - 'COMPOSE_PROFILES=dev {{.LOCAL_COMPOSE}} up -d --build'
+
+  local:resources:
+    desc: "Muestra CPU, memoria y procesos de los contenedores que están arriba"
+    cmds:
+      - 'docker stats --no-stream'
+
+  local:down:
+    desc: "Baja todos los perfiles del stack local conservando los volúmenes"
+    cmds:
+      # Incluye Jupyter aunque COMPOSE_PROFILES esté vacío: de otro modo un notebook
+      # iniciado antes como perfil dev quedaría consumiendo recursos en segundo plano.
+      - 'COMPOSE_PROFILES=dev {{.LOCAL_COMPOSE}} down'
 
   local:smoke:
     desc: "Ejecuta Web Events Bronze/Silver/Gold contra Spark y HDFS reales"
     deps: [local:check]
+    preconditions:
+      - sh: test -f dags/medallion_dags/web_events_medallion_dag.py
+        msg: "Falta el proyecto Web Events. Escribilo siguiendo docs/06-medallion-desde-cero.md §16"
     cmds:
       - |
         set -eu

@@ -6,11 +6,11 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-    deploy: {resources: {limits: {memory: 2g}}}
+    deploy: {resources: {limits: {memory: "${HDFS_NAMENODE_MEMORY_LIMIT:-1g}"}}}
 
   hdfs-datanode:
     restart: unless-stopped
-    deploy: {resources: {limits: {memory: 2g}}}
+    deploy: {resources: {limits: {memory: "${HDFS_DATANODE_MEMORY_LIMIT:-1g}"}}}
 
   spark-master:
     restart: unless-stopped
@@ -19,36 +19,39 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-    deploy: {resources: {limits: {memory: 1g}}}
+    deploy: {resources: {limits: {memory: "${SPARK_MASTER_MEMORY_LIMIT:-512m}"}}}
 
   spark-worker:
     restart: unless-stopped
-    deploy: {resources: {limits: {memory: 4g}}}
+    # Debe ser mayor que SPARK_WORKER_MEMORY para dejar espacio al JVM del worker.
+    deploy: {resources: {limits: {memory: "${SPARK_WORKER_MEMORY_LIMIT:-3g}"}}}
 
   jupyter:
     restart: unless-stopped
-    deploy: {resources: {limits: {memory: 4g}}}
+    deploy: {resources: {limits: {memory: "${JUPYTER_MEMORY_LIMIT:-2g}"}}}
 
   airflow-db:
     restart: unless-stopped
-    deploy: {resources: {limits: {memory: 1g}}}
+    deploy: {resources: {limits: {memory: "${POSTGRES_MEMORY_LIMIT:-512m}"}}}
 
   airflow-apiserver:
     restart: unless-stopped
-    deploy: {resources: {limits: {memory: 1g}}}
+    deploy: {resources: {limits: {memory: "${AIRFLOW_APISERVER_MEMORY_LIMIT:-512m}"}}}
 
   airflow-scheduler:
     restart: unless-stopped
-    deploy: {resources: {limits: {memory: 1g}}}
+    # El scheduler aloja LocalExecutor y los drivers Spark; por eso conserva más
+    # margen que los demás procesos de control de Airflow.
+    deploy: {resources: {limits: {memory: "${AIRFLOW_SCHEDULER_MEMORY_LIMIT:-1536m}"}}}
 
   airflow-dag-processor:
     restart: unless-stopped
-    deploy: {resources: {limits: {memory: 1g}}}
+    deploy: {resources: {limits: {memory: "${AIRFLOW_DAG_PROCESSOR_MEMORY_LIMIT:-512m}"}}}
 
   airflow-triggerer:
     restart: unless-stopped
-    deploy: {resources: {limits: {memory: 1g}}}
+    deploy: {resources: {limits: {memory: "${AIRFLOW_TRIGGERER_MEMORY_LIMIT:-512m}"}}}
 
   airflow-log-cleaner:
     restart: unless-stopped
-    deploy: {resources: {limits: {memory: 256m}}}
+    deploy: {resources: {limits: {memory: "${AIRFLOW_LOG_CLEANER_MEMORY_LIMIT:-128m}"}}}

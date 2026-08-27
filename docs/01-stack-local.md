@@ -27,9 +27,9 @@
 
 ### Antes de empezar
 
-Necesitás Docker Engine con Compose v2, `task` y al menos **20 GiB de RAM disponibles para Docker**.
-El stack completo tiene límites de memoria que suman aproximadamente 18.25 GiB; con menos memoria, Docker puede
-detener servicios. Reservá también espacio libre para imágenes, volúmenes y logs.
+Necesitás Docker Engine con Compose v2 y `task`. El stack completo tiene límites que suman aproximadamente
+**11.1 GiB**; son techos, no memoria reservada. Para pruebas de capacidad podés ampliar los valores de `.env`; reservá entonces RAM adicional,
+además de espacio libre para imágenes, volúmenes y logs.
 
 **EJECUTAR** desde la raíz del proyecto (la carpeta que contiene `docker-compose.yml`) para comprobar las herramientas:
 
@@ -334,9 +334,9 @@ contenedor (PID 1 terminado → `Exited(0)`). La solución es arrancar la clase 
 - `Dockerfile.spark` instala Python 3.14 (la base trae 3.10) y fija `PYSPARK_PYTHON=python3.14`: los
   executors deben correr el mismo minor de Python que el driver o Spark aborta con
   `[PYTHON_VERSION_MISMATCH]`.
-- El worker anuncia por defecto 4 cores y 3 GiB para no crear un proceso Python por cada core del
-  portátil. `SPARK_WORKER_CORES` y `SPARK_WORKER_MEMORY` permiten ampliar esa capacidad desde
-  `.env` sin modificar el Compose.
+- El worker anuncia por defecto 2 cores y 2 GiB: alcanza para los ejemplos y evita que el portátil
+  quede monopolizado. `SPARK_WORKER_CORES` y `SPARK_WORKER_MEMORY` permiten ampliar esa capacidad
+  desde `.env` sin modificar el Compose.
 
 **Archivo relacionado:** `Dockerfile.spark`.
 **Tipo:** configuración Docker propia. Define la imagen `pyspark_stack-spark:4.2.0`; no es un job
@@ -382,9 +382,9 @@ de Spark ni se ejecuta con `spark-submit`.
       - JUPYTER_TOKEN=${JUPYTER_TOKEN:?define JUPYTER_TOKEN en .env}
 ```
 
-- **`profiles: ["dev"]`:** Jupyter es una herramienta de desarrollo. Un `docker compose up` pelado no
-  lo levanta: hace falta `COMPOSE_PROFILES=dev` en el `.env` (así viene en `.env.example`) o
-  `docker compose --profile dev up`.
+- **`profiles: ["dev"]`:** Jupyter es una herramienta de desarrollo. El template activa
+  `COMPOSE_PROFILES=dev`, por lo que el laboratorio completo se inicia normalmente. También podés
+  usar `task local:up-dev` o `docker compose --profile dev up` de forma explícita.
 
   > **No crees el `.env` todavía solo para leer esta sección.** La creación completa y verificable
   > está en [§8.1](#81-secretos-en-un-env). A diferencia del `.env` de producción (guía 02 §13.4),

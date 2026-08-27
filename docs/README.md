@@ -18,7 +18,7 @@ repetible. Lo marcado como **roadmap** no forma parte todavía del runbook de pr
 
 ### Cómo está ordenada la carpeta
 
-Arriba quedan **solo los cinco documentos que se leen de punta a punta**. Lo que se
+Arriba quedan **solo los seis documentos que se leen de punta a punta**. Lo que se
 consulta —el material de referencia— vive un nivel adentro, para que abrir `docs/`
 muestre el camino y no el inventario.
 
@@ -29,6 +29,7 @@ docs/
 ├── 03-arquitectura.md                 el porqué
 ├── 04-dataops-local.md                proyectos medallion y operación local
 ├── 05-hdfs-desde-la-terminal.md       operar el lakehouse a mano, sin tasks
+├── 06-medallion-desde-cero.md         el taller: escribir los 15 proyectos, en orden
 ├── adr/                               decisiones estructurales, con sus alternativas descartadas
 └── README.md                          este índice
 ```
@@ -40,6 +41,7 @@ docs/
 | [03 — Arquitectura](03-arquitectura.md) | Vista lógica, seguridad y evolución | Implementado + roadmap |
 | [04 — DataOps local](04-dataops-local.md) | Operación de 15 pipelines medallion | Implementado |
 | [05 — HDFS desde la terminal](05-hdfs-desde-la-terminal.md) | Ver, buscar, subir, consultar y exportar data del lakehouse con los comandos crudos | Implementado; comandos verificados contra el stack |
+| [06 — Medallion desde cero](06-medallion-desde-cero.md) | Taller copy-paste: los 15 proyectos en orden creciente, más la metodología | **Es la fuente del código de `dags/`** |
 
 Las decisiones que no se rediscuten mientras seguís las guías están en
 [`adr/`](adr/README.md) — ocho ADR con su contexto, sus consecuencias y lo que se descartó.
@@ -73,7 +75,8 @@ flowchart TD
 
     Q --> L{"Aprender / desarrollar<br/>en mi máquina"}
     L --> L1["01 · Stack local<br/><i>cómo está armado el Compose</i>"]
-    L1 --> L2["04 · DataOps local<br/><i>los 20 proyectos y cómo se operan</i>"]
+    L1 --> L6["06 · Medallion desde cero<br/><i>escribir los 15 proyectos</i>"]
+    L6 --> L2["04 · DataOps local<br/><i>cómo se operan</i>"]
     L2 --> L3["05 · HDFS desde la terminal<br/><i>subir, buscar y sacar TU data</i>"]
 
     Q --> P{"Desplegar en AWS"}
@@ -89,9 +92,12 @@ flowchart TD
 
     style P1 fill:#d1ecf1,stroke:#0c5460
     style L1 fill:#d1ecf1,stroke:#0c5460
+    style L6 fill:#d4edda,stroke:#155724
 ```
 
-**El orden que sí importa**: 01 → 04 → 05 → 03 → 02. El stack local es el
+**El orden que sí importa**: 01 → **06** → 04 → 05 → 03 → 02. La 06 es donde se escribe
+el código: `dags/` arranca vacío y esa guía lo entrega completo, en quince pasos.
+ El stack local es el
 prerrequisito real del de producción —se desarrolla acá y se despliega allá—, y la
 guía 02 arranca con un gate explícito que lo verifica. Saltar directo a 02 sin un DAG
 que corra en local funciona hasta el primer error, y ahí se paga en minutos de EMR lo
@@ -123,6 +129,7 @@ significa que exista, esté desplegado o haya pasado una prueba integrada en AWS
 | Capacidad | Dónde vive |
 |---|---|
 | Spark, HDFS, Jupyter y Airflow en local | Repositorio — implementado |
+| Los 15 pipelines medallion y su runtime | [Guía 06](06-medallion-desde-cero.md) — el código vive en la guía, no en `dags/` |
 | Orquestador de comandos (`Taskfile.yml`) | Repositorio — implementación completa para local |
 | Terraform de red, EC2, S3, EMR Serverless y automatización | Arquitectura objetivo — no materializado |
 | DAG de Airflow contra EMR Serverless | Guía 02 §9.4 |

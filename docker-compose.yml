@@ -18,6 +18,14 @@ x-airflow-common: &airflow-common
     dockerfile: Dockerfile.airflow
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # Un DAG local lanza drivers Spark desde el scheduler. Limitar la concurrencia
+    # evita que un backfill cree decenas de JVM/Python a la vez; las tareas quedan
+    # en cola, no se descartan. Los valores se pueden ampliar desde .env.
+    AIRFLOW__CORE__PARALLELISM: ${AIRFLOW_PARALLELISM:-2}
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW_MAX_ACTIVE_TASKS_PER_DAG:-2}
+    # Con 15 DAGs educativos un solo parser es suficiente y evita otro intérprete
+    # Python residente. Aumentarlo solo cuando el parseo sea el cuello de botella.
+    AIRFLOW__DAG_PROCESSOR__PARSING_PROCESSES: ${AIRFLOW_DAG_PARSING_PROCESSES:-1}
     # En Airflow 3 la creacion de usuarios/RBAC vive en el provider FAB:
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     # SQL_ALCHEMY_CONN se movio de [core] a [database] en Airflow 3:
@@ -153,13 +161,13 @@ services:
       - spark-master
     entrypoint: ["/opt/spark/bin/spark-class"]
     # No anunciar todos los cores del portatil: cada task PySpark crea procesos
-    # Python. Cuatro cores y 3 GiB mantienen estable este laboratorio.
+    # Python. Dos cores y 2 GiB alcanzan para el laboratorio y dejan RAM al host.
     command:
       - org.apache.spark.deploy.worker.Worker
       - --cores
-      - ${SPARK_WORKER_CORES:-4}
+      - ${SPARK_WORKER_CORES:-2}
       - --memory
-      - ${SPARK_WORKER_MEMORY:-3g}
+      - ${SPARK_WORKER_MEMORY:-2g}
       - spark://spark-master:7077
     volumes:
       - ./spark-apps:/opt/spark-apps
