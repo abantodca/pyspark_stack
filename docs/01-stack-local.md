@@ -51,7 +51,7 @@ la guía, comparalo con el bloque antes de reemplazarlo.
 ```gitignore
 # --- Secretos / entorno ---
 .env
-# Overrides locales del cargador de contexto (guía 02 §3.1): rutas y perfil de TU máquina.
+# Overrides locales del cargador de contexto (guía 02, sección 3.1): rutas y perfil de TU máquina.
 # El patrón `.env` de arriba NO lo cubre: gitignore compara nombres completos, y este se
 # llama prod.env. Commitearlo apuntaría los comandos de otra persona a tu cuenta o tu clave.
 **/prod.env
@@ -298,7 +298,7 @@ ENV PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.9-src.zip
 # Token controlado por la env var JUPYTER_TOKEN (sh expande la variable y exec
 # entrega las señales directamente a JupyterLab):
 #  - sin definir/vacia -> sin token (entorno local de practica, igual que antes);
-#  - definida (override de prod, ver docs/02 §14.1, docker-compose.prod.yml) -> token obligatorio.
+#  - definida (override de prod, ver docs/02, sección 14.1, docker-compose.prod.yml) -> token obligatorio.
 CMD ["sh", "-c", "exec python3.14 -m jupyterlab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token=\"${JUPYTER_TOKEN:-}\" --ServerApp.password= --ServerApp.root_dir=/opt/notebooks"]
 ```
 
@@ -345,7 +345,7 @@ CMD ["org.apache.spark.deploy.history.HistoryServer"]
 # Descomentá la variable del proyecto y apuntala a tu archivo en HDFS. Sin valor, el DAG
 # usa su fixture mínimo de ejemplo. Los cambios se aplican al recrear los contenedores:
 #
-#   Seguí docs/06-medallion-desde-cero.md §3 para preparar HDFS y subir el archivo.
+#   Seguí docs/06-medallion-desde-cero.md sección 3 para preparar HDFS y subir el archivo.
 #   task local:up                                             # aplica este archivo
 #
 # El DAG de cada proyecto declara el formato y las columnas que espera.
@@ -898,7 +898,7 @@ services:
 ```dotenv
 # Copiá este archivo a .env y completalo. NO commitear .env (ya está en .gitignore).
 # Estos valores son para el stack LOCAL: en producción los secretos se generan fuertes y se cargan
-# desde AWS SSM (ver docs/02-produccion-aws-terraform.md §13).
+# desde AWS SSM (ver docs/02-produccion-aws-terraform.md sección 13).
 
 # El arranque normal incluye Jupyter para conservar el laboratorio completo.
 COMPOSE_PROFILES=dev
@@ -967,7 +967,7 @@ tasks:
         echo "  2  chmod 600 .env"
         echo "  3  completá los cuatro secretos con: openssl rand -hex 32"
         echo "  4  task local:up"
-        echo "  5  task local:smoke"
+        echo "  5  task local:urls"
         echo
         echo "Necesitás Docker y Docker Compose; el stack completo tiene un techo de ~11.1 GiB."
         echo
@@ -1010,7 +1010,7 @@ tasks:
     desc: "Verifica que los 15 proyectos de la guía 06 están escritos"
     cmds:
       - |
-        test -f dags/medallion/runtime.py || { echo "Falta dags/medallion/runtime.py (guía 06 §13)" >&2; exit 1; }
+        test -f dags/medallion/runtime.py || { echo "Falta dags/medallion/runtime.py (guía 06, sección 13)" >&2; exit 1; }
         count="$(find dags/medallion_dags -maxdepth 1 -name '*_medallion_dag.py' -type f 2>/dev/null | wc -l)"
         test "$count" -eq 15 || { echo "Hay $count de 15 proyectos en dags/medallion_dags (guía 06)" >&2; exit 1; }
         echo "Guía 06 completa: runtime + 15 proyectos medallion"
@@ -1044,7 +1044,7 @@ tasks:
     deps: [local:check]
     preconditions:
       - sh: test -f dags/medallion_dags/web_events_medallion_dag.py
-        msg: "Falta el proyecto Web Events. Escribilo siguiendo docs/06-medallion-desde-cero.md §16"
+        msg: "Falta el proyecto Web Events. Escribilo siguiendo docs/06-medallion-desde-cero.md sección 16"
     cmds:
       - |
         set -eu
@@ -1093,9 +1093,9 @@ tasks:
         echo "Spark jobs es la UI del driver de Jupyter: responde solo mientras un notebook tiene sesión abierta."
 ```
 
-El único archivo que todavía falta es `.env`: se crea a partir del template en [§8.1](#81-secretos-en-un-env),
+El único archivo que todavía falta es `.env`: se crea a partir del template en [sección 8.1](#81-secretos-en-un-env),
 donde también completás sus secretos y verificás sus permisos. Después podés continuar con la
-explicación de cada componente o ir directo a [§9.1](#91-arrancar).
+explicación de cada componente o ir directo a [sección 9.1](#91-arrancar).
 
 ---
 
@@ -1117,11 +1117,11 @@ task --version
 ```
 
 Si alguno de los tres comandos falla, instalá esa herramienta antes de continuar. No ejecutes todavía
-`docker compose up`: primero necesitás crear `.env` en §8.1.
+`docker compose up`: primero necesitás crear `.env` en la sección 8.1.
 
-Primero completá §0: ahí creás todos los archivos de infraestructura desde bloques completos. Los
+Primero completá sección 0: ahí creás todos los archivos de infraestructura desde bloques completos. Los
 apartados 1–7 explican los archivos que acabás de crear; sus fragmentos YAML son solo de lectura y
-no se vuelven a copiar. Los pasos ejecutables de operación están en §8 y §9 y usan siempre la raíz
+no se vuelven a copiar. Los pasos ejecutables de operación están en la sección 8 y sección 9 y usan siempre la raíz
 del repositorio como directorio de trabajo:
 la carpeta que contiene `docker-compose.yml` y `Taskfile.yml`.
 
@@ -1134,7 +1134,7 @@ Cada instrucción que modifica algo indica una de estas acciones:
 | **EDITAR** | Abrí el archivo existente en la ruta indicada y cambiá solo la línea o bloque citado. No pegues el fragmento al final. |
 | **EJECUTAR** | Pegá el bloque en una terminal ubicada en la raíz del proyecto; no crea ni edita archivos salvo que el texto lo diga. |
 
-Antes de cada bloque **EJECUTAR** posterior a §0, verificá dónde estás:
+Antes de cada bloque **EJECUTAR** posterior a la sección 0, verificá dónde estás:
 
 ```bash
 pwd                         # debe terminar en /pyspark_stack
@@ -1142,8 +1142,8 @@ test -f docker-compose.yml  # debe imprimir nada y devolver éxito
 ```
 
 No uses los bloques YAML de las secciones 2–7 como archivos completos: son recortes para explicar
-el Compose creado en §0. Los bloques completos y copiables viven exclusivamente en §0; `.env` se
-crea en §0.16 y se completa en §8.1.
+el Compose creado en la sección 0. Los bloques completos y copiables viven exclusivamente en la sección 0. El template
+`.env.example` se crea en la sección 0.14; el archivo `.env` se crea y completa en la sección 8.1.
 
 ### Cómo leer los bloques de la guía
 
@@ -1163,10 +1163,10 @@ En las secciones 2–7 todos los YAML son **Configuración Compose**. Son el mis
 
 Si tu objetivo es usarlo hoy y no estudiar cada servicio, seguí solo este orden:
 
-1. Completá [§0](#0-construcción-incremental-del-entorno) y creá/completá `.env` en [§8.1](#81-secretos-en-un-env).
-2. Ejecutá [§9.1](#91-arrancar) para levantarlo y [§9.1.1](#911-gate-confirmar-que-el-stack-completo-está-listo) para validarlo.
-3. Escribí el primer pipeline en [06 — Medallion desde cero](06-medallion-desde-cero.md#4-proyecto-00--hello_lakehouse). El smoke test queda disponible después de completar Web Events (§16).
-4. Abrí una URL de [§9.2](#92-urls). Para apagarlo sin perder datos, usá [§9.4](#94-bajar).
+1. Completá [sección 0](#0-construcción-incremental-del-entorno) y creá/completá `.env` en [sección 8.1](#81-secretos-en-un-env).
+2. Ejecutá [sección 9.1](#91-arrancar) para levantarlo y [sección 9.1.1](#911-gate-confirmar-que-el-stack-completo-está-listo) para validarlo.
+3. Escribí el primer pipeline en [06 — Medallion desde cero](06-medallion-desde-cero.md#4-proyecto-00--hello_lakehouse). El smoke test queda disponible después de completar Web Events (sección 16).
+4. Abrí una URL de [sección 9.2](#92-urls). Para apagarlo sin perder datos, usá [sección 9.4](#94-bajar).
 
 Las secciones 1–7 quedan como referencia para entender o diagnosticar el stack.
 
@@ -1178,7 +1178,7 @@ Las secciones 1–7 quedan como referencia para entender o diagnosticar el stack
 | **1–2** | **Leer** (~10 min) | El mapa de los 4 subsistemas y el patrón de anclas YAML que evita repetir configuración |
 | **3–6** | **Leer** (~20 min) | Un subsistema por sección: HDFS, Spark, Jupyter, Airflow. Se leen en orden: cada uno asume el anterior |
 | **7** | **Leer** (~5 min) | Red, volúmenes y orden de arranque — por qué `depends_on` no alcanza |
-| **8** | **Ejecutar** (~20 min) | Completás `.env` y validás el endurecimiento creado en §0 |
+| **8** | **Ejecutar** (~20 min) | Completás `.env` y validás el endurecimiento creado en la sección 0 |
 | **9** | **Ejecutar** (~5 min) | Arrancás, verificás, accedés y bajás el stack |
 
 > [!TIP]
@@ -1217,7 +1217,7 @@ El Compose levanta cuatro subsistemas en una sola red de Docker (`hadoopnet`):
 | Interactivo | `jupyter` | Driver PySpark para trabajo exploratorio |
 | Orquestación | `airflow-*` (6) + `airflow-db` | Airflow 3.2.2 + Postgres 16 |
 
-**Los comandos del día a día están en el `Taskfile.yml` de la raíz**, que creaste en §0.15, para
+**Los comandos del día a día están en el `Taskfile.yml` de la raíz**, que creaste en la sección 0.15, para
 que sean los mismos en tu máquina y en el CI. Este checkout parte sin tasks locales; los comandos
 AWS de la guía 02 son referencia y requieren artefactos de producción que no están en este árbol:
 
@@ -1225,7 +1225,7 @@ AWS de la guía 02 son referencia y requieren artefactos de producción que no e
 |---|---|
 | `task local:check` | Valida secretos, permisos y el Compose efectivo sin arrancar servicios |
 | `task local:up` | Valida y levanta los cuatro subsistemas con el override endurecido |
-| `task local:smoke` | Ejecuta Web Events end-to-end y exige evidencias en las cinco capas HDFS, después de escribirlo en la guía 06 §16 |
+| `task local:smoke` | Ejecuta Web Events end-to-end y exige evidencias en las cinco capas HDFS, después de escribirlo en la guía 06, sección 16 |
 | `task local:down` | Baja el stack **conservando** los volúmenes (los datos de HDFS y Postgres siguen ahí) |
 | `task local:credentials` | Muestra los accesos locales de Airflow y la URL con token de Jupyter |
 | `task local:urls` | Lista las URLs locales y marca qué servicio está arriba |
@@ -1319,7 +1319,7 @@ Volúmenes compartidos:
 ```
 
 > El stack **no** monta `docker.sock`: ningún DAG usa `DockerOperator`. Montarlo daría control del
-> host a los servicios de Airflow que heredan este ancla (§8.4).
+> host a los servicios de Airflow que heredan este ancla (sección 8.4).
 
 ---
 
@@ -1333,7 +1333,7 @@ Volúmenes compartidos:
 > **HDFS es solo local.** En producción no existe: el storage es S3 (`s3a://`). Está
 > acá para que puedas practicar el modelo de archivos distribuido sin pagar nada, no
 > porque sea el destino. El layout obligatorio se documenta en
-> [06 — Medallion desde cero, §3](06-medallion-desde-cero.md#3-preparar-el-entorno-una-sola-vez).
+> [06 — Medallion desde cero, sección 3](06-medallion-desde-cero.md#3-preparar-el-entorno-una-sola-vez).
 
 **Archivo:** `docker-compose.yml`, servicios `hdfs-namenode` y `hdfs-datanode`.
 **Tipo:** configuración Compose; no es código HDFS ni hay que crear un segundo YAML.
@@ -1377,7 +1377,7 @@ Volúmenes compartidos:
 
 > [!NOTE]
 > **En producción este cluster no existe**: el cómputo se delega a EMR Serverless
-> ([02 §6.4](02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless)). Lo que **sí** viaja
+> ([guía 02, sección 6.4](02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless)). Lo que **sí** viaja
 > es tu código: la lógica de transformación es la misma y por eso conviene mantenerla
 > desacoplada del I/O mediante el runtime compartido.
 
@@ -1424,7 +1424,7 @@ contenedor (PID 1 terminado → `Exited(0)`). La solución es arrancar la clase 
 de Spark ni se ejecuta con `spark-submit`.
 
 > `spark-history-server` está comentado en el Compose. Descomentarlo da la UI de jobs terminados
-> leyendo `./spark-events` (§8.5).
+> leyendo `./spark-events` (sección 8.5).
 
 ---
 
@@ -1438,7 +1438,7 @@ de Spark ni se ejecuta con `spark-submit`.
 > **Jupyter corre bajo el perfil `dev` y no debe llegar a producción.** Sin token es
 > ejecución remota de código para cualquiera que alcance el puerto — por eso
 > `JUPYTER_TOKEN` está en el checklist de la sección 9 y por eso el stack de
-> producción ([02 §14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)) no lo
+> producción ([guía 02, sección 14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)) no lo
 > incluye.
 
 **Archivo:** `docker-compose.yml`, servicio `jupyter`.
@@ -1468,7 +1468,7 @@ de Spark ni se ejecuta con `spark-submit`.
   usar `task local:up-dev` o `docker compose --profile dev up` de forma explícita.
 
   > **No crees el `.env` todavía solo para leer esta sección.** La creación completa y verificable
-  > está en [§8.1](#81-secretos-en-un-env). A diferencia del `.env` de producción (guía 02 §13.4),
+  > está en [sección 8.1](#81-secretos-en-un-env). A diferencia del `.env` de producción (guía 02, sección 13.4),
   > este es un único archivo local: se crea una vez en la raíz del repositorio y no crece por
   > secciones.
 - **`Dockerfile.jupyter` se construye sobre `apache/spark:4.2.0`**, no sobre la clásica
@@ -1494,7 +1494,7 @@ en `notebooks/` y son los que contienen tu código.
 
 Importa más que las otras porque **Airflow es lo único de este Compose que sobrevive
 tal cual a producción**: la EC2 corre estos mismos procesos
-([02 §14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)). Lo que cambia allá es
+([guía 02, sección 14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)). Lo que cambia allá es
 lo que los rodea, no ellos.
 
 Airflow 3 separó el viejo monolito (`webserver` + `scheduler`) en procesos independientes; todos
@@ -1597,7 +1597,7 @@ networks:
 ```
 
 - **Volúmenes nombrados:** los gestiona Docker en `/var/lib/docker/volumes`; su ciclo de vida es el
-  de §3.
+  de la sección 3.
 - **Bind mounts** (`./dags`, `./spark-apps`): carpetas del host mapeadas dentro del contenedor,
   ideales para editar código en caliente.
 - **Una sola red** simplifica el DNS. En producción se podría segmentar (datos y orquestación) para
@@ -1622,7 +1622,7 @@ pronto queda esperando executors.
 ## 8. Endurecimiento del stack local
 
 > **En esta sección: EJECUTAR, ~20 min.** Completás el único archivo local no versionado (`.env`)
-> y validás el endurecimiento que creaste en §0.
+> y validás el endurecimiento que creaste en la sección 0.
 > **Salís con**: secretos propios en un `.env` fuera de git, límites de memoria,
 > healthchecks reales, logs persistentes pero acotados y `docker.sock` fuera del stack.
 
@@ -1632,11 +1632,11 @@ pronto queda esperando executors.
 
 ```mermaid
 flowchart TD
-    E1["§8.1 · Secretos en un .env<br/><i>openssl, no los defaults</i>"]
-    E2["§8.2 · Override de endurecimiento<br/><i>límites, healthchecks y restart</i>"]
-    E3["§8.3 · Secretos parametrizados en el base<br/><i>ya está: el Compose interpola</i>"]
-    E4["§8.4 · docker.sock fuera del stack<br/><i>ya está: no se monta</i>"]
-    E5["§8.5 · History server (opcional)<br/><i>para ver los jobs ya terminados</i>"]
+    E1["sección 8.1 · Secretos en un .env<br/><i>openssl, no los defaults</i>"]
+    E2["sección 8.2 · Override de endurecimiento<br/><i>límites, healthchecks y restart</i>"]
+    E3["sección 8.3 · Secretos parametrizados en el base<br/><i>ya está: el Compose interpola</i>"]
+    E4["sección 8.4 · docker.sock fuera del stack<br/><i>ya está: no se monta</i>"]
+    E5["sección 8.5 · History server (opcional)<br/><i>para ver los jobs ya terminados</i>"]
     GATE["✅ Gate del stack local<br/>checklist de la sección 9 completo ·<br/>listo para escribir el primer DAG ·<br/>nada sensible en git"]
 
     E1 --> E2 --> E3 --> E4 --> GATE
@@ -1648,7 +1648,7 @@ flowchart TD
 
 **Reglas de esta sección:**
 
-- **El endurecimiento de recursos va en el override creado en §0.13.** Los controles que deben estar
+- **El endurecimiento de recursos va en el override creado en la sección 0.13.** Los controles que deben estar
   siempre activos —secretos obligatorios, loopback y rotación de logs— viven en el Compose base.
 - **`.env` nunca se commitea.** Está en `.gitignore`; `.env.example` es el que viaja,
   con placeholders. Un secreto commiteado sigue en la historia aunque lo borres
@@ -1658,7 +1658,7 @@ flowchart TD
 - **No existen defaults para secretos.** Si falta uno, Compose aborta antes de crear contenedores;
   `task local:check` además rechaza longitudes y valores conocidos inseguros.
 
-> **Gotcha §8.1 — cambiar `POSTGRES_PASSWORD` con el volumen ya creado no hace nada.**
+> **Punto de atención — sección 8.1:** cambiar `POSTGRES_PASSWORD` con el volumen ya creado no hace nada.**
 > Postgres solo aplica esas variables al **inicializar** el volumen de datos. Si ya
 > levantaste el stack con la contraseña vieja, la nueva se ignora en silencio y vas a
 > creer que la rotaste. Hay que recrear el volumen (perdiendo la metadata de Airflow)
@@ -1668,12 +1668,12 @@ Lo que es aceptable en desarrollo pero no en producción:
 
 | # | Problema | Riesgo | Estado |
 |---|---|---|---|
-| 1 | Secretos con defaults débiles | Arranque accidental con credenciales conocidas | Resuelto: obligatorios + gate local (§8.1) |
-| 2 | Sin `restart` en HDFS, Spark y Jupyter | Un crash deja el servicio caído | Resuelto en el override de §0.13 (§8.2) |
-| 3 | Sin healthchecks salvo en Postgres | `depends_on` no sabe si el servicio *funciona* | Resuelto en base/override (§8.2) |
-| 4 | Sin límites de recursos | Un job de Spark puede comerse toda la RAM del host | Resuelto en el override de §0.13 (§8.2) |
-| 5 | Jupyter sin token | Cualquiera en la red entra | Resuelto: token obligatorio y puerto loopback (§8.1) |
-| 6 | Montaje de `docker.sock` | Control del host para todos los procesos de Airflow | Resuelto: no se monta (§8.4) |
+| 1 | Secretos con defaults débiles | Arranque accidental con credenciales conocidas | Resuelto: obligatorios + gate local (sección 8.1) |
+| 2 | Sin `restart` en HDFS, Spark y Jupyter | Un crash deja el servicio caído | Resuelto en el override de la sección 0.13 (sección 8.2) |
+| 3 | Sin healthchecks salvo en Postgres | `depends_on` no sabe si el servicio *funciona* | Resuelto en base/override (sección 8.2) |
+| 4 | Sin límites de recursos | Un job de Spark puede comerse toda la RAM del host | Resuelto en el override de la sección 0.13 (sección 8.2) |
+| 5 | Jupyter sin token | Cualquiera en la red entra | Resuelto: token obligatorio y puerto loopback (sección 8.1) |
+| 6 | Montaje de `docker.sock` | Control del host para todos los procesos de Airflow | Resuelto: no se monta (sección 8.4) |
 | 7 | Clave `version:` obsoleta | Warning en cada comando de Compose | Resuelto: eliminada |
 | 8 | Logs locales sin límite | El disco puede llenarse aunque los contenedores sigan sanos | Resuelto: rotación + retención acotada |
 
@@ -1705,7 +1705,7 @@ docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml exec a
 `docker compose down -v` sí elimina deliberadamente `airflow_logs`, Postgres y HDFS; no lo use
 como parada rutinaria. La retención por edad limita el histórico y la rotación limita ráfagas de
 los contenedores. En producción, la copia durable va a S3 y se elimina del host tras subirla
-([guía 02 §14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)).
+([guía 02, sección 14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)).
 
 ### 8.1 Secretos en un `.env`
 
@@ -1757,7 +1757,7 @@ chmod 600 .env
 task local:check
 ```
 
-Si `task local:check` falla, corregí la línea que indique y repetilo. No avances a §8.2 hasta que
+Si `task local:check` falla, corregí la línea que indique y repetilo. No avances a la sección 8.2 hasta que
 termine correctamente.
 
 ### 8.2 Override de endurecimiento
@@ -1765,7 +1765,7 @@ termine correctamente.
 Usá un override que Compose fusiona para añadir `restart`, healthchecks y límites de memoria. La
 rotación y retención de logs ya están en el Compose base y no se duplican aquí.
 
-**Archivo creado en §0.13, no editar ni copiar de nuevo:**
+**Archivo creado en la sección 0.13, no editar ni copiar de nuevo:**
 `docker-compose.local-hardened.yml`. `task local:up` siempre lo combina con el Compose base. En
 el camino normal de esta guía, solo verificás que Docker pueda fusionarlo; no pegues sus servicios dentro de
 `docker-compose.yml`:
@@ -1775,18 +1775,18 @@ task local:check
 ```
 
 **Resultado esperado:** el comando termina con código 0 y no imprime errores de interpolación ni
-de YAML. El arranque viene en §9.1, después de terminar las decisiones opcionales de esta sección.
+de YAML. El arranque viene en la sección 9.1, después de terminar las decisiones opcionales de esta sección.
 
 > Este override endurece el **stack local completo**, útil si querés correrlo así en una sola
 > máquina. No confundir con producción: el Compose de producción de la
-> [guía 02 §14.1](02-produccion-aws-terraform.md) **no levanta** HDFS ni Spark —en la EC2 solo corren
+> [guía 02, sección 14.1](02-produccion-aws-terraform.md) **no levanta** HDFS ni Spark —en la EC2 solo corren
 > Airflow, Postgres y el monitoreo— porque el cómputo va a EMR Serverless y el storage a S3.
 
 ### 8.3 Secretos parametrizados en el Compose base
 
-**Archivo creado en §0.12, solo lectura en esta sección:** `docker-compose.yml`. Ya está aplicado:
+**Archivo creado en la sección 0.12, solo lectura en esta sección:** `docker-compose.yml`. Ya está aplicado:
 el Compose usa `${VAR:?mensaje}` para los cuatro secretos. No pegues estos fragmentos ni añadas otra
-sección `environment:`; son evidencia de lo que validaste en §8.1. Sin `.env`, o con un valor
+sección `environment:`; son evidencia de lo que validaste en la sección 8.1. Sin `.env`, o con un valor
 vacío, la expansión falla antes de arrancar.
 
 **Recorte 1:** servicio `airflow-db` del mismo archivo. **Tipo:** configuración Compose.
@@ -1810,7 +1810,7 @@ x-airflow-common: &airflow-common
 
 > Los nombres de usuario y base conservan defaults no sensibles; las contraseñas, JWT y token no.
 > El Compose de producción deberá cargarlos desde SSM antes de arrancar
-> ([guía 02 §13](02-produccion-aws-terraform.md)).
+> ([guía 02, sección 13](02-produccion-aws-terraform.md)).
 
 ### 8.4 Mantener `docker.sock` fuera del stack
 
@@ -1862,7 +1862,7 @@ que creaste desde la guía; conviene hacerlo en una rama y conservar el cambio e
 > el comando de apagado que conserva tus datos.
 
 **Directorio para todos los comandos de esta sección:** la raíz del proyecto. Esta sección no crea
-ni edita archivos: usa el `.env` que creaste y validaste en §8.1.
+ni edita archivos: usa el `.env` que creaste y validaste en la sección 8.1.
 
 ### 9.1 Arrancar
 
@@ -1919,7 +1919,7 @@ worker disponible. Si dejaste `COMPOSE_PROFILES` vacío, Jupyter no arranca por 
 cuarto comando y no uses su URL.
 
 Si los comandos que correspondan terminan correctamente, están listos Spark, HDFS, Airflow y Jupyter.
-Después de completar Web Events en [06 §16](06-medallion-desde-cero.md#16-proyecto-03--web-events),
+Después de completar Web Events en [06 sección 16](06-medallion-desde-cero.md#16-proyecto-03--web-events),
 ejecutá `task local:smoke`. En un checkout recién clonado ese comando falla de forma esperada hasta
 que exista ese DAG. Si uno de los cuatro checks anteriores falla, no ejecutes los pipelines: revisá `docker compose -f docker-compose.yml -f
 docker-compose.local-hardened.yml ps` y resolvé ese servicio primero.
@@ -1942,7 +1942,7 @@ resto en contestar después de figurar `Up`.
 
 ### 9.3 Credenciales
 
-Viven en el `.env`, que está fuera de git (§8.1). Para mostrarlas cuando las necesites, ejecutá:
+Viven en el `.env`, que está fuera de git (sección 8.1). Para mostrarlas cuando las necesites, ejecutá:
 
 ```bash
 task local:credentials
