@@ -15,9 +15,8 @@ diez minutos.
 ## Decisión
 
 **Spark corre en EMR Serverless**, con su propio rol de ejecución, y la EC2 queda como orquestador:
-solo Airflow + Postgres + monitoreo. Airflow lanza cada job con `EmrServerlessStartJobOperator` y lo
-poolea con `EmrServerlessJobSensor` ([guía 02 §9.4](../02-produccion-aws-terraform.md#94-dag-de-referencia-para-emr-serverless));
-nunca corre `spark-submit` local.
+Airflow + Postgres y, solo si se justifica, observabilidad local. Airflow lanza cada job con
+`EmrServerlessStartJobOperator` deferrable; nunca corre `spark-submit` local.
 
 Consecuencia directa: la EC2 baja a `t3.large` burstable, que es lo correcto para una carga que pasa
 la mayor parte del tiempo idle.
@@ -27,8 +26,8 @@ la mayor parte del tiempo idle.
 **Se gana:**
 
 - La app escala a cero entre corridas: sin job, no hay factura de cómputo.
-- El techo de gasto es explícito (`maximum_capacity`, 16 vCPU / 64 GB) y no depende de que nadie se
-  olvide de apagar un cluster.
+- El techo de gasto es explícito (`maximum_capacity`, concurrencia 1, cola acotada y timeout por
+  job) y no depende de que nadie se olvide de apagar un cluster.
 - Los permisos de Spark quedan separados de los de Airflow: el job tiene su propio rol, acotado a
   los dos buckets del lake ([guía 02 §6.4](../02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless)).
 
@@ -52,5 +51,5 @@ la mayor parte del tiempo idle.
 ## Dónde vive
 
 Guía 02 [guía 02 §6.4](../02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless) (módulo `emr`),
-[guía 02 §9.4](../02-produccion-aws-terraform.md#94-dag-de-referencia-para-emr-serverless) (el DAG) y
+[guía 02 §6.6](../02-produccion-aws-terraform.md#66-dag-ejecutable-de-referencia) (el DAG) y
 [guía 02 §17](../02-produccion-aws-terraform.md#17-qué-motor-usar-para-cada-tarea) (cuándo usar cada motor).

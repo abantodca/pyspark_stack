@@ -16,12 +16,1089 @@
 >
 > **Qué implica en la práctica**: un job que dependa de rutas `hdfs://` escritas a
 > mano funciona acá y falla allá. Parametrizá la URI base desde el principio; el
-> contrato local está en [04 — DataOps local](04-dataops-local.md).
+> contrato local está en [06 — Medallion desde cero](06-medallion-desde-cero.md#3-preparar-el-entorno-una-sola-vez).
 
-> **En este documento: LEER (~40 min) y EJECUTAR el endurecimiento de la sección 8.**
+> **En este documento: CREAR (~30 min), LEER (~40 min) y EJECUTAR el endurecimiento de la sección 8.**
 > **Salís con**: entender por qué cada servicio está donde está —no solo cómo
 > levantarlo—, y con el stack endurecido lo suficiente para que sea un laboratorio y
 > no una máquina abierta.
+
+## 0. Construcción incremental del entorno
+
+> **En esta sección: CREAR, ~30 min.** El checkout no trae los archivos de infraestructura:
+> los generás una vez, en este orden, copiando cada bloque completo. Esta sección es la fuente
+> canónica de `docker-compose.yml`, los Dockerfiles, el Taskfile y sus archivos de soporte.
+>
+> **Salís con**: una raíz lista para ejecutar `task local:check`, sin configuración oculta ni
+> archivos de infraestructura preinstalados.
+
+Todos los comandos y rutas de esta sección parten de la raíz del proyecto. Primero, creá los
+directorios que recibirán los archivos y el código que escribirás más adelante:
+
+```bash
+mkdir -p dags dags/guia dags/medallion dags/medallion_dags \
+  hadoop-config ops notebooks spark-apps/projects spark-events
+```
+
+Para cada bloque siguiente: **CREAR** el archivo indicado, copiá su contenido completo y guardalo
+con ese nombre exacto. No combines bloques ni cambies rutas. Si ya existe un archivo porque retomás
+la guía, comparalo con el bloque antes de reemplazarlo.
+
+### 0.1 · Proteger secretos y artefactos locales
+
+**CREAR:** `.gitignore`
+
+```gitignore
+# --- Secretos / entorno ---
+.env
+# Overrides locales del cargador de contexto (guía 02 §3.1): rutas y perfil de TU máquina.
+# El patrón `.env` de arriba NO lo cubre: gitignore compara nombres completos, y este se
+# llama prod.env. Commitearlo apuntaría los comandos de otra persona a tu cuenta o tu clave.
+**/prod.env
+*.pem
+*.key
+
+# --- Terraform ---
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+**/tfplan
+# .terraform.lock.hcl SI se versiona: pinea las versiones exactas de los providers, para que un
+# init de hoy y uno de dentro de 6 meses instalen lo mismo (mismo criterio que COMPOSE_VERSION).
+
+# --- Config de monitoreo con credenciales ---
+monitoring/alertmanager/alertmanager.yml
+
+# --- Python ---
+**/__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# --- Spark ---
+# Se ignoran los event logs, pero la config de eventLog sí se versiona:
+spark-events/*
+!spark-events/spark-defaults.conf
+
+# --- Salidas de notebooks ejecutados ---
+notebooks/**/output/
+spark-apps/notebook-output/
+
+# --- Salidas y logs de ejecucion (resultados, no fuente) ---
+spark-apps/shared_output/
+spark-apps/logs/
+# Área de trabajo del taller 06: los .py que escribís siguiendo los ejemplos
+# y sus salidas. Es un laboratorio personal, no fuente del proyecto.
+spark-apps/ejemplos/
+
+# --- Lambdas empaquetadas ---
+**/lambda/*.zip
+infra/modules/*/*.zip
+
+# --- SO / editor ---
+.DS_Store
+*.swp
+```
+
+### 0.2 · Aislar el contexto de build
+
+**CREAR:** `.dockerignore`
+
+```
+# Las imágenes sólo copian este archivo. No enviar .env, state, datos ni el repo completo al daemon.
+**
+!requirements.txt
+```
+
+### 0.3 · Declarar los providers de Airflow
+
+**CREAR:** `requirements.txt`
+
+```text
+# Providers para Airflow 3.2.2 (Python 3.14).
+# Versiones tomadas del constraints file oficial constraints-3.2.2/constraints-3.14.txt.
+# - apache-spark: SparkSubmitOperator para lanzar los jobs contra el cluster standalone.
+# - fab: necesario en Airflow 3 para el FabAuthManager y el comando `airflow users create`.
+# pyspark==4.2.0 se instala aparte en Dockerfile.airflow (sin constraints) para casar con el cluster Spark 4.2.0.
+apache-airflow-providers-apache-spark==6.0.2
+apache-airflow-providers-fab==3.6.4
+# Producción: EmrServerlessStartJobOperator. Pin compatible con Airflow 3.2.2/Python 3.14.
+apache-airflow-providers-amazon[aiobotocore]==9.29.0
+```
+
+### 0.4 · Construir la imagen de Airflow
+
+**CREAR:** `Dockerfile.airflow`
+
+```dockerfile
+# Airflow 3.2.2 (rama 3.2, la mas madura a jul-2026) sobre Python 3.14 + Spark 4.2.0.
+# Stack "lo mas actual manteniendo estabilidad": Python 3.14 obliga a PySpark >= 4.1 (4.0.x
+# solo declara soporte hasta 3.13 y su cloudpickle no serializa contra el bytecode de 3.14).
+# Se usa Spark 4.2.0, que requiere Java 17 -> se instala Temurin (Adoptium) JDK 17 desde
+# tarball (bookworm no trae openjdk-11; y Spark 4 ya no soporta Java 11).
+FROM apache/spark:4.2.0-scala2.13-java17-python3-ubuntu@sha256:84a4eedb1abcf36a90808d5a1310e3e910b78c85d85aaa1599e31af5f862ed59 AS spark-runtime
+
+FROM apache/airflow:3.2.2-python3.14@sha256:db1b6917b2460637faa28fda794fa2c419f4618c7a79062f2e863a62cfc1132f
+
+ARG AIRFLOW_VERSION=3.2.2
+ARG PYTHON_VERSION=3.14
+ARG SPARK_VERSION=4.2.0
+# JDK 17 (x86_64). Si cambias de arquitectura, ajusta esta URL de Adoptium.
+ARG TEMURIN_JDK_URL=https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.18%2B8/OpenJDK17U-jdk_x64_linux_hotspot_17.0.18_8.tar.gz
+
+USER root
+
+# ----------------------------
+#  Install Java 17 (Temurin). Spark se copia de su imagen oficial pineada y cacheable.
+# ----------------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl procps && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /opt/java && \
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 3 "${TEMURIN_JDK_URL}" -o /tmp/temurin.tar.gz && \
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 3 "${TEMURIN_JDK_URL}.sha256.txt" -o /tmp/temurin.sha256 && \
+    printf '%s  %s\n' "$(awk '{print $1}' /tmp/temurin.sha256)" /tmp/temurin.tar.gz | sha256sum -c - && \
+    tar -xzf /tmp/temurin.tar.gz -C /opt/java --strip-components=1 && \
+    rm -f /tmp/temurin.tar.gz /tmp/temurin.sha256
+
+COPY --from=spark-runtime /opt/spark /opt/spark
+
+ENV JAVA_HOME=/opt/java
+ENV SPARK_HOME=/opt/spark
+ENV PATH="${PATH}:${JAVA_HOME}/bin:${SPARK_HOME}/bin"
+
+# ----------------------------
+# 🔁 Switch back to airflow user and install Python providers
+#    Se usa el constraints file OFICIAL de Airflow 3.2.2 para no romper la version de airflow.
+# ----------------------------
+USER airflow
+COPY requirements.txt /
+RUN pip install --no-cache-dir -r /requirements.txt \
+      --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+
+# pyspark 4.2.0 SIN constraints: debe casar con el cluster Spark 4.2.0.
+RUN pip install --no-cache-dir 'pyspark[sql]==4.2.0' 'pytest==8.4.2'
+```
+
+### 0.5 · Construir la imagen de Spark
+
+**CREAR:** `Dockerfile.spark`
+
+```dockerfile
+# Cluster Spark 4.2.0 (master/worker) con Python 3.14.
+# La imagen oficial apache/spark:4.2.0 es Ubuntu 22.04 -> trae Python 3.10, pero el driver
+# (Airflow, Python 3.14) exige que los executors corran el MISMO minor de Python
+# ([PYTHON_VERSION_MISMATCH] si no). Se instala Python 3.14 desde el PPA deadsnakes y se
+# fuerza PYSPARK_PYTHON=python3.14 para que los workers PySpark casen con el driver.
+FROM apache/spark:4.2.0-scala2.13-java17-python3-ubuntu@sha256:84a4eedb1abcf36a90808d5a1310e3e910b78c85d85aaa1599e31af5f862ed59
+
+USER root
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends software-properties-common && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends python3.14 python3.14-venv && \
+    python3.14 -m ensurepip --upgrade && \
+    python3.14 -m pip install --no-cache-dir \
+      'numpy==2.4.6' 'pandas==2.3.3' 'pyarrow==24.0.0' && \
+    apt-get purge -y software-properties-common && apt-get autoremove -y && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# El runtime PySpark ya forma parte de /opt/spark en la imagen oficial. Se instalan
+# solo los extras de pandas UDF, alineados con el driver Airflow. Reinstalar el paquete
+# PySpark de 434 MB duplica artefactos, alarga el build y agrega un punto de fallo.
+
+# Los executors PySpark arrancan con este interprete (debe casar con el driver 3.14).
+ENV PYSPARK_PYTHON=python3.14
+ENV PYSPARK_DRIVER_PYTHON=python3.14
+
+# --- Conector S3A: habilita leer/escribir s3a:// usando el rol IAM de la EC2 (sin keys) ---
+# Spark 4.2.0 empaqueta Hadoop 3.5.0 => hadoop-aws debe ser 3.5.0 y el AWS SDK v2 el que
+# declara esa version (bundle 2.35.4). Si aparece ClassNotFound/NoSuchMethod de S3A, ajusta estas versiones.
+ARG HADOOP_AWS_VERSION=3.5.0
+ARG AWS_SDK_BUNDLE_VERSION=2.35.4
+# hadoop-aws 3.5.0 declara ademas el Analytics Accelerator (solo se carga con
+# fs.s3a.input.stream.type=analytics, pero sin el jar seria NoClassDefFoundError).
+ARG AAL_VERSION=1.3.1
+RUN curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
+      -o "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
+    curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar.sha1" -o /tmp/hadoop-aws.jar.sha1 && \
+    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/hadoop-aws.jar.sha1)" "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" | sha1sum -c - && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" \
+      -o "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar.sha1" -o /tmp/aws-bundle.jar.sha1 && \
+    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/aws-bundle.jar.sha1)" "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" | sha1sum -c - && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/s3/analyticsaccelerator/analyticsaccelerator-s3/${AAL_VERSION}/analyticsaccelerator-s3-${AAL_VERSION}.jar" \
+      -o "/opt/spark/jars/analyticsaccelerator-s3-${AAL_VERSION}.jar" && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/s3/analyticsaccelerator/analyticsaccelerator-s3/${AAL_VERSION}/analyticsaccelerator-s3-${AAL_VERSION}.jar.sha1" -o /tmp/aal.jar.sha1 && \
+    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/aal.jar.sha1)" "/opt/spark/jars/analyticsaccelerator-s3-${AAL_VERSION}.jar" | sha1sum -c - && \
+    rm -f /tmp/hadoop-aws.jar.sha1 /tmp/aws-bundle.jar.sha1 /tmp/aal.jar.sha1
+
+USER spark
+```
+
+### 0.6 · Construir la imagen de Jupyter
+
+**CREAR:** `Dockerfile.jupyter`
+
+```dockerfile
+# Jupyter sobre la imagen OFICIAL de Spark 4.2.0 (Java 17 ya incluido).
+# La base trae Python 3.10, pero el cluster corre Python 3.14 -> se instala Python 3.14
+# (deadsnakes) para que el driver del notebook case con los executors (evita PYTHON_VERSION_MISMATCH).
+# (jupyter/pyspark-notebook solo llega a Spark 3.5, por eso no se usa.)
+FROM apache/spark:4.2.0-scala2.13-java17-python3-ubuntu@sha256:84a4eedb1abcf36a90808d5a1310e3e910b78c85d85aaa1599e31af5f862ed59
+
+USER root
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends software-properties-common && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends python3.14 python3.14-venv && \
+    python3.14 -m ensurepip --upgrade && \
+    python3.14 -m pip install --no-cache-dir \
+      'jupyterlab==4.6.3' 'pytest==8.4.2' 'six==1.17.0' \
+      'numpy==2.4.6' 'pandas==2.3.3' 'pyarrow==24.0.0' && \
+    apt-get purge -y software-properties-common && apt-get autoremove -y && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /opt/notebooks
+
+# --- Conector S3A: habilita s3a:// desde el notebook usando el rol IAM de la EC2 ---
+ARG HADOOP_AWS_VERSION=3.5.0
+ARG AWS_SDK_BUNDLE_VERSION=2.35.4
+# hadoop-aws 3.5.0 declara ademas el Analytics Accelerator (solo se carga con
+# fs.s3a.input.stream.type=analytics, pero sin el jar seria NoClassDefFoundError).
+ARG AAL_VERSION=1.3.1
+RUN curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
+      -o "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
+    curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar.sha1" -o /tmp/hadoop-aws.jar.sha1 && \
+    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/hadoop-aws.jar.sha1)" "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" | sha1sum -c - && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" \
+      -o "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar.sha1" -o /tmp/aws-bundle.jar.sha1 && \
+    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/aws-bundle.jar.sha1)" "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" | sha1sum -c - && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/s3/analyticsaccelerator/analyticsaccelerator-s3/${AAL_VERSION}/analyticsaccelerator-s3-${AAL_VERSION}.jar" \
+      -o "/opt/spark/jars/analyticsaccelerator-s3-${AAL_VERSION}.jar" && \
+    curl -fSL "https://repo1.maven.org/maven2/software/amazon/s3/analyticsaccelerator/analyticsaccelerator-s3/${AAL_VERSION}/analyticsaccelerator-s3-${AAL_VERSION}.jar.sha1" -o /tmp/aal.jar.sha1 && \
+    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/aal.jar.sha1)" "/opt/spark/jars/analyticsaccelerator-s3-${AAL_VERSION}.jar" | sha1sum -c - && \
+    rm -f /tmp/hadoop-aws.jar.sha1 /tmp/aws-bundle.jar.sha1 /tmp/aal.jar.sha1
+
+WORKDIR /opt/notebooks
+EXPOSE 8888
+
+# El driver del notebook y los executors usan Python 3.14 (igual que el cluster).
+ENV PYSPARK_PYTHON=python3.14
+ENV PYSPARK_DRIVER_PYTHON=python3.14
+# La distribución oficial ya incluye PySpark y Py4J; se exponen al Python de Jupyter
+# sin descargar una segunda copia de 434 MB desde PyPI.
+ENV PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.9-src.zip
+
+# Token controlado por la env var JUPYTER_TOKEN (sh expande la variable y exec
+# entrega las señales directamente a JupyterLab):
+#  - sin definir/vacia -> sin token (entorno local de practica, igual que antes);
+#  - definida (override de prod, ver docs/02 §14.1, docker-compose.prod.yml) -> token obligatorio.
+CMD ["sh", "-c", "exec python3.14 -m jupyterlab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token=\"${JUPYTER_TOKEN:-}\" --ServerApp.password= --ServerApp.root_dir=/opt/notebooks"]
+```
+
+### 0.7 · Preparar el History Server opcional
+
+**CREAR:** `Dockerfile.history`
+
+```dockerfile
+# Spark History Server 4.2.0 — misma imagen oficial que el cluster (Java 17), para poder
+# leer los event logs que generan master/worker/driver 4.2.0.
+# Se arranca la clase en foreground con spark-class: sbin/start-history-server.sh daemoniza
+# y el contenedor saldria con Exited(0) (mismo patron que master/worker en el compose).
+FROM apache/spark:4.2.0-scala2.13-java17-python3-ubuntu
+
+# Lee los event logs de /tmp/spark-events (bind-mount de ./spark-events en el compose).
+ENV SPARK_HISTORY_OPTS="-Dspark.history.fs.logDirectory=file:/tmp/spark-events"
+
+EXPOSE 18080
+
+ENTRYPOINT ["/opt/spark/bin/spark-class"]
+CMD ["org.apache.spark.deploy.history.HistoryServer"]
+```
+
+### 0.8 · Configurar el cliente HDFS
+
+**CREAR:** `hadoop-config/core-site.xml`
+
+```xml
+<configuration>
+  <property>
+    <name>fs.defaultFS</name>
+    <value>hdfs://hdfs-namenode:9000</value>
+  </property>
+</configuration>
+```
+
+### 0.9 · Declarar los orígenes de datos
+
+**CREAR:** `ops/sources.env`
+
+```dotenv
+# Orígenes de datos propios de cada proyecto medallion.
+#
+# Descomentá la variable del proyecto y apuntala a tu archivo en HDFS. Sin valor, el DAG
+# usa su fixture mínimo de ejemplo. Los cambios se aplican al recrear los contenedores:
+#
+#   Seguí docs/06-medallion-desde-cero.md §3 para preparar HDFS y subir el archivo.
+#   task local:up                                             # aplica este archivo
+#
+# El DAG de cada proyecto declara el formato y las columnas que espera.
+# Los orígenes JSON son JSON Lines: un objeto por línea, sin corchete envolvente.
+# Este archivo se versiona: no pongas acá credenciales ni rutas con secretos.
+
+# --- Un origen por proyecto ------------------------------------------------------
+#CUSTOMER_360_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/customer_360/customers.json
+#DAILY_SALES_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/daily_sales/sales.csv
+#FRAUD_SIGNALS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/fraud_signals/alerts.json
+#INVENTORY_SNAPSHOT_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/inventory_snapshot/stock.csv
+#MARKETING_ATTRIBUTION_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/marketing_attribution/touchpoints.json
+#PAYMENT_RECONCILIATION_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/payment_reconciliation/payments.csv
+#PRODUCT_CATALOG_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/product_catalog/products.json
+#SUPPLIER_PERFORMANCE_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/supplier_performance/deliveries.csv
+#SUPPORT_TICKETS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/support_tickets/tickets.json
+#WEB_EVENTS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/web_events/events.json
+
+# --- Varios orígenes por proyecto: se pueden definir de a uno -------------------
+#AML_TRANSACTIONS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/aml_transaction_monitoring/transactions.json
+#AML_CUSTOMERS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/aml_transaction_monitoring/customers.json
+#AML_WATCHLIST_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/aml_transaction_monitoring/watchlist.csv
+
+#CHURN_CUSTOMERS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/customer_churn_features/customers.json
+#CHURN_SUBSCRIPTIONS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/customer_churn_features/subscriptions.json
+#CHURN_USAGE_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/customer_churn_features/usage.csv
+#CHURN_TICKETS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/customer_churn_features/tickets.json
+
+#DEMAND_SALES_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/demand_forecasting/sales.csv
+#DEMAND_PROMOTIONS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/demand_forecasting/promotions.json
+#DEMAND_INVENTORY_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/demand_forecasting/inventory.json
+
+#OTIF_ORDERS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/order_fulfillment_otif/orders.json
+#OTIF_FULFILLMENT_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/order_fulfillment_otif/fulfillment.json
+#OTIF_DELIVERY_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/order_fulfillment_otif/delivery.csv
+
+#SUBSCRIPTION_EVENTS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/subscription_revenue/events.json
+#SUBSCRIPTION_INVOICES_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/subscription_revenue/invoices.json
+#SUBSCRIPTION_ACCOUNTS_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/subscription_revenue/accounts.json
+#SUBSCRIPTION_FX_SOURCE_URI=hdfs://hdfs-namenode:9000/lakehouse/landing/subscription_revenue/fx_rates.csv
+```
+
+### 0.10 · Limitar los logs de Airflow
+
+**CREAR:** `ops/airflow_log_retention.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly LOG_DIR="/opt/airflow/logs"
+readonly RETENTION_DAYS="${AIRFLOW_LOCAL_LOG_RETENTION_DAYS:-30}"
+readonly MAX_SIZE_MB="${AIRFLOW_LOCAL_LOG_MAX_SIZE_MB:-1024}"
+readonly INTERVAL_MINUTES="${AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES:-15}"
+
+for value in "$RETENTION_DAYS" "$MAX_SIZE_MB" "$INTERVAL_MINUTES"; do
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    echo "log retention values must be positive integers" >&2
+    exit 2
+  fi
+done
+
+mkdir -p "$LOG_DIR"
+
+directory_size_bytes() {
+  du -sb "$LOG_DIR" | awk '{print $1}'
+}
+
+trim_to_size_limit() {
+  local -r max_bytes=$((MAX_SIZE_MB * 1024 * 1024))
+  local current_bytes
+  current_bytes="$(directory_size_bytes)"
+  (( current_bytes <= max_bytes )) && return 0
+
+  while IFS= read -r -d '' entry; do
+    local path="${entry#* }"
+    rm -f -- "$path"
+    current_bytes="$(directory_size_bytes)"
+    (( current_bytes <= max_bytes )) && break
+  done < <(find "$LOG_DIR" -type f -printf '%T@ %p\0' | sort -z -n)
+}
+
+prune_once() {
+  find "$LOG_DIR" -type f -mtime "+$RETENTION_DAYS" -delete
+  trim_to_size_limit
+  find "$LOG_DIR" -depth -type d -empty -delete
+}
+
+case "${1:-}" in
+  --once)
+    prune_once
+    exit 0
+    ;;
+  "") ;;
+  *)
+    echo "usage: $0 [--once]" >&2
+    exit 2
+    ;;
+esac
+
+while true; do
+  prune_once
+  sleep "$((INTERVAL_MINUTES * 60))"
+done
+```
+
+### 0.11 · Preparar eventos de Spark
+
+**CREAR:** `spark-events/spark-defaults.conf`
+
+```
+# Desactivado: el spark-history-server está comentado en docker-compose.yml,
+# por lo que los event logs no tienen consumidor y quedaban huérfanos.
+# Para reactivar el historial: poner esto en 'true' y descomentar el
+# servicio spark-history-server en docker-compose.yml.
+spark.eventLog.enabled           false
+spark.eventLog.dir               file:/tmp/spark-events
+spark.history.fs.logDirectory    file:/tmp/spark-events
+```
+
+### 0.12 · Definir el stack base
+
+**CREAR:** `docker-compose.yml`
+
+```yaml
+# -----------------------------------------------------------------------------
+# Config comun de los servicios de Airflow 3.2.2 (LocalExecutor).
+# Airflow 3 parte el monolito: api-server (UI+API), scheduler, dag-processor y triggerer
+# son procesos independientes que comparten esta misma imagen, env y volumenes.
+# -----------------------------------------------------------------------------
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-airflow-common: &airflow-common
+  # image + build compartidos: la imagen se construye UNA vez y los 5 servicios airflow-*
+  # la reutilizan (evita 5 imagenes duplicadas de ~7GB y que 'up' agarre una imagen vieja).
+  image: pyspark_stack-airflow:3.2.2
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # Un DAG local lanza drivers Spark desde el scheduler. Limitar la concurrencia
+    # evita que un backfill cree decenas de JVM/Python a la vez; las tareas quedan
+    # en cola, no se descartan. Los valores se pueden ampliar desde .env.
+    AIRFLOW__CORE__PARALLELISM: ${AIRFLOW_PARALLELISM:-2}
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW_MAX_ACTIVE_TASKS_PER_DAG:-2}
+    # Con 15 DAGs educativos un solo parser es suficiente y evita otro intérprete
+    # Python residente. Aumentarlo solo cuando el parseo sea el cuello de botella.
+    AIRFLOW__DAG_PROCESSOR__PARSING_PROCESSES: ${AIRFLOW_DAG_PARSING_PROCESSES:-1}
+    # En Airflow 3 la creacion de usuarios/RBAC vive en el provider FAB:
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    # SQL_ALCHEMY_CONN se movio de [core] a [database] en Airflow 3:
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}@airflow-db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+    # El scheduler/worker habla con el api-server via la Task Execution API (nuevo en Airflow 3).
+    # OJO: debe apuntar al hostname del contenedor api-server, NO a localhost:
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    # Reemplaza al viejo WEBSERVER__SECRET_KEY: el api-server firma tokens JWT.
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:?define AIRFLOW_JWT_SECRET en .env}'
+    AIRFLOW_UID: 50000
+    # Contrato de persistencia de los DAGs medallion: todas las capas y archivos
+    # operativos se escriben en HDFS, nunca en el filesystem efimero de Airflow.
+    LAKEHOUSE_ROOT: 'hdfs://hdfs-namenode:9000/lakehouse'
+    HADOOP_CONF_DIR: /opt/hadoop/etc/hadoop
+    SPARK_MASTER: 'spark://spark-master:7077'
+    # El driver Airflow corre con Python 3.14. Spark propaga este ejecutable a
+    # cada executor; sin declararlo usaría `python3` (3.10 en la imagen base).
+    PYSPARK_PYTHON: python3.14
+    PYSPARK_DRIVER_PYTHON: python3.14
+    # dags/ contiene el paquete medallion compartido; spark-apps/projects queda
+    # disponible para entrypoints externos sin mezclar ambos tipos de codigo.
+    PYTHONPATH: /opt/airflow/dags:/opt/spark-apps/projects
+  # Origenes de datos propios: <PROYECTO>_SOURCE_URI se define en ops/sources.env,
+  # sin editar el Compose. Vacio o comentado -> el DAG usa su fixture de ejemplo.
+  env_file:
+    - ./ops/sources.env
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./spark-apps:/opt/spark-apps
+    - ./hadoop-config/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
+    # Persiste los task logs entre recreaciones. airflow-log-cleaner aplica la retencion.
+    - airflow_logs:/opt/airflow/logs
+  logging: *default-logging
+  networks:
+    - hadoopnet
+
+services:
+  hdfs-namenode:
+    #image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    image: chandravenkat/hadoop-namenode@sha256:51ad9293ec52083c5003ef0aaab00c3dd7d6335ddf495cc1257f97a272cab4c0
+    container_name: hdfs-namenode
+    environment:
+      - CLUSTER_NAME=hadoop-cluster
+      - CORE_CONF_fs_defaultFS=hdfs://hdfs-namenode:9000
+      - HDFS_CONF_dfs_webhdfs_enabled=true
+    ports:
+      - "127.0.0.1:9870:9870"
+    volumes:
+      - hdfs-nn-data:/hadoop/dfs/name
+      - ./spark-apps:/opt/spark-apps
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+    networks:
+      - hadoopnet
+
+  # Inicializacion idempotente del namespace local. HDFS simple-auth resuelve el
+  # usuario desde cada contenedor; 0777 se limita a este laboratorio local y
+  # permite que los executors Spark creen los directorios de staging/commit.
+  hdfs-init:
+    image: chandravenkat/hadoop-namenode@sha256:51ad9293ec52083c5003ef0aaab00c3dd7d6335ddf495cc1257f97a272cab4c0
+    container_name: hdfs-init
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        until hdfs dfs -fs hdfs://hdfs-namenode:9000 -ls / >/dev/null 2>&1; do sleep 2; done
+        hdfs dfs -fs hdfs://hdfs-namenode:9000 -mkdir -p /lakehouse
+        hdfs dfs -fs hdfs://hdfs-namenode:9000 -chmod 0777 /lakehouse
+        hdfs dfs -fs hdfs://hdfs-namenode:9000 -mkdir -p /lakehouse/landing
+        hdfs dfs -fs hdfs://hdfs-namenode:9000 -chmod 0777 /lakehouse/landing
+    depends_on:
+      hdfs-namenode:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - hadoopnet
+
+  hdfs-datanode:
+    #image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    image: chandravenkat/hadoop-datanode@sha256:ddf6e9ad55af4f73d2ccb6da31d9e3331ffb94d5f046126db4f40aa348d484bf
+    container_name: hdfs-datanode
+    depends_on:
+      - hdfs-namenode
+    environment:
+      - CLUSTER_NAME=hadoop-cluster
+      - CORE_CONF_fs_defaultFS=hdfs://hdfs-namenode:9000
+      - HDFS_CONF_dfs_replication=1
+      - HDFS_CONF_dfs_webhdfs_enabled=true
+    volumes:
+      - hdfs-dn-data:/hadoop/dfs/data
+      - ./spark-apps:/opt/spark-apps
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9864"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging: *default-logging
+    networks:
+      - hadoopnet
+
+  # Cluster Spark 4.2.0 (imagen oficial Apache, Java 17 + Python 3 para los executors PySpark).
+  # La imagen apache/spark esta pensada para spark-submit/k8s, asi que se arranca el master/worker
+  # standalone en foreground con spark-class (sbin/start-*.sh daemonizan y el contenedor saldria).
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: pyspark_stack-spark:4.2.0
+    container_name: spark-master
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "127.0.0.1:7077:7077"
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ./spark-apps:/opt/spark-apps
+      - ./spark-events:/tmp/spark-events
+    logging: *default-logging
+    networks:
+      - hadoopnet
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: pyspark_stack-spark:4.2.0
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    # No anunciar todos los cores del portatil: cada task PySpark crea procesos
+    # Python. Dos cores y 2 GiB alcanzan para el laboratorio y dejan RAM al host.
+    command:
+      - org.apache.spark.deploy.worker.Worker
+      - --cores
+      - ${SPARK_WORKER_CORES:-2}
+      - --memory
+      - ${SPARK_WORKER_MEMORY:-2g}
+      - spark://spark-master:7077
+    volumes:
+      - ./spark-apps:/opt/spark-apps
+    networks:
+      - hadoopnet
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging: *default-logging
+
+#  spark-history-server:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile.history
+#    image: pyspark_stack-spark-history:4.2.0
+#    container_name: spark-history
+#    entrypoint: ["/opt/spark/bin/spark-class"]
+#    command: ["org.apache.spark.deploy.history.HistoryServer"]
+#    ports:
+#      - "18080:18080"
+#    volumes:
+#      - ./spark-events:/tmp/spark-events
+#      - ./spark-events/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+#    environment:
+#      - SPARK_HISTORY_OPTS=-Dspark.history.fs.logDirectory=file:/tmp/spark-events
+#    networks:
+#      - hadoopnet
+
+  # Jupyter con pyspark 4.2.0 (mismo Spark que el cluster). Se construye desde Dockerfile.jupyter
+  # (base apache/spark:4.2.0) porque jupyter/pyspark-notebook solo ofrece hasta Spark 3.5.
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.jupyter
+    image: pyspark_stack-jupyter:4.2.0
+    container_name: jupyter-notebook
+    # Jupyter es herramienta de DESARROLLO (explorar/depurar antes de promover a DAG).
+    # En prod el ETL corre por Airflow y los .ipynb por papermill (headless, sin este server),
+    # así que aquí queda bajo el perfil "dev": solo arranca si COMPOSE_PROFILES=dev (ver .env.example)
+    # o con `docker compose --profile dev up`. Un `docker compose up` "pelado" (prod) NO lo levanta.
+    profiles: ["dev"]
+    ports:
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:4055:4040"
+    volumes:
+      - ./notebooks:/opt/notebooks
+      - ./spark-apps:/opt/spark-apps
+      - ./spark-events:/tmp/spark-events
+    depends_on:
+      - spark-master
+    networks:
+      - hadoopnet
+    environment:
+      # Notebook driver -> conecta al master standalone y a HDFS.
+      - SPARK_MASTER=spark://spark-master:7077
+      # python3.14 explicito: 'python3' en esta base (Ubuntu 22.04) es 3.10 y pisaria el ENV
+      # del Dockerfile -> [PYTHON_VERSION_MISMATCH] contra los executors (3.14) del cluster.
+      - PYSPARK_PYTHON=python3.14
+      - PYSPARK_DRIVER_PYTHON=python3.14
+      # Sin esta línea el token del .env nunca llega al contenedor: compose usa el .env para
+      # sustituir en el YAML, no lo inyecta en el proceso. Dockerfile.jupyter lo lee como
+      # --ServerApp.token="${JUPYTER_TOKEN:-}" y, vacío, levanta JupyterLab SIN token.
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:?define JUPYTER_TOKEN en .env}
+    healthcheck:
+      test: ["CMD", "python3.14", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/api', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging: *default-logging
+
+  airflow-db:
+    image: postgres:16.14-bookworm@sha256:64154d0babcb1741988719e703419af0382b19953706149f9872fbd0f438efa8
+    container_name: airflow-db
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    networks:
+      - hadoopnet
+
+  # Init one-shot: migra el esquema (core + FAB) y crea el usuario admin, luego sale.
+  # `airflow db migrate` reemplaza al viejo `airflow db upgrade`.
+  # `airflow fab-db migrate` crea las tablas de auth de FAB (ab_user, ab_role, ...), nuevas en Airflow 3.
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      hdfs-init:
+        condition: service_completed_successfully
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow fab-db migrate &&
+        (airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:?define AIRFLOW_ADMIN_PASSWORD en .env} ||
+         airflow users reset-password --username ${AIRFLOW_ADMIN_USER:-admin} --password ${AIRFLOW_ADMIN_PASSWORD:?define AIRFLOW_ADMIN_PASSWORD en .env})"
+
+  # UI + API REST (antes 'airflow webserver'). Sirve en 8080 dentro del contenedor.
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    restart: always
+    command: api-server
+    ports:
+      - "127.0.0.1:8082:8080"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    restart: always
+    command: scheduler
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Nuevo en Airflow 3: el parsing de DAGs corre en un proceso propio, ya no dentro del scheduler.
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    restart: always
+    command: dag-processor
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Ejecuta operadores deferrables (opcional pero recomendado; estandar en Airflow 3).
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    restart: always
+    command: triggerer
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Airflow no elimina por si solo los task logs locales. Este servicio comparte el volumen y
+  # aplica periodicamente edad + tamano maximo; evita que la persistencia crezca sin limite.
+  airflow-log-cleaner:
+    <<: *airflow-common
+    container_name: airflow-log-cleaner
+    restart: unless-stopped
+    environment:
+      <<: *airflow-common-env
+      AIRFLOW_LOCAL_LOG_RETENTION_DAYS: ${AIRFLOW_LOCAL_LOG_RETENTION_DAYS:-30}
+      AIRFLOW_LOCAL_LOG_MAX_SIZE_MB: ${AIRFLOW_LOCAL_LOG_MAX_SIZE_MB:-1024}
+      AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES: ${AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES:-15}
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - ./ops/airflow_log_retention.sh:/opt/pyspark-stack/ops/airflow_log_retention.sh:ro
+    command: ["bash", "/opt/pyspark-stack/ops/airflow_log_retention.sh"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_data:
+  hdfs-nn-data:
+  hdfs-dn-data:
+  airflow_logs:
+
+networks:
+  hadoopnet:
+```
+
+### 0.13 · Endurecer el stack local
+
+**CREAR:** `docker-compose.local-hardened.yml`
+
+```yaml
+services:
+  hdfs-namenode:
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy: {resources: {limits: {memory: "${HDFS_NAMENODE_MEMORY_LIMIT:-1g}"}}}
+
+  hdfs-datanode:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: "${HDFS_DATANODE_MEMORY_LIMIT:-1g}"}}}
+
+  spark-master:
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy: {resources: {limits: {memory: "${SPARK_MASTER_MEMORY_LIMIT:-512m}"}}}
+
+  spark-worker:
+    restart: unless-stopped
+    # Debe ser mayor que SPARK_WORKER_MEMORY para dejar espacio al JVM del worker.
+    deploy: {resources: {limits: {memory: "${SPARK_WORKER_MEMORY_LIMIT:-3g}"}}}
+
+  jupyter:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: "${JUPYTER_MEMORY_LIMIT:-2g}"}}}
+
+  airflow-db:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: "${POSTGRES_MEMORY_LIMIT:-512m}"}}}
+
+  airflow-apiserver:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: "${AIRFLOW_APISERVER_MEMORY_LIMIT:-512m}"}}}
+
+  airflow-scheduler:
+    restart: unless-stopped
+    # El scheduler aloja LocalExecutor y los drivers Spark; por eso conserva más
+    # margen que los demás procesos de control de Airflow.
+    deploy: {resources: {limits: {memory: "${AIRFLOW_SCHEDULER_MEMORY_LIMIT:-1536m}"}}}
+
+  airflow-dag-processor:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: "${AIRFLOW_DAG_PROCESSOR_MEMORY_LIMIT:-512m}"}}}
+
+  airflow-triggerer:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: "${AIRFLOW_TRIGGERER_MEMORY_LIMIT:-512m}"}}}
+
+  airflow-log-cleaner:
+    restart: unless-stopped
+    deploy: {resources: {limits: {memory: "${AIRFLOW_LOG_CLEANER_MEMORY_LIMIT:-128m}"}}}
+```
+
+### 0.14 · Crear el template de configuración local
+
+**CREAR:** `.env.example`
+
+```dotenv
+# Copiá este archivo a .env y completalo. NO commitear .env (ya está en .gitignore).
+# Estos valores son para el stack LOCAL: en producción los secretos se generan fuertes y se cargan
+# desde AWS SSM (ver docs/02-produccion-aws-terraform.md §13).
+
+# El arranque normal incluye Jupyter para conservar el laboratorio completo.
+COMPOSE_PROFILES=dev
+
+# Perfil local equilibrado: procesa los mismos DAGs, pero serializa como máximo dos tasks Spark
+# y usa un worker de 2 cores. Aumentá solo para pruebas de capacidad.
+SPARK_WORKER_CORES=2
+SPARK_WORKER_MEMORY=2g
+AIRFLOW_PARALLELISM=2
+AIRFLOW_MAX_ACTIVE_TASKS_PER_DAG=2
+AIRFLOW_DAG_PARSING_PROCESSES=1
+
+# Techos de memoria del override local. No son memoria reservada: son el máximo de cada contenedor.
+# SPARK_WORKER_MEMORY_LIMIT debe ser mayor que SPARK_WORKER_MEMORY.
+HDFS_NAMENODE_MEMORY_LIMIT=1g
+HDFS_DATANODE_MEMORY_LIMIT=1g
+SPARK_MASTER_MEMORY_LIMIT=512m
+SPARK_WORKER_MEMORY_LIMIT=3g
+JUPYTER_MEMORY_LIMIT=2g
+POSTGRES_MEMORY_LIMIT=512m
+AIRFLOW_APISERVER_MEMORY_LIMIT=512m
+AIRFLOW_SCHEDULER_MEMORY_LIMIT=1536m
+AIRFLOW_DAG_PROCESSOR_MEMORY_LIMIT=512m
+AIRFLOW_TRIGGERER_MEMORY_LIMIT=512m
+AIRFLOW_LOG_CLEANER_MEMORY_LIMIT=128m
+
+POSTGRES_USER=airflow
+POSTGRES_PASSWORD=                   # obligatorio: openssl rand -hex 24
+POSTGRES_DB=airflow
+
+AIRFLOW_JWT_SECRET=                  # obligatorio: openssl rand -hex 32
+AIRFLOW_ADMIN_USER=admin
+AIRFLOW_ADMIN_PASSWORD=              # obligatorio: openssl rand -hex 24
+
+# Los task logs sobreviven a recreaciones de contenedores, pero se podan para no crecer sin limite.
+AIRFLOW_LOCAL_LOG_RETENTION_DAYS=30
+AIRFLOW_LOCAL_LOG_MAX_SIZE_MB=1024
+AIRFLOW_LOG_CLEANUP_INTERVAL_MINUTES=15
+
+JUPYTER_TOKEN=                       # obligatorio con perfil dev: openssl rand -hex 32
+```
+
+### 0.15 · Crear los comandos repetibles
+
+**CREAR:** `Taskfile.yml`
+
+```yaml
+version: "3"
+
+# Contrato ejecutable del stack local. La arquitectura AWS se conserva como
+# referencia documental; no hay artefactos de producción en este árbol.
+
+vars:
+  LOCAL_COMPOSE: docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml
+
+tasks:
+  default:
+    desc: "Qué correr primero. El catálogo completo: task --list"
+    silent: true
+    cmds:
+      - |
+        echo "pyspark_stack · plataforma local de datos con Airflow + Spark + HDFS"
+        echo
+        echo "── PRIMERA VEZ ──────────────────────────────────────────────────────────"
+        echo "  1  cp .env.example .env"
+        echo "  2  chmod 600 .env"
+        echo "  3  completá los cuatro secretos con: openssl rand -hex 32"
+        echo "  4  task local:up"
+        echo "  5  task local:smoke"
+        echo
+        echo "Necesitás Docker y Docker Compose; el stack completo tiene un techo de ~11.1 GiB."
+        echo
+        echo "── ESCRIBIR LOS PIPELINES ────────────────────────────────────────────────"
+        echo "  dags/ arranca vacío. El código de los 15 proyectos está en la guía:"
+        echo "      docs/06-medallion-desde-cero.md   (copy-paste, en orden)"
+        echo "  task local:gate             verifica que los 15 estén escritos"
+        echo
+        echo "── OPERACIÓN LOCAL ───────────────────────────────────────────────────────"
+        echo "  task local:up               levanta el stack completo (incluido Jupyter)"
+        echo "  task local:up-dev           levanta núcleo + Jupyter para notebooks"
+        echo "  task local:smoke            valida Web Events contra Spark + HDFS"
+        echo "  task local:down             lo apaga y conserva los volúmenes"
+        echo "  task local:check            valida .env, estructura y Compose"
+        echo "  task local:urls             lista URLs y estados"
+        echo "  task local:credentials      muestra los accesos locales"
+        echo
+        echo "Arquitectura AWS: docs/02-produccion-aws-terraform.md es referencia; no hay tareas de despliegue en este checkout."
+
+  local:check:
+    desc: "Valida secretos, permisos y configuración efectiva del stack local"
+    cmds:
+      - |
+        test -f .env || { echo "Falta .env" >&2; exit 1; }
+        test "$(stat -c %a .env)" = 600 || { echo ".env debe tener permisos 0600" >&2; exit 1; }
+        for key in POSTGRES_PASSWORD AIRFLOW_JWT_SECRET AIRFLOW_ADMIN_PASSWORD JUPYTER_TOKEN; do
+          value="$(sed -n "s/^$key=//p" .env | tail -n 1)"
+          test "${#value}" -ge 24 || { echo "$key falta o es corto" >&2; exit 1; }
+        done
+        # dags/ empieza vacío: el código de los pipelines se escribe siguiendo la guía 06.
+        test -d dags || { echo "Falta la carpeta dags/" >&2; exit 1; }
+        test "$(find dags -maxdepth 1 -name '*_dag.py' -type f | wc -l)" -eq 0 || {
+          echo "Los DAGs deben estar clasificados en dags/medallion_dags/ o dags/guia/" >&2; exit 1;
+        }
+        test -f ops/airflow_log_retention.sh || { echo "Falta el limpiador de logs" >&2; exit 1; }
+        test -f ops/sources.env || { echo "Falta ops/sources.env con los orígenes de datos" >&2; exit 1; }
+      - '{{.LOCAL_COMPOSE}} config --quiet'
+
+  local:gate:
+    desc: "Verifica que los 15 proyectos de la guía 06 están escritos"
+    cmds:
+      - |
+        test -f dags/medallion/runtime.py || { echo "Falta dags/medallion/runtime.py (guía 06 §13)" >&2; exit 1; }
+        count="$(find dags/medallion_dags -maxdepth 1 -name '*_medallion_dag.py' -type f 2>/dev/null | wc -l)"
+        test "$count" -eq 15 || { echo "Hay $count de 15 proyectos en dags/medallion_dags (guía 06)" >&2; exit 1; }
+        echo "Guía 06 completa: runtime + 15 proyectos medallion"
+
+  local:up:
+    desc: "Valida el entorno y levanta el stack local completo"
+    deps: [local:check]
+    cmds:
+      - '{{.LOCAL_COMPOSE}} up -d --build'
+
+  local:up-dev:
+    desc: "Valida el entorno y levanta el núcleo más Jupyter para trabajar con notebooks"
+    deps: [local:check]
+    cmds:
+      - 'COMPOSE_PROFILES=dev {{.LOCAL_COMPOSE}} up -d --build'
+
+  local:resources:
+    desc: "Muestra CPU, memoria y procesos de los contenedores que están arriba"
+    cmds:
+      - 'docker stats --no-stream'
+
+  local:down:
+    desc: "Baja todos los perfiles del stack local conservando los volúmenes"
+    cmds:
+      # Incluye Jupyter aunque COMPOSE_PROFILES esté vacío: de otro modo un notebook
+      # iniciado antes como perfil dev quedaría consumiendo recursos en segundo plano.
+      - 'COMPOSE_PROFILES=dev {{.LOCAL_COMPOSE}} down'
+
+  local:smoke:
+    desc: "Ejecuta Web Events Bronze/Silver/Gold contra Spark y HDFS reales"
+    deps: [local:check]
+    preconditions:
+      - sh: test -f dags/medallion_dags/web_events_medallion_dag.py
+        msg: "Falta el proyecto Web Events. Escribilo siguiendo docs/06-medallion-desde-cero.md §16"
+    cmds:
+      - |
+        set -eu
+        run_date="${RUN_DATE:-$(date -u +%F)}"
+        {{.LOCAL_COMPOSE}} exec -T -e MEDALLION_SMOKE_RUN_DATE="$run_date" airflow-scheduler python -c '
+        import os
+        from airflow.dag_processing.dagbag import DagBag
+        bag = DagBag("/opt/airflow/dags", include_examples=False)
+        assert not bag.import_errors, bag.import_errors
+        dag = bag.dags["medallion_web_events"]
+        for task in dag.task_group.topological_sort():
+            task.python_callable(run_date=os.environ["MEDALLION_SMOKE_RUN_DATE"])
+        '
+        for layer in bronze silver gold quality quarantine; do
+          {{.LOCAL_COMPOSE}} exec -T hdfs-namenode hdfs dfs -test -e "/lakehouse/$layer/web_events/run_date=$run_date/_SUCCESS"
+        done
+        echo "Smoke medallion OK: web_events run_date=$run_date"
+
+  local:credentials:
+    desc: "Muestra los accesos locales de Airflow y Jupyter desde .env"
+    preconditions:
+      - sh: test -f .env
+        msg: "Falta .env. Crealo con: cp .env.example .env"
+    cmds:
+      - |
+        value() { sed -n "s/^$1=//p" .env | tail -n 1; }
+        user="$(value AIRFLOW_ADMIN_USER)"; password="$(value AIRFLOW_ADMIN_PASSWORD)"; token="$(value JUPYTER_TOKEN)"
+        [ -n "$user" ] && [ -n "$password" ] && [ -n "$token" ] || { echo "Faltan credenciales en .env. Ejecutá: task local:check" >&2; exit 1; }
+        echo "No compartas esta salida: contiene secretos locales."
+        echo "Airflow: http://localhost:8082  usuario: $user  contraseña: $password"
+        echo "Jupyter: http://localhost:8888/?token=$token"
+
+  local:urls:
+    desc: "Lista las URLs del stack local y marca cuáles están arriba"
+    silent: true
+    cmds:
+      - |
+        up="$({{.LOCAL_COMPOSE}} ps --services --status running)"
+        state() { echo "$up" | grep -qx "$1" && echo arriba || echo apagado; }
+        printf '%-14s %-24s %s\n' SERVICIO URL ESTADO
+        printf '%-14s %-24s %s\n' Airflow http://localhost:8082 "$(state airflow-apiserver)"
+        printf '%-14s %-24s %s\n' Jupyter http://localhost:8888 "$(state jupyter)"
+        printf '%-14s %-24s %s\n' "Spark master" http://localhost:8081 "$(state spark-master)"
+        printf '%-14s %-24s %s\n' "Spark jobs" http://localhost:4055 "$(state jupyter)"
+        printf '%-14s %-24s %s\n' HDFS http://localhost:9870 "$(state hdfs-namenode)"
+        echo "Spark jobs es la UI del driver de Jupyter: responde solo mientras un notebook tiene sesión abierta."
+```
+
+El único archivo que todavía falta es `.env`: se crea a partir del template en [§8.1](#81-secretos-en-un-env),
+donde también completás sus secretos y verificás sus permisos. Después podés continuar con la
+explicación de cada componente o ir directo a [§9.1](#91-arrancar).
+
+---
+
 
 ## Cómo ejecutar esta guía (contrato de copy-paste)
 
@@ -42,9 +1119,10 @@ task --version
 Si alguno de los tres comandos falla, instalá esa herramienta antes de continuar. No ejecutes todavía
 `docker compose up`: primero necesitás crear `.env` en §8.1.
 
-Los apartados 1–7 explican archivos que **ya existen** en el repositorio: no copies sus
-fragmentos YAML al Compose ni crees archivos a partir de ellos. Los pasos ejecutables están en
-§8 y §9 y usan siempre la raíz del repositorio como directorio de trabajo:
+Primero completá §0: ahí creás todos los archivos de infraestructura desde bloques completos. Los
+apartados 1–7 explican los archivos que acabás de crear; sus fragmentos YAML son solo de lectura y
+no se vuelven a copiar. Los pasos ejecutables de operación están en §8 y §9 y usan siempre la raíz
+del repositorio como directorio de trabajo:
 la carpeta que contiene `docker-compose.yml` y `Taskfile.yml`.
 
 Cada instrucción que modifica algo indica una de estas acciones:
@@ -56,7 +1134,7 @@ Cada instrucción que modifica algo indica una de estas acciones:
 | **EDITAR** | Abrí el archivo existente en la ruta indicada y cambiá solo la línea o bloque citado. No pegues el fragmento al final. |
 | **EJECUTAR** | Pegá el bloque en una terminal ubicada en la raíz del proyecto; no crea ni edita archivos salvo que el texto lo diga. |
 
-Antes de cada bloque, verificá dónde estás:
+Antes de cada bloque **EJECUTAR** posterior a §0, verificá dónde estás:
 
 ```bash
 pwd                         # debe terminar en /pyspark_stack
@@ -64,9 +1142,8 @@ test -f docker-compose.yml  # debe imprimir nada y devolver éxito
 ```
 
 No uses los bloques YAML de las secciones 2–7 como archivos completos: son recortes para explicar
-el Compose que ya está versionado. La única configuración local que debés crear manualmente es
-`.env` en la raíz; `docker-compose.local-hardened.yml` ya existe y no se copia ni se edita en el
-camino normal.
+el Compose creado en §0. Los bloques completos y copiables viven exclusivamente en §0; `.env` se
+crea en §0.16 y se completa en §8.1.
 
 ### Cómo leer los bloques de la guía
 
@@ -86,9 +1163,10 @@ En las secciones 2–7 todos los YAML son **Configuración Compose**. Son el mis
 
 Si tu objetivo es usarlo hoy y no estudiar cada servicio, seguí solo este orden:
 
-1. Creá y completá `.env` en [§8.1](#81-secretos-en-un-env).
+1. Completá [§0](#0-construcción-incremental-del-entorno) y creá/completá `.env` en [§8.1](#81-secretos-en-un-env).
 2. Ejecutá [§9.1](#91-arrancar) para levantarlo y [§9.1.1](#911-gate-confirmar-que-el-stack-completo-está-listo) para validarlo.
-3. Abrí una URL de [§9.2](#92-urls). Para apagarlo sin perder datos, usá [§9.4](#94-bajar).
+3. Escribí el primer pipeline en [06 — Medallion desde cero](06-medallion-desde-cero.md#4-proyecto-00--hello_lakehouse). El smoke test queda disponible después de completar Web Events (§16).
+4. Abrí una URL de [§9.2](#92-urls). Para apagarlo sin perder datos, usá [§9.4](#94-bajar).
 
 Las secciones 1–7 quedan como referencia para entender o diagnosticar el stack.
 
@@ -96,19 +1174,21 @@ Las secciones 1–7 quedan como referencia para entender o diagnosticar el stack
 
 | Sección | Qué hacés | Detalle |
 |---|---|---|
+| **0** | **Crear** (~30 min) | Generás Dockerfiles, Compose, Taskfile y soportes desde bloques completos |
 | **1–2** | **Leer** (~10 min) | El mapa de los 4 subsistemas y el patrón de anclas YAML que evita repetir configuración |
 | **3–6** | **Leer** (~20 min) | Un subsistema por sección: HDFS, Spark, Jupyter, Airflow. Se leen en orden: cada uno asume el anterior |
 | **7** | **Leer** (~5 min) | Red, volúmenes y orden de arranque — por qué `depends_on` no alcanza |
-| **8** | **Ejecutar** (~20 min) | Creás `.env` y validás el endurecimiento que ya está versionado |
+| **8** | **Ejecutar** (~20 min) | Completás `.env` y validás el endurecimiento creado en §0 |
 | **9** | **Ejecutar** (~5 min) | Arrancás, verificás, accedés y bajás el stack |
 
 > [!TIP]
-> **Si lo que querés es *usar* el stack, no entenderlo**, este no es el documento:
-> andá a [04 — DataOps local](04-dataops-local.md), que resume cómo levantar y probar
-> los quince pipelines medallion. Volvé acá cuando algo no haga lo que esperabas.
+> **Si lo que querés es *usar* el stack, no entenderlo**, seguí el taller
+> [06 — Medallion desde cero](06-medallion-desde-cero.md). Ahí escribís y probás los quince
+> pipelines medallion; volvé acá cuando algo del entorno no haga lo que esperabas.
 
 ## Índice
 
+0. [Construcción incremental del entorno](#0-construcción-incremental-del-entorno)
 1. [Visión general](#1-visión-general)
 2. [El patrón de anclas YAML](#2-el-patrón-de-anclas-yaml)
 3. [Almacenamiento: HDFS](#3-almacenamiento-hdfs)
@@ -137,22 +1217,23 @@ El Compose levanta cuatro subsistemas en una sola red de Docker (`hadoopnet`):
 | Interactivo | `jupyter` | Driver PySpark para trabajo exploratorio |
 | Orquestación | `airflow-*` (6) + `airflow-db` | Airflow 3.2.2 + Postgres 16 |
 
-**Los comandos del día a día están en el `Taskfile.yml` de la raíz**, versionado, para que sean los
-mismos en tu máquina y en el CI. Este checkout expone únicamente tasks locales; los comandos AWS de
-la guía 02 son referencia y requieren los artefactos de producción que no están en este árbol:
+**Los comandos del día a día están en el `Taskfile.yml` de la raíz**, que creaste en §0.15, para
+que sean los mismos en tu máquina y en el CI. Este checkout parte sin tasks locales; los comandos
+AWS de la guía 02 son referencia y requieren artefactos de producción que no están en este árbol:
 
 | Task | Qué hace |
 |---|---|
 | `task local:check` | Valida secretos, permisos y el Compose efectivo sin arrancar servicios |
 | `task local:up` | Valida y levanta los cuatro subsistemas con el override endurecido |
-| `task local:smoke` | Ejecuta Web Events end-to-end y exige evidencias en las cinco capas HDFS |
+| `task local:smoke` | Ejecuta Web Events end-to-end y exige evidencias en las cinco capas HDFS, después de escribirlo en la guía 06 §16 |
 | `task local:down` | Baja el stack **conservando** los volúmenes (los datos de HDFS y Postgres siguen ahí) |
 | `task local:credentials` | Muestra los accesos locales de Airflow y la URL con token de Jupyter |
 | `task local:urls` | Lista las URLs locales y marca qué servicio está arriba |
-| `task --list` | El catálogo completo, incluidas las tasks de producción de la [guía 02](02-produccion-aws-terraform.md) |
+| `task --list` | El catálogo completo de tareas locales disponibles en este checkout |
 
 No son obligatorias: cuando la guía invoca Compose directamente muestra los dos archivos que lo
-componen. El Taskfile es un atajo versionado para el uso diario, una vez que ya conocés el stack.
+componen. El Taskfile es un atajo repetible para el uso diario, una vez que ya conocés el stack.
+Este checkout no contiene tareas ni artefactos de producción; la guía 02 sigue siendo referencia.
 
 Regla base: dentro de una red de Compose, el nombre del servicio **es** el hostname DNS. Por eso
 `spark://spark-master:7077` y `hdfs://hdfs-namenode:9000` resuelven solos. Nunca uses `localhost`
@@ -252,7 +1333,7 @@ Volúmenes compartidos:
 > **HDFS es solo local.** En producción no existe: el storage es S3 (`s3a://`). Está
 > acá para que puedas practicar el modelo de archivos distribuido sin pagar nada, no
 > porque sea el destino. El layout obligatorio se documenta en
-> [04 — DataOps local](04-dataops-local.md#contrato-obligatorio-de-almacenamiento-hdfs).
+> [06 — Medallion desde cero, §3](06-medallion-desde-cero.md#3-preparar-el-entorno-una-sola-vez).
 
 **Archivo:** `docker-compose.yml`, servicios `hdfs-namenode` y `hdfs-datanode`.
 **Tipo:** configuración Compose; no es código HDFS ni hay que crear un segundo YAML.
@@ -540,8 +1621,8 @@ pronto queda esperando executors.
 
 ## 8. Endurecimiento del stack local
 
-> **En esta sección: EJECUTAR, ~20 min.** Creás el único archivo local no versionado (`.env`);
-> el resto del endurecimiento ya está en archivos versionados.
+> **En esta sección: EJECUTAR, ~20 min.** Completás el único archivo local no versionado (`.env`)
+> y validás el endurecimiento que creaste en §0.
 > **Salís con**: secretos propios en un `.env` fuera de git, límites de memoria,
 > healthchecks reales, logs persistentes pero acotados y `docker.sock` fuera del stack.
 
@@ -556,7 +1637,7 @@ flowchart TD
     E3["§8.3 · Secretos parametrizados en el base<br/><i>ya está: el Compose interpola</i>"]
     E4["§8.4 · docker.sock fuera del stack<br/><i>ya está: no se monta</i>"]
     E5["§8.5 · History server (opcional)<br/><i>para ver los jobs ya terminados</i>"]
-    GATE["✅ Gate del stack local<br/>checklist de la sección 9 completo ·<br/>un DAG corre verde ·<br/>nada sensible en git"]
+    GATE["✅ Gate del stack local<br/>checklist de la sección 9 completo ·<br/>listo para escribir el primer DAG ·<br/>nada sensible en git"]
 
     E1 --> E2 --> E3 --> E4 --> GATE
     E2 -.opcional.-> E5
@@ -567,7 +1648,7 @@ flowchart TD
 
 **Reglas de esta sección:**
 
-- **El endurecimiento de recursos va en el override versionado.** Los controles que deben estar
+- **El endurecimiento de recursos va en el override creado en §0.13.** Los controles que deben estar
   siempre activos —secretos obligatorios, loopback y rotación de logs— viven en el Compose base.
 - **`.env` nunca se commitea.** Está en `.gitignore`; `.env.example` es el que viaja,
   con placeholders. Un secreto commiteado sigue en la historia aunque lo borres
@@ -588,9 +1669,9 @@ Lo que es aceptable en desarrollo pero no en producción:
 | # | Problema | Riesgo | Estado |
 |---|---|---|---|
 | 1 | Secretos con defaults débiles | Arranque accidental con credenciales conocidas | Resuelto: obligatorios + gate local (§8.1) |
-| 2 | Sin `restart` en HDFS, Spark y Jupyter | Un crash deja el servicio caído | Resuelto en override versionado (§8.2) |
+| 2 | Sin `restart` en HDFS, Spark y Jupyter | Un crash deja el servicio caído | Resuelto en el override de §0.13 (§8.2) |
 | 3 | Sin healthchecks salvo en Postgres | `depends_on` no sabe si el servicio *funciona* | Resuelto en base/override (§8.2) |
-| 4 | Sin límites de recursos | Un job de Spark puede comerse toda la RAM del host | Resuelto en override versionado (§8.2) |
+| 4 | Sin límites de recursos | Un job de Spark puede comerse toda la RAM del host | Resuelto en el override de §0.13 (§8.2) |
 | 5 | Jupyter sin token | Cualquiera en la red entra | Resuelto: token obligatorio y puerto loopback (§8.1) |
 | 6 | Montaje de `docker.sock` | Control del host para todos los procesos de Airflow | Resuelto: no se monta (§8.4) |
 | 7 | Clave `version:` obsoleta | Warning en cada comando de Compose | Resuelto: eliminada |
@@ -684,10 +1765,9 @@ termine correctamente.
 Usá un override que Compose fusiona para añadir `restart`, healthchecks y límites de memoria. La
 rotación y retención de logs ya están en el Compose base y no se duplican aquí.
 
-**Archivo existente, no editar ni copiar:**
-[`docker-compose.local-hardened.yml`](../docker-compose.local-hardened.yml). Ya está
-versionado y `task local:up` siempre lo combina con el Compose base. En el camino normal de esta
-guía, solo verificás que Docker pueda fusionarlo; no pegues sus servicios dentro de
+**Archivo creado en §0.13, no editar ni copiar de nuevo:**
+`docker-compose.local-hardened.yml`. `task local:up` siempre lo combina con el Compose base. En
+el camino normal de esta guía, solo verificás que Docker pueda fusionarlo; no pegues sus servicios dentro de
 `docker-compose.yml`:
 
 ```bash
@@ -704,8 +1784,8 @@ de YAML. El arranque viene en §9.1, después de terminar las decisiones opciona
 
 ### 8.3 Secretos parametrizados en el Compose base
 
-**Archivo existente, solo lectura:** `docker-compose.yml`. Ya está aplicado: el
-Compose usa `${VAR:?mensaje}` para los cuatro secretos. No pegues estos fragmentos ni añadas otra
+**Archivo creado en §0.12, solo lectura en esta sección:** `docker-compose.yml`. Ya está aplicado:
+el Compose usa `${VAR:?mensaje}` para los cuatro secretos. No pegues estos fragmentos ni añadas otra
 sección `environment:`; son evidencia de lo que validaste en §8.1. Sin `.env`, o con un valor
 vacío, la expansión falla antes de arrancar.
 
@@ -749,7 +1829,7 @@ con API limitada. No lo heredes en api-server, scheduler, triggerer y dag-proces
 ### 8.5 Añadir el history-server (opcional)
 
 Elegí esta opción solo si necesitás consultar jobs de Spark **ya terminados**. Cambia dos archivos
-versionados, por lo que conviene hacerla en una rama y conservar el cambio en Git.
+que creaste desde la guía; conviene hacerlo en una rama y conservar el cambio en Git.
 
 1. **EDITAR** `docker-compose.yml`. Buscá el bloque completo que comienza con
    `#  spark-history-server:` (cerca del servicio `spark-worker`) y quitá el `#` inicial de **cada
@@ -839,8 +1919,9 @@ worker disponible. Si dejaste `COMPOSE_PROFILES` vacío, Jupyter no arranca por 
 cuarto comando y no uses su URL.
 
 Si los comandos que correspondan terminan correctamente, están listos Spark, HDFS, Airflow y Jupyter.
-Después ejecutá `task local:smoke`, descrito en [04 — DataOps local](04-dataops-local.md#operación-local).
-Si uno falla, no ejecutes los pipelines: revisá `docker compose -f docker-compose.yml -f
+Después de completar Web Events en [06 §16](06-medallion-desde-cero.md#16-proyecto-03--web-events),
+ejecutá `task local:smoke`. En un checkout recién clonado ese comando falla de forma esperada hasta
+que exista ese DAG. Si uno de los cuatro checks anteriores falla, no ejecutes los pipelines: revisá `docker compose -f docker-compose.yml -f
 docker-compose.local-hardened.yml ps` y resolvé ese servicio primero.
 
 ### 9.2 URLs
@@ -877,8 +1958,8 @@ grep -E '^(AIRFLOW_ADMIN_USER|AIRFLOW_ADMIN_PASSWORD)=' .env
 echo "http://localhost:8888/?token=$(grep '^JUPYTER_TOKEN=' .env | cut -d= -f2)"
 ```
 
-Los veinte DAGs se cargan **pausados**, que es el default de Airflow: hay que activarlos desde la UI
-para que corran.
+Los DAGs que agregues en `dags/` se cargan **pausados**, que es el default de Airflow: activalos
+desde la UI cuando estés listo para ejecutarlos.
 
 ### 9.4 Bajar
 

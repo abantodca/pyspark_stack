@@ -38,7 +38,7 @@ spark-apps/notebook-output/
 # --- Salidas y logs de ejecucion (resultados, no fuente) ---
 spark-apps/shared_output/
 spark-apps/logs/
-# Área de trabajo de la guía 04 (docs/04 §0.3): los .py que escribís siguiendo los ejemplos
+# Área de trabajo del taller 06: los .py que escribís siguiendo los ejemplos
 # y sus salidas. Es un laboratorio personal, no fuente del proyecto.
 spark-apps/ejemplos/
 

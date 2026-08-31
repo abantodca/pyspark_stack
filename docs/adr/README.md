@@ -17,8 +17,8 @@ Si una sección de la guía contradice un ADR, el que está mal es uno de los do
 | [006](ADR-006-el-modulo-que-crea-otorga.md) | El módulo que crea el recurso es el que otorga el acceso a él | accepted |
 | [007](ADR-007-contrato-de-variables-por-output.md) | Ningún comando lleva valores escritos a mano: salen de `terraform output` | accepted |
 | [008](ADR-008-apagado-job-aware.md) | El apagado automático es *job-aware*: no corta DAGs en vuelo | accepted |
+| [009](ADR-009-arquitectura-por-etapas-y-gates-de-produccion.md) | Plano de datos serverless y plano de control por etapas | accepted |
 
-Todos fechados **2026-08-12**, en la reorganización que también refundió la guía 02 en un solo
-documento y pasó su Terraform a composición por módulos. Las decisiones son anteriores y ya estaban
-argumentadas en la guía; lo que no existía era el registro con su número, su estado y sus
-alternativas descartadas.
+Los ADR 001–008 se registraron el **2026-08-12**, en la reorganización que refundió la guía 02 en
+un solo documento y pasó su Terraform a composición por módulos. ADR-009, del **2026-08-31**, fija
+los gates de datos reales y el criterio para evolucionar el plano de control.

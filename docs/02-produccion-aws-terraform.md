@@ -1,29 +1,37 @@
-# Producción en AWS para DataOps — arquitectura de referencia
+# Guía de producción en AWS con Terraform
 
 > [!CAUTION]
 > **No ejecutable desde este checkout.** El árbol actual no contiene `infra/`, los scripts de
 > producción, los Compose productivos ni los entrypoints de EMR que esta guía ilustra. Conservá este
-> documento como diseño y referencia de implementación; no ejecutes sus `task`, `terraform`, `aws`
+> documento como guía de implementación de una arquitectura de referencia; no ejecutes sus `task`, `terraform`, `aws`
 > ni comandos de despliegue hasta restaurar y validar esos artefactos en una rama de producción.
 
 > [!WARNING]
-> **Laboratorio controlado, no exposición productiva segura** ([ADR-002](adr/ADR-002-plano-de-control-single-node.md)). Airflow, Postgres y monitoreo comparten una EC2.
-> Las UIs usan túnel SSH; §5.6 permite HTTPS únicamente desde la IP `/32` del operador.
-> Para datos reales son obligatorias [§13](#13-hardening-y-secretos), [§18](#18-gobierno-resiliencia-y-costos) y un estándar de gobierno y operaciones formal.
-> No incluye alta disponibilidad: la EC2 sigue siendo un punto único de fallo.
+> **Etapa A: plano de control single-node, coste controlado** ([ADR-002](adr/ADR-002-plano-de-control-single-node.md),
+> [ADR-009](adr/ADR-009-arquitectura-por-etapas-y-gates-de-produccion.md)). Airflow y Postgres
+> comparten una EC2; las UIs usan túnel SSH y §5.6 permite HTTPS solo desde la IP `/32` del
+> operador. Para datos reales son obligatorias [§13](#13-hardening-y-secretos),
+> [§18](#18-gobierno-resiliencia-y-costos), [§20](#20-calidad-de-datos) y una recuperación probada.
+> No incluye alta disponibilidad: la EC2 sigue siendo un punto único de fallo hasta migrar a etapa B.
 
 > Este tramo promueve a AWS el **contrato del orquestador** validado en [local](01-stack-local.md).
 > Spark cambia de runtime: local usa 4.2.0 y `emr-7.13.0`, Spark 3.5.6; §6.4 prueba compatibilidad.
 > Terraform se construye por módulos con state S3 bloqueado y apply incremental.
-> La EC2 se apaga fuera de horario para que el costo siga al uso.
+> La EC2 se apaga fuera de horario para que el costo siga al uso. El precio final se mide con
+> Cost Explorer y AWS Pricing Calculator para la región y el patrón de ejecución reales.
 
 > [!IMPORTANT]
-> **Estado: guía completa, sin desplegar de extremo a extremo en AWS.**
-> Observabilidad, Iceberg, dbt, Great Expectations, OpenLineage y CD son arquitectura objetivo; consulte la [matriz de estado](README.md).
-> El job EMR y la publicación son referencias incompletas: no se autorizan para datos reales hasta consumir el manifest inmutable y publicar después del gate.
+> **Estado: guía de implementación de una arquitectura de referencia, no certificación de producción.** Esta guía no está
+> desplegada de extremo a extremo en AWS y este checkout no contiene sus artefactos productivos.
+> El plano base sirve para una carga pequeña, de un equipo y no regulada; no autoriza datos reales
+> hasta aprobar el gate de [§15](#15-runbook-de-puesta-en-producción) **incluyendo** los controles
+> de [§18](#18-gobierno-resiliencia-y-costos), calidad de [§20](#20-calidad-de-datos) y el registro
+> de riesgos de [§21](#21-control-de-cambios-y-límites). Observabilidad, Iceberg, dbt y OpenLineage
+> siguen siendo arquitectura objetivo, no capacidades ya entregadas.
 
 > [!IMPORTANT]
-> **Un comando por terminal, siempre el mismo.** Parado en la raíz del repo, antes de
+> **Un comando por terminal, siempre el mismo — desde §3.1.** Materialice primero
+> `scripts/prod-env.sh` con el bloque de §3.1. Después, parado en la raíz del repo y antes de
 > cualquier `terraform`, `aws`, `ssh` o `rsync` de este documento:
 >
 > ```bash
@@ -32,26 +40,28 @@
 >
 > Convierte los outputs de Terraform en variables (`public_ip` → `$PUBLIC_IP`), y por
 > eso ningún bloque de la guía lleva un ID, una IP ni un bucket escrito adentro.
-> **Devuelve dos resultados según el estado de la infraestructura; ambos son válidos:**
+> **Use `./scripts/prod-env.sh --check` para inspeccionar el estado; ambos resultados son válidos
+> durante el stand-up:**
 >
 > | Cuándo | Qué imprime | Qué significa |
 > |---|---|---|
 > | §1 a §5.1, antes del primer `apply` del entorno | `contexto parcial — …` (no existe la carpeta, falta el `init`, o el state no publicó outputs) | **Esperado, no es un fallo**: no hay nada que leer todavía. Los comandos de esas secciones (`aws sts`, `terraform init/apply`) no usan ninguna variable del contrato |
 > | Desde el `apply` de [§5.1](#51-variables-y-red) | `Contexto de producción … lectura fresca del state` | El contexto real **crece con cada sección**; todo recurso aún no aplicado aparece como `— (sin definir aún)` |
 >
-> Después de un `apply` con outputs, ejecute `PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh`.
-> El cargador cachea 15 minutos; un nombre vacío indica terminal sin contexto o caché vieja.
+> Después de un `apply` con outputs, ejecute `source ./scripts/prod-env.sh`.
+> El cargador lee el state en cada carga; un nombre vacío indica que falta aplicar la sección que
+> publica ese output, no una caché vieja.
 > El contrato completo está en [§3.1](#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando).
 
-**Arquitectura — solo lectura.** Una **EC2 `t3.large`** con Elastic IP ejecuta en Docker el orquestador (**Airflow 3** + **Postgres**) y, opcionalmente, el monitoreo.
+**Resumen previo a la ejecución.** Una **EC2 `t3.large`** con Elastic IP ejecuta en Docker el orquestador (**Airflow 3** + **Postgres**) y, opcionalmente, el monitoreo.
 El **cómputo Spark** vive en **EMR Serverless**, escala a cero y usa su propio rol; el **data lake** es S3 (`raw/` → `curated/`).
 **Lambda `trigger-airflow`** dispara DAGs vía SSM por cron o eventos S3/SQS; **Lambda `startstop`** apaga la EC2 sin cortar DAGs.
 **DLM** respalda el EBS, **Athena** ofrece SQL y **GitHub Actions con OIDC** valida y despliega sin access keys.
 
 Regla mental: **almacenar es barato y constante; computar es lo que cuesta, y solo
 durante la ejecución.** Por eso Spark vive en EMR Serverless, la EC2 se apaga fuera de
-horario y el data lake vive en S3. **~$35/mes** con auto start/stop 8h×22d
-(~$83/mes si permanece encendida 24/7) — el desglose está en [§2](#2-costo).
+horario y el data lake vive en S3. El ahorro es real solo si se limita concurrencia, duración,
+capacidad y retención; la fórmula y las guardas están en [§2](#2-costo).
 
 ## Cómo leer esta guía
 
@@ -92,18 +102,19 @@ permisos faltantes del rol real.
 >
 > | Ruta | Estado | Acción requerida |
 > |---|---|---|
-> | `infra/bootstrap/`, `infra/envs/prod/`, módulos `network` y `orchestrator` | **existen parcialmente** | Validar y revisar; no equivalen a un entorno desplegado |
+> | `infra/bootstrap/`, `infra/envs/prod/`, módulos `network` y `orchestrator` | **no existen en este checkout** | Crearlos desde §§3–5, validar y revisar antes de aplicar |
 > | Módulos storage, EMR, Lambdas, gobierno y demás producción | **por crear** | **Escribirlos**, probarlos y revisarlos antes de desplegar |
-> | `Taskfile.yml` | **existe**, con el resultado final | Usarlo directamente; los bloques de §3.0b, §5.5, §6.4, §8, §10.1, §13.4 y §15 muestran cómo crece por etapas |
+> | `Taskfile.yml` | **solo contiene tareas locales en este checkout** | Integre los bloques incrementales de §3.0b, §5.5, §6.4, §8, §10.1, §13.4 y §15 antes de usar cualquier `task prod:*` o `task infra:*` |
 > | `Dockerfile.airflow.prod` | **por crear** | **Pegarlo** de [§5.5](#55-desplegar-subir-código-y-túnel-ssh) |
 > | `docker-compose.prod.yml` (+ `.https.yml`, + `.monitoring.yml`) | **por crear** | **Pegarlo** de [§14.1](#141-docker-composeprodyml--base), [§5.6](#56-exponer-la-web-de-airflow-https-nativo-acceso-desde-la-ip-del-operador) y [§14.2](#142-docker-composeprodmonitoringyml--override-de-observabilidad) |
-> | `scripts/load-secrets.sh`, `scripts/update-sg-ip.sh` | **por crear** | **Pegarlo** de [§13.4](#134-materializar-env) y [§5.1](#51-variables-y-red) |
+> | `scripts/prod-env.sh`, `scripts/load-secrets.sh`, `scripts/update-sg-ip.sh` | **por crear** | **Pegarlos** de [§3.1](#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando), [§13.4](#134-materializar-env) y [§5.1](#51-variables-y-red) |
 > | `monitoring/` (Prometheus, Grafana, Alertmanager, Loki) | **por crear** | **Pegarlo** de [§12.2](#122-prometheus) y §14.2 — es *roadmap*, no bloquea el primer despliegue |
 > | `dags/customer_etl_emr_dag.py`, `spark-apps/emr/` | **por crear** | **Pegarlo** de [§6.6](#66-dag-ejecutable-de-referencia) y [§6.4](#64-cómputo-spark-emr-serverless) |
 > | `.github/workflows/` | **por crear** | **Pegarlo** en [§11](#11-cicd-con-github-actions-y-oidc) |
 >
-> Ya existen y no se modifican: `scripts/prod-env.sh`, los dos validadores y el stack local.
-> Incluye Compose, Dockerfiles, Hadoop, DAGs, jobs, notebooks y `tests/test_dag_integrity.py`.
+> Ya existen y no se modifican: el stack local (Compose, Dockerfiles, Hadoop, DAGs, jobs y
+> notebooks). Los validadores y artefactos productivos que menciona esta guía deben existir en la
+> rama de producción antes de tratarlos como gates ejecutables.
 >
 > Corolario: `task infra:validate` sólo comprueba el HCL que ya existe; no valida módulos que siguen
 > siendo texto en esta guía. Los validadores documentales comprueban referencias y comandos, no la
@@ -122,7 +133,7 @@ Cada tramo usa lo que dejó el anterior; dentro de cada uno, las secciones se le
 **1 · Fundamentos — LEER (~15 min).** Arquitectura, costo y contrato de variables. §3.1
 define de dónde sale cada valor de cada comando.
 
-1. [Panorama de la arquitectura](#1-panorama-de-la-arquitectura) · [1.1 Ciclo de vida: los 4 modos](#11-ciclo-de-vida-los-4-modos)
+1. [Panorama de la arquitectura](#1-panorama-de-la-arquitectura) · [1.1 Ciclo de vida: los 4 modos](#11-ciclo-de-vida-los-4-modos) · [1.2 Gate de producción](#12-gate-de-producción-qué-falta-y-qué-no-se-negocia)
 2. [Costo](#2-costo)
 3. [Prerrequisitos](#3-prerrequisitos) · [3.1 Contrato de variables de entorno](#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando)
 4. [Fundamentos: backend Terraform](#4-fundamentos-backend-terraform)
@@ -143,8 +154,8 @@ que la EC2 arranca.
 9. [Patrones de tareas DataOps](#9-patrones-de-tareas-dataops) — [9.2 Contrato mínimo de un DAG](#92-contrato-mínimo-de-un-dag-productivo) · [9.4 DAG de referencia para EMR](#94-dag-de-referencia-para-emr-serverless) · [9.5 Idempotencia](#95-idempotencia)
 10. [Flujo de desarrollo y despliegue](#10-flujo-de-desarrollo-y-despliegue)
 
-**5 · Entrega — EJECUTAR antes del primer despliegue formal.** §12 es *roadmap*; §13 es
-obligatoria si el stack va a ver datos reales.
+**5 · Entrega y autorización — EJECUTAR antes de datos reales.** §12 local es *roadmap*; §13,
+§18.1–§18.5, §20 y la prueba de recuperación de §21.3 son obligatorias para etapa A.
 
 11. [CI/CD con GitHub Actions y OIDC](#11-cicd-con-github-actions-y-oidc) — [11.3 Test de integridad de DAGs](#113-test-de-integridad-de-dags) · [11.4 Workflow de despliegue](#114-workflow-de-despliegue) · [11.5 El mismo contrato en CI](#115-el-mismo-contrato-en-ci-sembrar-las-vars-desde-los-outputs)
 12. [Observabilidad e incidentes](#12-observabilidad-e-incidentes) — [12.2 Prometheus](#122-prometheus)
@@ -153,7 +164,8 @@ obligatoria si el stack va a ver datos reales.
 15. [Runbook de puesta en producción](#15-runbook-de-puesta-en-producción)
 
 **6 · Evolución — CONSULTAR cuando haga falta.** No se lee de corrido; lo marcado
-*roadmap* es diseño, no runbook.
+*roadmap* es diseño, no runbook. **Excepción:** vuelva a §18, §20 y §21.3 para completar el gate
+de datos reales aunque aparezcan después en el documento.
 
 16. [Athena e Iceberg](#16-athena-e-iceberg) — [16.3 Mantenimiento Iceberg](#163-mantenimiento-iceberg)
 17. [Qué motor usar para cada tarea](#17-qué-motor-usar-para-cada-tarea)
@@ -201,19 +213,19 @@ determina qué comandos corresponden:
 
 | Modo | Pregunta que responde | Tiempo | Costo después |
 |---|---|---|---|
-| **STAND-UP** | «Es la primera vez, parto de cero» | 3–4 h | ~$35/mes (operando) |
-| **OPERACIÓN** | «Ya está construido, lo uso día a día» | — | ~$35/mes |
-| **PAUSA LARGA** | «No lo voy a usar por semanas, pero no quiero perder nada» | 5 min | ~$14/mes (EBS + snapshots + EIP + S3) |
-| **TEARDOWN** | «Terminé el proyecto, que no facture nada» | 30–45 min | $0/mes |
+| **STAND-UP** | «Es la primera vez, parto de cero» | 3–4 h | línea base medida en la cuenta |
+| **OPERACIÓN** | «Ya está construido, lo uso día a día» | — | fijo + EMR/S3/logs por uso |
+| **PAUSA LARGA** | «No lo voy a usar por semanas, pero no quiero perder nada» | 5 min | EBS + snapshots + IPv4 + S3 + logs |
+| **TEARDOWN** | «Terminé el proyecto, que no facture nada» | 30–45 min | sin recursos de esta guía; revise cargos ajenos |
 
 ```text
                           stand-up (§4 → §15)
-            (vacío) ─────────────────────────► OPERANDO (~$35/mes)
+            (vacío) ─────────────────────────► OPERANDO (línea base + consumo)
                                                   │  ▲
                                     stop manual   │  │  start manual
                                      (§8.4)       │  │   (§8.4)
                                                   ▼  │
-                                              PAUSADO (~$14/mes)
+                                              PAUSADO (persistencia y red)
                                                   │
                                              teardown (§21.4)
                                                   │
@@ -244,10 +256,12 @@ flowchart TD
     P7["§7 · Disparadores: cron y evento S3<br/><i>Lambda trigger-airflow vía SSM</i>"]
     P13["§13 · Secretos en SSM + §14 Compose canónico<br/><i>el .env de la EC2 deja de ser manual</i>"]
     P11["§11 · CI/CD con OIDC<br/><i>sin access keys en GitHub</i>"]
+    P18["§18 · DLQ, alarmas, Budget y anomalías<br/><i>replay y coste observables antes de datos reales</i>"]
+    P20["§20 · Calidad y promoción<br/><i>contrato, cuarentena y gate antes de curated/</i>"]
     P15["§15 · Runbook de puesta en producción<br/><i>los 7 pasos, repetibles</i>"]
     GATE["✅ Gate de stand-up<br/>DAG verde end-to-end (§8.3):<br/>job EMR SUCCESS + datos en curated/<br/>+ nada raro en la DLQ"]
 
-    P3 --> P4 --> P5 --> P6 --> P7 --> P13 --> P11 --> P15 --> GATE
+    P3 --> P4 --> P5 --> P6 --> P7 --> P13 --> P11 --> P18 --> P20 --> P15 --> GATE
 
     style GATE fill:#d4edda,stroke:#155724
 ```
@@ -264,49 +278,104 @@ copy-paste y esperas de AWS.
   opcional. Con `airflow_domain = ""` las UIs van por túnel SSH, que es el default.
 - **Alta disponibilidad**: fuera de alcance ([§21.1](#211-límites-aceptados)).
 
+### 1.2 Gate de producción: qué falta y qué no se negocia
+
+El stand-up demuestra que el camino funciona; **no** demuestra que sea operable con datos reales.
+La siguiente tabla convierte los vacíos normales de una referencia en decisiones explícitas. Los
+controles marcados *obligatorio* son parte del primer entorno productivo y no elevan de forma
+material el coste; los demás se eligen según criticidad, regulación y RTO/RPO.
+
+| Área | Mínimo para autorizar datos reales | Estado de esta guía |
+|---|---|---|
+| Propiedad y gobierno | owner, clasificación/PII, contrato versionado, retención y consumidor por dataset | **falta completar por cada dominio** |
+| Calidad y promoción | validación de esquema, volumen, frescura y reconciliación antes de `curated`; cuarentena y rollback | **obligatorio; §20 es el patrón, no implementación completa** |
+| Eventos | manifest inmutable, idempotencia, DLQ, alarma y procedimiento de replay | **obligatorio; complete §18.1–§18.2 antes de activar triggers** |
+| Coste | Budget, anomalías, etiquetas `Environment/Service/Owner/CostCenter`, límite de EMR y revisión semanal | **obligatorio; complete §18.3–§18.5** |
+| Seguridad/auditoría | CloudTrail de eventos de gestión, revisión de Access Analyzer, rotación y parcheo/AMI con dueño | **obligatorio; CloudTrail y ciclo AMI aún no están automatizados** |
+| Red y acceso de operador | VPC/subred elegidas deliberadamente, sin puertos públicos salvo excepción aprobada; administración por SSM y revisión de egress | **bloqueante:** la VPC default + EIP + SSH de §5 es una simplificación de bootstrap, no un baseline para datos sensibles o acceso multiusuario |
+| Supply chain | imágenes por *digest*, dependencias bloqueadas, escaneo de secretos/vulnerabilidades y evidencia del artefacto desplegado | **bloqueante:** hoy hay versiones fijas, pero no digests, SBOM ni firma de artefactos** |
+| Recuperación | dump lógico comprobado, restore de EBS y prueba registrada contra RPO/RTO | **obligatorio; §21.3 es manual** |
+| Disponibilidad | decidir y aceptar el SPOF o migrar Airflow/metadata a un diseño HA gestionado | **decisión de negocio; no se resuelve con un ajuste menor** |
+| Lineage, catálogo fino, Lake Formation y KMS CMK | requeridos si hay auditoría, acceso multi-equipo/columnar o requisitos regulatorios | **extensión con coste y operación adicionales** |
+
+No active la notificación S3 ni el schedule de producción mientras falten calidad, DLQ/alarma,
+budget y un runbook de replay. Para una demo o entorno de desarrollo se pueden diferir; para
+producción no. Esta separación protege coste: agrega guardas y evidencia antes que servicios
+siempre encendidos. La excepción de red no se arregla agregando un NAT por defecto: para una
+etapa A de bajo coste, elija explícitamente SSM-only sin ingreso público o una excepción temporal
+con EIP/SSH `/32`, con owner, caducidad y revisión.
+
+### 1.3 Auditoría de la guía — hallazgos que siguen abiertos
+
+Esta auditoría separa lo que la guía ya corrige de lo que todavía requiere una decisión o una
+implementación. Un hallazgo **P0/P1** impide declarar datos reales en producción; no se compensa
+con un `apply` exitoso.
+
+| Prioridad | Hallazgo | Riesgo | Cierre exigido |
+|---|---|---|---|
+| P0 | La guía es referencia: sus artefactos no existen ni han sido probados E2E en este checkout | no hay evidencia de que el diseño se pueda desplegar tal como está | materializar en una rama de producción, CI, plan revisado, smoke y restore test antes de autorizar datos |
+| P0 | §7 crea schedules/notificación antes de que §18 cree DLQ, alarmas y replay | un fallo temprano puede quedar sin alerta ni procedimiento de recuperación | añadir flags de activación con default `false` o mover la activación de cron/S3 al final de §18; probar falla → DLQ → replay |
+| P0 | VPC default, EIP y SSH son el camino de bootstrap actual | superficie pública y dependencia de una clave/IP de operador | para datos sensibles o multiusuario: VPC definida, SSM-only y sin ingreso público; una excepción SSH debe tener owner y fecha de retirada |
+| P1 | Solo se materializa la alarma de DLQ | fallos de Lambda, edad SQS, EMR, disco/EC2 y gasto pueden no despertar a nadie | alarmas, rutas de escalamiento y prueba de entrega basadas en SLO antes de activar pipelines |
+| P1 | Backups y dumps permanecen en la misma cuenta/región | no cubren pérdida de cuenta o región | decidir RPO/RTO; para ese riesgo, AWS Backup o réplica cross-account/cross-region y restore probado |
+| P1 | CloudTrail, parcheo/AMI, calidad, cuarentena y promoción se exigen pero aún no se materializan | control declarativo sin evidencia operativa | versionar sus controles y asignar responsable/retención por cada data product |
+| P1 (si se requiere auditoría de datos) | CloudTrail de management no registra por defecto lecturas/escrituras de objetos S3 | no hay trazabilidad de quién accedió a datos del lake | habilitar data events solo para buckets/prefijos requeridos, con retención y presupuesto explícitos |
+| Corregido | SQS no declaraba cifrado explícito y la policy S3 no restringía `aws:SourceAccount` | postura de cifrado/confused deputy dependía de defaults | §7.3 y §18.1 ahora usan SSE-SQS, 14 días de retención y acotan por bucket y cuenta; con KMS CMK hay que añadir permisos de productores/consumidores |
+| P2 | Las imágenes usan tags versionados, no digests; no hay SBOM/firma | una etiqueta puede no identificar exactamente el binario promovido | fijar digest, generar SBOM y asociar commit, imagen y deploy en la evidencia de release |
+| Corregido | El cargador decía que tenía caché y no leía `prod.env`; el recorrido usaba `-target` rutinariamente | contexto obsoleto y drift parcial | §3.1 ahora lee state fresco + overrides locales; `infra:apply` es completo |
+
+Esta tabla es deliberadamente más estricta que un laboratorio: si no se acepta una excepción por
+escrito, el cierre debe quedar materializado en la rama de producción antes de ejecutar la carga
+real.
+
 ---
 
 ## 2. Costo
 
-> **LEER, ~5 min.** Resultado: costo estimado y palancas que lo modifican.
+> **LEER y completar antes del primer apply.** Resultado: línea base por servicio, tope mensual
+> y límite por job. No use cifras históricas de una guía para aprobar gasto: precios, free tier,
+> región, descuentos y volumen cambian.
 
-Las decisiones de §5–§7 (tamaño de la EC2, EMR Serverless en vez de cluster, EIP, `gp3`)
-salen de esta tabla.
+Este diseño elimina el cómputo Spark ocioso, pero no hace que la plataforma sea gratis. Calcule en
+[AWS Pricing Calculator](https://calculator.aws) para la región elegida y valide después con Cost
+Explorer. Separe los cargos para que un pico tenga dueño y causa:
 
-> Precios aproximados de us-east-1 (on-demand), estimados en julio de 2026. Valide en
-> [calculator.aws](https://calculator.aws). Escenario **real**: ~2 GB/día, 3 corridas/semana
-> (≈13/mes) de Spark en EMR Serverless, con ~50 GB acumulados en el data lake.
+| Grupo | Fórmula de presupuesto | Control obligatorio |
+|---|---|---|
+| Orquestación | horas EC2 encendida × tarifa + EBS gp3 + snapshots + IPv4 pública | horario, alarma de CPU/espacio y revisión de créditos T3 |
+| Spark | suma de `billedResourceUtilization` de cada job × precio regional de vCPU/GB/disco | `maximum_capacity`, concurrencia 1 y timeout por job (§6.4) |
+| Lake | GiB-mes por clase + versiones no actuales + requests + transferencia | lifecycle por prefijo y expiración de logs (§6.1) |
+| Operación | CloudWatch Logs, Lambda, SQS, EventBridge, backups y alertas | retenciones explícitas; DLQ y Budget (§18) |
+| Red | IPv4 pública, DNS y, si se introduce, NAT/PrivateLink | **no** cree NAT para cargas solo AWS sin modelar su coste |
 
-| Ítem | US$/mes (auto start/stop 8h×22d) |
-|---|---|
-| EC2 `t3.large` (Airflow + Postgres + monitoreo) | ~12 |
-| EMR Serverless (pago por uso, ~13 corridas/mes) | ~9 |
-| EBS gp3 (root 40 + data 30) + snapshots DLM | ~9 |
-| S3 data lake (~50 GB) + requests | ~1.5 |
-| IPv4 pública (EIP; AWS la cobra desde feb-2024, asociada o no) | ~3.6 |
-| Lambda + EventBridge + SSM | ~0 (free tier) |
-| **Total** | **~35/mes** |
+Antes de producción, registre cuatro números: horas reales de EC2, GB-mes por prefijo S3,
+percentil p95 de duración/uso facturado de EMR y gasto mensual de observabilidad/backups. Fije
+`monthly_budget_usd` con margen para un reintento completo y use la alarma al 80%; el límite no es
+un mecanismo para interrumpir una carga ya iniciada.
 
-La `t3.large` (2 vCPU/8 GB) alcanza porque no corre Spark: queda casi idle entre corridas.
-EMR Serverless ejecuta el cómputo pesado y escala a cero. **Variante 24/7**: ~**$83/mes**.
-Con menor volumen, EMR ronda ~$5 → ~**$31** / ~**$79**. El monitoreo comparte la EC2.
+**Tamaño inicial, no promesa:** `t3.large` puede ser suficiente para Airflow, Postgres y el stack
+mínimo sin Spark. Si se habilita Prometheus/Grafana/Loki, mida memoria, disco y créditos T3 durante
+siete días antes de bajar o reservar capacidad. Una EC2 saturada es más cara que una talla correcta
+si provoca reintentos de EMR. No active modo ilimitado de T3 sin alertar
+`CPUSurplusCreditsCharged`.
 
 ### Self-managed vs managed: ¿cuándo cada uno?
 
-Comparación aproximada (us-east-1, datos chicos, ~20 tareas/día):
+Comparación de decisión; cotice todas las opciones con los mismos SLO, concurrencia y horas:
 
-| Opción | Cómo cobra | ~US$/mes a esta escala | Ops | Cuándo gana |
+| Opción | Cómo cobra | Ops | Cuándo gana |
 |---|---|---|---|---|
-| **EMR Serverless** (este stack, cómputo) | vCPU-seg + GB-seg, escala a cero | ~9 (+ S3) | AWS | **Spark pequeño o esporádico con operación mínima → opción elegida** |
-| **Airflow en EC2 pequeña** (este stack, orquestación) | tiempo encendido (flat) | ~12 (~35 total) | Equipo | orquestador liviano y portable, sin lock-in |
-| **Spark self-managed en EC2** (una instancia grande) | tiempo encendido (flat) | ~34 compute | Equipo | consolidar cargas Spark sostenidas en una instancia ya contratada; HDFS real |
-| **Glue Spark** | DPU-hora (mín 2 DPU + 1 min por corrida) | ~44 | AWS | pocos jobs/día, ecosistema Glue |
-| **EMR on EC2** (clásico) | fleet EC2 + ~25% recargo | ~120–160 | Equipo (clúster) | TB sostenidos, multi-nodo |
-| **MWAA** (solo orquestación) | entorno siempre encendido | ~350+ | AWS | evitar a esta escala |
+| **EMR Serverless** (este stack, cómputo) | vCPU-seg + GB-seg, escala a cero | AWS | **Spark pequeño o esporádico con operación mínima → opción elegida** |
+| **Airflow en EC2 pequeña** (este stack, orquestación) | tiempo encendido | Equipo | orquestador liviano y portable, sin lock-in |
+| **Spark self-managed en EC2** (una instancia grande) | tiempo encendido | Equipo | ejecución sostenida y capacidad ya contratada; asumir la operación |
+| **Glue Spark** | DPU/worker por uso | AWS | preferencia por integración Glue y tarifa validada en la región |
+| **EMR on EC2** (clásico) | fleet EC2 + cargo EMR | Equipo | TB sostenidos, multi-nodo y afinación de cluster |
+| **MWAA** (solo orquestación) | entorno siempre encendido | AWS | cuando HA administrada justifique el coste |
 
 Regla: **uso bajo o esporádico + mínima ops → serverless**, con Airflow en una EC2 pequeña.
 **Spark sostenido muchas horas → self-managed** en una instancia ya pagada, con HDFS real.
-Glue paga mínimos de 2 DPU y 1 minuto; EMR on EC2 y MWAA están sobredimensionados a esta escala.
+EMR Serverless deja de ser la opción económica cuando la capacidad está ocupada gran parte del día
+o si los cold starts incumplen el SLO. En ese caso, reevalúe el motor y el modelo de capacidad.
 
 ---
 
@@ -411,14 +480,15 @@ igual que §5.
 | 1 | Cree `variables.tf`, `main.tf` y `outputs.tf` del módulo | Bloques de la sección |
 | 2 | **Valide el módulo aislado**, sin backend ni credenciales | `terraform -chdir=infra/modules/<mod> init -backend=false && terraform -chdir=infra/modules/<mod> validate` |
 | 3 | Agregue `module "<mod>"` al final de `envs/prod/main.tf` | Bloque «Componer» de la sección |
-| 4 | Aplique **solo ese módulo** y verifique el checkpoint | `terraform -chdir=infra/envs/prod apply -target=module.<mod>` |
+| 4 | Revise y aplique **el plan completo** y verifique el checkpoint | `terraform -chdir=infra/envs/prod plan -out=tfplan && terraform -chdir=infra/envs/prod apply tfplan` |
 
 Validar el módulo primero atrapa errores antes del `apply`; aplicarlo por separado localiza el fallo.
 El [Taskfile de §3.0b](#30b-el-orquestador-de-comandos-taskfileyml) reduce el ciclo a **dos comandos** iguales en cada sección.
 
 ```text
 task infra:validate MODULE="<mod>"   # paso 2: valida el módulo aislado
-task infra:apply    MODULE="<mod>"   # paso 4: apply -target de ese módulo
+task infra:plan                     # paso 4: plan completo que se revisa
+task infra:apply                    # aplica el plan revisado; no usa -target
 ```
 
 **Cuando un módulo falla a mitad del apply**, Terraform no hace rollback: lo que se creó,
@@ -428,14 +498,15 @@ queda. Los cinco modos de falla — ninguno se arregla borrando el state:
 |---|---|---|
 | `Error: Unsupported attribute: module.X has no output "y"` | El módulo se compuso antes de agregar `outputs.tf` | Agregue `outputs.tf` al módulo y repita el `apply`; no modifique la composición |
 | `Error acquiring the state lock` | Otro `apply` está activo o terminó sin liberar el lock | Confirme que no existe otro proceso y ejecute `terraform -chdir=infra/envs/prod force-unlock <LOCK_ID>` |
-| El apply crea **más** recursos de los esperados | `-target` incluyó una dependencia todavía no aplicada | Es correcto si el plan coincide con el grafo; revíselo antes de confirmar |
+| El plan completo crea **más** recursos de los esperados | quedó una dependencia o un cambio pendiente de una sección anterior | Deténgase, entienda el grafo y corrija la composición; no recorte el plan con `-target` |
 | `EntityAlreadyExists` / `BucketAlreadyExists` | El recurso existe en AWS pero no en el state | Importe el recurso a su address de módulo antes de aplicar; no elimine recursos que contengan datos |
 | El apply termina OK pero `output` no devuelve nada | El output existe en el módulo, pero no en `envs/prod/outputs.tf` | Publique el output en el entorno, como indica §3.1 |
 
-> **`-target` es un andamio, no una forma de operar.** Un plan con `-target` es parcial por
-> definición: sirve para levantar el stack por capas la primera vez y para aislar un error.
-> Con todo arriba, **todo cambio va por `plan`/`apply` completos** (§15, §21.2). Usarlo
-> para evitar cambios no comprendidos indica que el plan completo todavía no está listo para aprobarse.
+> **No use `-target` como recorrido normal.** Terraform lo reserva para recuperación o una
+> limitación excepcional: puede ocultar drift y omitir cambios relacionados. La composición se
+> construye por secciones, pero cada sección completa se revisa y aplica con el plan íntegro del
+> entorno. Si el plan completo contiene cambios inesperados, se detiene y se investiga; no se
+> recorta para forzar el avance.
 
 > El árbol de arriba es el resultado final: cada módulo aparece cuando su sección lo crea.
 > `bootstrap` corre una vez y tiene state local; todo lo demás vive en **un solo backend y
@@ -447,9 +518,10 @@ El bucle de §3.0 se repite catorce veces, el deploy otras tantas y el runbook d
 encadena. Escritos a mano serían catorce copias divergiendo, más una quinceava en el CI
 (§11.2). Se definen **una sola vez**: el operador y CI ejecutan la misma task.
 
-El archivo versionado ya contiene el resultado final: tasks locales y productivas. La tabla de
-La tabla indica en qué etapa nace cada bloque y su dependencia; si se parte del repositorio,
-no debe agregarlo nuevamente. `check-doc-env.py` evita divergencias entre la guía y el archivo.
+En este checkout el `Taskfile.yml` solo contiene tareas locales. La tabla indica qué bloque se
+pega en qué etapa y su dependencia; la guía es la fuente de verdad hasta que esos bloques queden
+versionados en una rama de producción. Si se añade un validador documental, debe comparar los
+bloques contra el archivo para impedir divergencias.
 
 | Bloque incremental | Se incorpora en | Consumidor |
 |---|---|---|
@@ -530,17 +602,10 @@ vars:
       - terraform -chdir={{.ENV_DIR}} show tfplan
 
   infra:apply:
-    desc: "Aplica. MODULE=<n> aplica solo ese módulo; acepta varios entre comillas"
+    desc: "Aplica el plan completo aprobado; no admite -target"
     deps: [infra:init]
     cmds:
-      - |
-        if [ -n "{{.MODULE}}" ]; then
-          targets=""
-          for x in {{.MODULE}}; do targets="$targets -target=module.$x"; done
-          terraform -chdir={{.ENV_DIR}} apply $targets
-        else
-          terraform -chdir={{.ENV_DIR}} apply
-        fi
+      - terraform -chdir={{.ENV_DIR}} apply
 
   infra:output:
     desc: "Todos los outputs. NAME=<output> devuelve uno solo, en crudo"
@@ -554,16 +619,20 @@ vars:
 
 ```
 
-> **Los bloques YAML de la guía son la fuente de verdad de las tasks de producción**; las
-> locales viven solo en el archivo. Editar una sin la otra las hace divergir, y
-> `check-doc-env.py` compara cada bloque contra `Taskfile.yml` en cada corrida.
+> **Los bloques YAML de la guía son la fuente de verdad de las tasks de producción** hasta que se
+> versionen. Las locales viven solo en el archivo. Después de materializarlos, incorpore un
+> validador que compare guía y `Taskfile.yml`; de lo contrario, editar uno sin el otro los hará
+> divergir.
 
-Comprobalo ya: estas líneas corren sin credenciales AWS y sin un solo `.tf` escrito.
+Después de pegar los bloques anteriores en el `Taskfile.yml`, estas líneas corren sin credenciales
+AWS y sin un solo `.tf` escrito.
 
 ```bash
 task --list          # las 7 de infra, junto a las locales que ya estaban
-task doc:check       # una de las locales: los dos validadores de documentación
 ```
+
+`task doc:check` solo debe usarse cuando los validadores documentales hayan sido materializados;
+no existe en este checkout local.
 
 Con el esqueleto vacío, la validación debe terminar en cero sin tocar AWS:
 
@@ -625,10 +694,93 @@ Ningún bloque de este documento vuelve a calcular lo que un paso anterior ya de
 
 #### El cargador: `scripts/prod-env.sh`
 
-**Ya está en el repo** y no se modifica: las secciones agregan outputs de Terraform, no código al cargador.
-Su bucle exporta todo `terraform output -json`; un recurso nuevo queda disponible automáticamente.
-Si `infra/envs/prod` aún no existe, informa `contexto parcial`, carga los valores locales y continúa.
-El detalle está en [§5.5, Paso 0c](#55-desplegar-subir-código-y-túnel-ssh).
+**Créelo ahora, una vez.** Este checkout no lo incluye. El cargador exporta todo
+`terraform output -json`, deriva las rutas operativas y sigue en modo parcial antes del primer
+apply. Las secciones posteriores agregan outputs, no listas de variables al script.
+
+**`scripts/prod-env.sh`:**
+
+```bash
+#!/usr/bin/env bash
+# Sourcear en la terminal: source ./scripts/prod-env.sh
+# Ejecutar con --check solo informa el contexto; no puede exportarlo al proceso padre.
+_pe_sourced=0; (return 0 2>/dev/null) && _pe_sourced=1
+_pe_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+_pe_infra="${INFRA_DIR:-$_pe_root/infra/envs/prod}"
+
+# Overrides exclusivamente locales (perfil AWS, clave SSH). Debe ser un archivo de asignaciones
+# controlado por el operador, fuera de Git; Terraform nunca toma valores de aquí.
+_pe_overrides="${PROD_ENV_FILE:-$_pe_infra/prod.env}"
+if [ -r "$_pe_overrides" ]; then
+  set -a
+  . "$_pe_overrides"
+  set +a
+fi
+
+# Solo valores locales; los identificadores de AWS siempre llegan como outputs.
+export AWS_PAGER=""
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+export AWS_DEFAULT_REGION="$AWS_REGION"
+export SSH_KEY="${SSH_KEY:-$HOME/.ssh/pyspark_stack}"
+export SSH_USER="${SSH_USER:-ec2-user}"
+export REMOTE_DIR="${REMOTE_DIR:-/home/$SSH_USER/pyspark_stack}"
+export COMPOSE_PROD="${COMPOSE_PROD:-docker-compose.prod.yml}"
+
+if [ -d "$_pe_infra/.terraform" ]; then
+  _pe_json="$(terraform -chdir="$_pe_infra" output -json)" || {
+    echo "prod-env: terraform output falló; ejecute init o revise el state" >&2
+    [ "$_pe_sourced" -eq 1 ] && return 1 || exit 1
+  }
+  if [ "$(printf '%s' "$_pe_json" | jq 'length')" -gt 0 ]; then
+    eval "$(printf '%s' "$_pe_json" | jq -r '
+      to_entries[]
+      | select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$"))
+      | (.key | ascii_upcase) as $key
+      | (.value.value | if type == "string" then . else tojson end) as $value
+      | "export \($key)=\($value | @sh)"')"
+  else
+    echo "prod-env: contexto parcial — el state aún no tiene outputs" >&2
+  fi
+else
+  echo "prod-env: contexto parcial — todavía no existe state inicializado" >&2
+fi
+
+# Derivadas: solo aparecen cuando existe su valor base.
+[ -n "${ARTIFACTS_BUCKET:-}" ] && export EMR_ENTRYPOINTS_URI="s3://$ARTIFACTS_BUCKET/emr" EMR_LOGS_URI="s3://$ARTIFACTS_BUCKET/emr/logs" ATHENA_RESULTS_URI="s3://$ARTIFACTS_BUCKET/athena-results"
+[ -n "${DATALAKE_BUCKET:-}" ] && export RAW_URI="s3://$DATALAKE_BUCKET/raw" CURATED_URI="s3://$DATALAKE_BUCKET/curated"
+[ -n "${PUBLIC_IP:-}" ] && export SSH_TARGET="$SSH_USER@$PUBLIC_IP" SSH="ssh -i $SSH_KEY" RSYNC_SSH="ssh -i $SSH_KEY"
+
+if [ "${1:-}" = "--check" ]; then
+  _pe_strict=0
+  [ "${2:-}" = "--strict" ] && _pe_strict=1
+  _pe_missing=""
+  printf 'Contexto de producción (fuente: terraform; lectura fresca del state)\n'
+  for _pe_var in AWS_REGION NAME_PREFIX ACCOUNT_ID INSTANCE_ID PUBLIC_IP DATALAKE_BUCKET ARTIFACTS_BUCKET EMR_APP_ID SQS_TRIGGER_QUEUE_URL AIRFLOW_URL; do
+    eval "_pe_value=\${$_pe_var:-}"
+    printf '%-24s %s\n' "$_pe_var" "${_pe_value:-— (sin definir aún)}"
+    [ -n "${_pe_value:-}" ] || _pe_missing="$_pe_missing $_pe_var"
+  done
+  if [ -n "$_pe_missing" ]; then
+    echo "prod-env: contexto parcial; faltan:$_pe_missing" >&2
+    # El modo normal informa durante el recorrido incremental. --strict es para un gate final.
+    if [ "$_pe_strict" -eq 1 ]; then
+      [ "$_pe_sourced" -eq 1 ] && return 1 || exit 1
+    fi
+  else
+    echo 'prod-env: contexto completo'
+  fi
+fi
+unset _pe_json _pe_value _pe_var _pe_missing _pe_overrides _pe_infra _pe_root _pe_sourced _pe_strict
+```
+
+```bash
+chmod +x scripts/prod-env.sh
+source ./scripts/prod-env.sh
+```
+
+El script lee el state en cada carga a propósito: es más simple y evita usar un ID o IP obsoletos.
+Después de cada `apply`, vuelva a ejecutar `source ./scripts/prod-env.sh`; el prefijo
+No use `PROD_ENV_REFRESH`: el script no mantiene caché.
 
 #### Escalabilidad: qué agregar y dónde cuando la infra crece
 
@@ -669,16 +821,15 @@ nada de este ejemplo**; el código ejecutable vive en [§18.1](#181-dlq-según-e
    envs/prod/outputs.tf         output "sqs_trigger_dlq_url" { value = module.triggers.… }
                    └─ las dos, en la MISMA sección: nunca "para después"
 
-3. terraform apply      +  PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+3. terraform apply      +  source ./scripts/prod-env.sh
                    └─ apply publica el output; refresh lo carga en la terminal
 
 4. aws sqs get-queue-attributes --queue-url "$SQS_TRIGGER_DLQ_URL" ...
                    └─ ya es usable, sin haber tocado prod-env.sh ni una línea
 ```
 
-`PROD_ENV_REFRESH=1` en el paso 3 no es opcional: el cargador cachea el state 15 minutos y
-sin él el paso 4 corre con la URL vacía. Por eso cada `apply` que agrega outputs va seguido
-de un refresh en el bloque siguiente.
+El `source` del paso 3 siempre vuelve a leer el state; por eso cada `apply` que agrega outputs va
+seguido de una recarga antes del siguiente comando operativo.
 
 **Por qué no un `.env.prod` a mano**: es la misma trampa que el valor pegado, centralizada —
 se desincroniza en silencio en cuanto Terraform recrea algo. El state ya es el inventario
@@ -736,7 +887,7 @@ Se crea con un mini-Terraform de **state local**, una sola vez.
 ```hcl
 terraform {
   required_version = ">= 1.6"
-  required_providers { aws = { source = "hashicorp/aws", version = "~> 5.0" } }
+  required_providers { aws = { source = "hashicorp/aws", version = ">= 6.16, < 7.0" } }
   # sin backend => state LOCAL (intencional: este stack crea el backend).
 }
 provider "aws" { region = "us-east-1" }
@@ -767,6 +918,22 @@ resource "aws_s3_bucket_public_access_block" "tfstate" {
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+}
+# Block Public Access no reemplaza negar transporte inseguro: una policy futura podría permitir
+# un principal autenticado por HTTP. El state nunca viaja sin TLS.
+resource "aws_s3_bucket_policy" "tfstate_tls_only" {
+  bucket = aws_s3_bucket.tfstate.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource  = [aws_s3_bucket.tfstate.arn, "${aws_s3_bucket.tfstate.arn}/*"]
+      Condition = { Bool = { "aws:SecureTransport" = "false" } }
+    }]
+  })
 }
 
 output "state_bucket" { value = local.state_bucket }
@@ -844,7 +1011,8 @@ variable "aws_region" {
 terraform {
   required_version = ">= 1.10"   # use_lockfile (backend.tf) no existe antes de 1.10
   required_providers {
-    aws     = { source = "hashicorp/aws", version = "~> 5.0" }
+    # >= 6.16: scheduler_configuration de EMR Serverless (§6.4) no existía en provider 5.x.
+    aws     = { source = "hashicorp/aws", version = ">= 6.16, < 7.0" }
     random  = { source = "hashicorp/random", version = "~> 3.0" }
     archive = { source = "hashicorp/archive", version = "~> 2.0" }  # para zippear la Lambda
   }
@@ -1265,7 +1433,7 @@ Primero valide el módulo aislado; después aplique la composición contra AWS:
 
 ```bash
 task infra:validate MODULE=network   # el módulo aislado: Success! The configuration is valid.
-task infra:apply MODULE=network      # init + apply -target: crea SOLO este módulo
+task infra:apply                     # init + apply completo: revise todo el grafo
 ```
 
 <details>
@@ -1277,7 +1445,7 @@ terraform -chdir=infra/modules/network init -backend=false
 terraform -chdir=infra/modules/network validate      # Success! The configuration is valid.
 
 terraform -chdir=infra/envs/prod init                # instala el módulo recién compuesto
-terraform -chdir=infra/envs/prod apply -target=module.network
+terraform -chdir=infra/envs/prod apply
 ```
 
 - `fmt -check` no reescribe nada — para arreglar el formato, `task infra:fmt`.
@@ -1302,7 +1470,7 @@ agregó el bloque `module` en una ubicación incorrecta.
 > cuando se configure `airflow_domain` en §5.6.
 >
 > **Este apply activa el contrato de §3.1.** Recargue con
-> `PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh`; el contexto dejará de ser parcial.
+> `source ./scripts/prod-env.sh`; el contexto dejará de ser parcial.
 > El contexto crecerá en cada sección y marcará lo que aún no esté definido.
 
 > **Gotcha §5.1 — `ids[0]` vacío.** Si la AZ no tiene subnet en la VPC default, el apply falla con
@@ -1536,7 +1704,7 @@ resource "aws_instance" "pyspark" {
 }
 
 # EIP: sin ella, cada stop/start cambiaría la IP pública (túneles SSH, output public_ip).
-# Costo: AWS cobra toda IPv4 pública (~$3.6/mes, ver tabla de §2), asociada o no.
+# Costo: AWS cobra toda IPv4 pública asociada o no; inclúyala en la línea base de §2.
 resource "aws_eip" "pyspark" {
   domain = "vpc"
   tags   = { Name = "${var.name_prefix}-eip" }
@@ -1751,7 +1919,7 @@ module "orchestrator" {
 
 ```bash
 task infra:validate MODULE=orchestrator
-task infra:apply MODULE=orchestrator
+task infra:apply
 ```
 
 <details>
@@ -1763,7 +1931,7 @@ terraform -chdir=infra/modules/orchestrator init -backend=false
 terraform -chdir=infra/modules/orchestrator validate
 
 terraform -chdir=infra/envs/prod init
-terraform -chdir=infra/envs/prod apply -target=module.orchestrator
+terraform -chdir=infra/envs/prod apply
 ```
 
 </details>
@@ -1788,7 +1956,7 @@ instancia, EIP + asociación, volumen y su attachment. Si dice `1 to destroy` so
 > **Gotcha §5.3 — el `.tftpl` se busca dentro del módulo.** `templatefile("${path.module}/…")`
 > resuelve ahora contra `infra/modules/orchestrator/`, no contra la carpeta anterior. Si permanece en
 > otro lado, el error es *Invalid function argument: no file exists at* y aparece en `validate`,
-> antes de tocar AWS. El `-target` no lo evita.
+> antes de tocar AWS.
 
 > **Gotcha §5.3 (2) — `prevent_destroy` en el volumen de datos bloquea el `destroy` entero.** No
 > saltea ese recurso: aborta el plan completo, incluido `terraform destroy -target=module.orchestrator`.
@@ -1807,7 +1975,8 @@ instancia, EIP + asociación, volumen y su attachment. Si dice `1 to destroy` so
 Una Lambda prende y apaga la EC2, disparada por cron desde EventBridge Scheduler. Va Lambda y
 no una llamada directa de Scheduler a EC2 porque ahí vive la guarda implementada: no apagar con
 un DAG corriendo. El encendido sigue el horario y las alertas viven en gobierno (§18); esta Lambda
-no inspecciona colas ni publica SNS. Convierte ~$60/mes fijos en ~12 (8h×22d).
+no inspecciona colas ni publica SNS. Reduce las horas facturables de EC2; calcule el ahorro con
+la tarifa regional y el horario reales, pues EBS, snapshots, IPv4 y S3 permanecen facturando.
 
 **`infra/lambdas/startstop.py`:** el handler `stop` consulta antes si hay DAG runs activos y,
 si los hay, no apaga — apagado *job-aware*: con varios DAGs, se apaga cuando termina el
@@ -2090,7 +2259,7 @@ module "scheduler" {
 
 ```bash
 task infra:validate MODULE=scheduler
-task infra:apply MODULE=scheduler
+task infra:apply
 ```
 
 <details>
@@ -2102,7 +2271,7 @@ terraform -chdir=infra/modules/scheduler init -backend=false
 terraform -chdir=infra/modules/scheduler validate
 
 terraform -chdir=infra/envs/prod init
-terraform -chdir=infra/envs/prod apply -target=module.scheduler
+terraform -chdir=infra/envs/prod apply
 ```
 
 </details>
@@ -2114,7 +2283,7 @@ sesión operativa. Para pausarlos, defina `state = "DISABLED"` en cada schedule.
 > **Checkpoint §5.4** — no alcanza con que exista la Lambda; tiene que operar su instancia:
 >
 > ```bash
-> PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+> source ./scripts/prod-env.sh
 > aws lambda invoke --function-name "$LAMBDA_STARTSTOP_NAME" \
 >   --cli-binary-format raw-in-base64-out --payload '{"action":"start"}' /dev/stdout
 > ```
@@ -2360,20 +2529,18 @@ networks:
   platform:
 ```
 
-**Paso 0c — `scripts/prod-env.sh`: nada que crear.** Ya está en el repo
-(un cargador de contexto que debe restaurarse junto con la infraestructura) y no se toca en toda la guía: las secciones
-siguientes agregan `output`s a Terraform, nunca código al script. Se omite deliberadamente porque
-duplicarlo permitiría que la documentación divergiera del archivo ejecutado.
+**Paso 0c — `scripts/prod-env.sh`: ya fue creado en §3.1.** No lo reescriba acá: las secciones
+siguientes agregan `output`s a Terraform, nunca una lista de IDs al script. El archivo versionado
+en la rama de producción y este bloque documental deben mantenerse idénticos.
 
 Sus seis piezas, todas comentadas en el archivo:
 
 | Pieza | Qué resuelve |
 |---|---|
 | El bucle de `jq` sobre `terraform output -json` | **El motor.** No tiene una lista de variables: exporta en MAYÚSCULAS *todo* output que exista (`public_ip` → `$PUBLIC_IP`). Agregar un recurso es declarar su `output`; el cargador no se modifica |
-| Caché con TTL (`PROD_ENV_TTL`, 900 s) | `terraform output` baja el state de S3 en cada llamada (~1-2 s). Con 20 comandos por sesión se nota. `PROD_ENV_REFRESH=1` la ignora |
-| `PROD_ENV_SOURCE=discover` | El mismo contrato **sin** Terraform: descubre la infra por tags y nombres. El equivalente por consola fue retirado de este checkout |
+| Lectura fresca del state | Cada `source` ejecuta `terraform output -json`; elimina el riesgo de una caché con IDs obsoletos. Úselo después de cada `apply` |
 | Derivadas (`SSH_TARGET`, `RAW_URI`, `EMR_ENTRYPOINTS_URI`, …) | Se calculan una vez y solo si existe su base; una sección pendiente deja la variable vacía en lugar de producir una URI inválida |
-| Contexto parcial | Si `infra/envs/prod` aún no existe o el state no publicó outputs, **informa y continúa**: el mismo `source` sirve desde §1 y comienza a obtener valores cuando están disponibles |
+| Contexto parcial | Si `infra/envs/prod` aún no existe o el state no publicó outputs, **informa y continúa**: el mismo `source` sirve desde §3.1 y comienza a obtener valores cuando están disponibles |
 | `prod-env.sh --check` | Muestra qué quedó definido y qué falta. La lista de obligatorias crece con la guía |
 | `infra/envs/prod/prod.env` | Overrides locales **no versionados** (perfil AWS y clave SSH). Es lo único que el script no puede deducir |
 
@@ -2460,7 +2627,7 @@ desde donde está el `Taskfile.yml`). Del 3 al 5 no aparece ni un valor escrito 
 
 ```bash
 task infra:apply
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+source ./scripts/prod-env.sh
 ```
 
 **Paso 3 — comprobar el contexto y esperar el boot:**
@@ -2520,7 +2687,7 @@ los comandos posteriores requieren las variables en la terminal actual; una task
 
 | Línea | Por qué está |
 |---|---|
-| `PROD_ENV_REFRESH=1` | Si §5.1 ejecutó `update-sg-ip.sh`, puede existir una caché anterior a la EC2. Un `source` sin refresh devuelve ese contexto, sin `PUBLIC_IP`, y `prod:deploy` no puede resolver el host |
+| `source ./scripts/prod-env.sh` después de `apply` | Lee los outputs recién publicados; no hay caché ni se requiere una bandera especial. Sin la recarga, la shell conserva variables de la ejecución anterior |
 | `aws ec2 wait instance-status-ok` | La instancia figura `running` bastante antes de que termine el `user_data`. Sin el wait, el `rsync` falla con *connection refused*: `sshd` todavía no levantó |
 | `prod:trust-host` | Obtiene la clave Ed25519 por SSM/IAM, valida su forma y reemplaza la entrada exacta de la EIP; `release:deploy` puede repetirlo porque la confianza viene del canal autenticado, no de TOFU |
 | `StrictHostKeyChecking=yes` | Todo SSH posterior falla cerrado si la clave difiere de la registrada por SSM; un cambio de host igualmente debe estar explicado por el plan revisado |
@@ -2730,13 +2897,13 @@ define el segundo; ejecute ambos en la misma terminal.
 
 ```bash
 task infra:validate MODULE=https
-task infra:apply MODULE=https
+task infra:apply
 ```
 
 **Pasos 2–3 — recargar el contexto y comprobar el DNS:**
 
 ```bash
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+source ./scripts/prod-env.sh
 dig +short "$AIRFLOW_DOMAIN"
 ```
 
@@ -2827,7 +2994,7 @@ resource "aws_ssm_parameter" "airflow_https" {
 ```
 
 ```bash
-task infra:apply MODULE=https
+task infra:apply
 aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" --recursive \
   --query 'Parameters[].Name' --output text     # deben aparecer las 5 airflow_*
 ```
@@ -2977,7 +3144,7 @@ Con Caddy, **no configure** `AIRFLOW__API__SSL_*` ni el alias, y no cambie `EXEC
 **Prerrequisitos**:
 
 - §5 aplicada y la EC2 responde (`aws ssm describe-instance-information` la muestra `Online`).
-- Contexto recargado: `PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh`.
+- Contexto recargado: `source ./scripts/prod-env.sh`.
 
 ```mermaid
 flowchart TD
@@ -3070,6 +3237,12 @@ resource "aws_s3_bucket_public_access_block" "all" {
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+}
+# Desactiva ACLs heredadas: el dueño del bucket controla todos los objetos por IAM/policy.
+resource "aws_s3_bucket_ownership_controls" "all" {
+  for_each = local.buckets
+  bucket   = each.value
+  rule { object_ownership = "BucketOwnerEnforced" }
 }
 resource "aws_s3_bucket_server_side_encryption_configuration" "all" {
   for_each = local.buckets
@@ -3214,7 +3387,7 @@ output "artifacts_bucket" { value = module.storage.artifacts_bucket }
 
 ```bash
 task infra:validate MODULE=storage
-task infra:apply MODULE=storage
+task infra:apply
 ```
 
 <details>
@@ -3225,7 +3398,7 @@ terraform fmt -check -recursive infra/
 terraform -chdir=infra/modules/storage init -backend=false && terraform -chdir=infra/modules/storage validate
 
 terraform -chdir=infra/envs/prod init
-terraform -chdir=infra/envs/prod apply -target=module.storage
+terraform -chdir=infra/envs/prod apply
 ```
 
 </details>
@@ -3237,7 +3410,7 @@ cambió (`name_prefix`, por ejemplo) y existe riesgo de pérdida de datos. **Can
 > **Checkpoint §6.1** — los buckets por su nombre real, no por un prefijo asumido:
 >
 > ```bash
-> PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+> source ./scripts/prod-env.sh
 > aws s3api head-bucket --bucket "$DATALAKE_BUCKET"  && echo "datalake  ok"
 > ```
 >
@@ -3278,7 +3451,7 @@ resource "aws_ssm_parameter" "artifacts_bucket" {
 ```
 
 ```bash
-task infra:apply MODULE=storage
+task infra:apply
 # El último segmento del path es el nombre de la variable en el .env:
 #   /pyspark-stack/config/datalake_bucket  →  DATALAKE_BUCKET
 aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" \
@@ -3343,7 +3516,7 @@ profile):
 ```bash
 # Verifique.
 task infra:apply   # crea la policy ec2-s3a de arriba — sin esto el s3 cp de abajo da AccessDenied
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+source ./scripts/prod-env.sh
 ```
 
 Desde la EC2, verifique el rol de instancia y no las credenciales locales:
@@ -3449,7 +3622,7 @@ module "backups" {
 
 ```bash
 task infra:validate MODULE=backups
-task infra:apply MODULE=backups
+task infra:apply
 ```
 
 <details>
@@ -3460,7 +3633,7 @@ terraform fmt -check -recursive infra/
 terraform -chdir=infra/modules/backups init -backend=false && terraform -chdir=infra/modules/backups validate
 
 terraform -chdir=infra/envs/prod init
-terraform -chdir=infra/envs/prod apply -target=module.backups
+terraform -chdir=infra/envs/prod apply
 ```
 
 </details>
@@ -3523,7 +3696,14 @@ por vCPU-seg + GB-seg. Cuesta ~1–2 min de cold start y ahorra el cluster. Airf
 
 > **ESCRIBIR y APLICAR, ~20 min.** Resultado: aplicación Spark con escalado a cero, rol dedicado
 > y la EC2 autorizada únicamente para enviar jobs. **No agregue `network_configuration` sin un
-> requisito de conectividad privada**: obliga a usar NAT para acceder a S3 y suma ~$33/mes.
+> requisito de conectividad privada**: obliga a diseñar salida privada (NAT o endpoints) y puede
+> dominar el coste fijo. Modele la red antes de activarla; para S3/Glue/CloudWatch regionales el
+> modo sin VPC es deliberadamente más económico.
+
+> **Provider mínimo:** `scheduler_configuration` requiere AWS provider `>= 6.16`; por eso §4 fija
+> esa restricción. Si empezó esta guía con un `.terraform.lock.hcl` de provider 5.x, ejecute una vez
+> `terraform -chdir=infra/envs/prod init -upgrade`, revise el diff del lock y hágalo en una PR
+> dedicada antes de aplicar este módulo.
 
 #### 6.4.1 `infra/modules/emr/variables.tf`
 
@@ -3545,6 +3725,18 @@ variable "instance_role_name" {
 variable "log_retention_days" {
   type    = number
   default = 30
+}
+
+# Guardas de coste y de backpressure. Un pipeline pequeño no debe arrancar varios Spark a la vez
+# por entregas duplicadas de S3 ni esperar indefinidamente en la cola de EMR.
+variable "max_concurrent_runs" {
+  type    = number
+  default = 1
+}
+
+variable "queue_timeout_minutes" {
+  type    = number
+  default = 60
 }
 ```
 
@@ -3568,6 +3760,14 @@ resource "aws_emrserverless_application" "spark" {
   maximum_capacity {
     cpu    = "16 vCPU"
     memory = "64 GB"
+    disk   = "200 GB"
+  }
+
+  # EMR 7.x permite cola nativa. Este límite complementa max_active_runs de Airflow: también
+  # protege submits manuales, reintentos y eventos S3 duplicados que lleguen fuera de Airflow.
+  scheduler_configuration {
+    max_concurrent_runs  = var.max_concurrent_runs
+    queue_timeout_minutes = var.queue_timeout_minutes
   }
 
   # network_configuration: NO hace falta para jobs S3-only (EMR sale por el service network de AWS).
@@ -3673,6 +3873,7 @@ data "aws_iam_policy_document" "ec2_emr" {
     actions = [
       "emr-serverless:StartJobRun",
       "emr-serverless:GetJobRun",
+      "emr-serverless:CancelJobRun",
       "emr-serverless:StartApplication",
       "emr-serverless:GetApplication",
     ]
@@ -3797,7 +3998,7 @@ Agregue a `module "scheduler"` la entrada que habilita el apagado consciente de 
 
 ```bash
 task infra:validate MODULE="emr scheduler"
-task infra:apply MODULE="emr scheduler"
+task infra:apply
 ```
 
 <details>
@@ -3808,22 +4009,18 @@ terraform fmt -check -recursive infra/
 terraform -chdir=infra/modules/emr init -backend=false && terraform -chdir=infra/modules/emr validate
 
 terraform -chdir=infra/envs/prod init
-terraform -chdir=infra/envs/prod apply -target=module.emr -target=module.scheduler
+terraform -chdir=infra/envs/prod apply
 ```
 
-`MODULE` acepta varios nombres separados por espacio: construye un `-target` por cada uno y los envía
-en **un solo plan**, que no es lo mismo que dos `apply` seguidos — ves el efecto conjunto antes
-de confirmar.
+El apply es completo a propósito: `module.scheduler` recibe acá su `instance_role_name`, pero el
+plan también refresca y detecta cambios pendientes de los módulos ya compuestos.
 
 </details>
-
-Los dos `-target` juntos no son un descuido: `module.scheduler` recibe acá su
-`instance_role_name`, así que su plan también cambió.
 
 > **Checkpoint §6.4** — la app tiene que existir *y* estar en un estado que acepte jobs:
 >
 > ```bash
-> PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+> source ./scripts/prod-env.sh
 > aws emr-serverless get-application --application-id "$EMR_APP_ID" \
 >   --query 'application.{id:applicationId,state:state}'
 > ```
@@ -3987,7 +4184,7 @@ task que lo hace se apendea al `Taskfile.yml`, y el CD la reusa en cada deploy (
 
 ```bash
 # Recargue el contexto: este apply publicó emr_app_id y emr_job_role_arn.
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+source ./scripts/prod-env.sh
 task emr:sync
 ```
 
@@ -3998,13 +4195,14 @@ el operator de Airflow, y no tiene un solo valor escrito a mano:
 aws emr-serverless start-job-run \
   --application-id "$EMR_APP_ID" \
   --execution-role-arn "$EMR_JOB_ROLE_ARN" \
+  --execution-timeout-minutes 90 \
   --job-driver "$(jq -nc \
       --arg entry "$EMR_ENTRYPOINTS_URI/wordcount.py" \
       --arg bucket "$DATALAKE_BUCKET" \
       '{sparkSubmit: {
           entryPoint: $entry,
           entryPointArguments: [$bucket, "2026-07-16"],
-          sparkSubmitParameters: "--conf spark.executor.cores=2 --conf spark.executor.memory=4g --conf spark.executor.instances=2"
+          sparkSubmitParameters: "--conf spark.driver.cores=2 --conf spark.driver.memory=4g --conf spark.executor.cores=2 --conf spark.executor.memory=4g --conf spark.executor.instances=2 --conf spark.dynamicAllocation.enabled=false"
         }}')" \
   --configuration-overrides "$(jq -nc \
       --arg logs "$EMR_LOGS_URI/" \
@@ -4021,7 +4219,11 @@ aws emr-serverless start-job-run \
 
 La config de Spark va **por-job**, no en un `spark-defaults.conf`: en EMR Serverless no hay
 instancia donde montarlo. Los logs van a S3 y a CloudWatch, y la UI de Spark de cada corrida se
-abre desde la consola de EMR.
+abre desde la consola de EMR. El timeout de CLI es una guarda de coste: el default de EMR es 12 h.
+El operador estándar de Airflow debe probarse con la versión fijada del provider: conserva
+`execution_timeout` y `cancel_on_kill`, pero si esa versión no propaga un timeout de job a la API,
+cree un wrapper mínimo que envíe `executionTimeoutMinutes` y pruebe que cancela antes de habilitar
+retries. Nunca compense un timeout incierto con reintentos automáticos del submit.
 
 <details>
 <summary>🖱️ A mano en la consola AWS — EMR Serverless (app + rol del job)</summary>
@@ -4052,8 +4254,8 @@ abre desde la consola de EMR.
 
 ```bash
 # Verifique.
-task infra:apply MODULE=emr
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+task infra:apply
+source ./scripts/prod-env.sh
 ```
 
 Verifique la aplicación y luego publique los entrypoints:
@@ -4164,11 +4366,20 @@ with DAG(
                     "{{ dag_run.conf.get('key', 'scheduled') }}",
                 ],
                 "sparkSubmitParameters": (
+                    "--conf spark.driver.cores=2 "
+                    "--conf spark.driver.memory=4g "
                     "--conf spark.executor.cores=2 "
-                    "--conf spark.executor.memory=4g"
+                    "--conf spark.executor.memory=4g "
+                    "--conf spark.executor.instances=2 "
+                    "--conf spark.dynamicAllocation.enabled=false"
                 ),
             }
         },
+        # No reintente el submit a ciegas: si el worker pierde el estado puede quedar un job
+        # EMR vivo. La recuperación se hace con un run id/token idempotente y el runbook.
+        retries=0,
+        cancel_on_kill=True,
+        client_request_token="customer-etl-{{ dag_run.run_id }}",
         configuration_overrides={
             "monitoringConfiguration": {
                 "s3MonitoringConfiguration": {
@@ -4220,7 +4431,7 @@ flowchart TD
     O1["§7.1 · Lambda trigger-airflow<br/><i>ejecuta 'airflow dags trigger' por SSM SendCommand</i>"]
     O2["§7.2 · Disparo por cron<br/><i>EventBridge Scheduler → Lambda</i>"]
     O3["§7.3 · Disparo por evento<br/><i>S3 ObjectCreated → SQS → Lambda (+ DLQ)</i>"]
-    GATE["✅ Gate sección 7<br/>subir un archivo a raw/ crea<br/>un DAG run en Airflow ·<br/>la DLQ queda vacía"]
+    GATE["✅ Gate técnico sección 7<br/>un manifest de prueba crea<br/>un DAG run en Airflow<br/>sin activar cargas reales"]
 
     O1 --> O2 --> O3 --> GATE
 
@@ -4232,9 +4443,10 @@ flowchart TD
 - **El disparo va por SSM, no por la API REST de Airflow.** Es lo que permite que la
   API siga sin exponerse: la Lambda no necesita ruta de red a la EC2, solo permiso
   IAM sobre el ARN de esa instancia y ese documento.
-- **SQS va en el medio del evento de S3 a propósito.** S3 no reintenta; SQS sí, y la
-  DLQ conserva el mensaje fallido en lugar de perderlo. Un evento perdido en un data
-  lake es un dato que nunca llegó y que nadie va a notar.
+- **SQS va en el medio del evento de S3 a propósito.** S3 no reintenta; SQS sí. La DLQ,
+  alarma y replay se completan en §18: hasta entonces esta sección solo permite una prueba
+  técnica controlada, no activar datos reales. Un evento perdido en un data lake es un dato que
+  nunca llegó y que nadie va a notar.
 - **La idempotencia es responsabilidad del DAG, no del disparador.** S3 puede
   entregar el mismo evento más de una vez: procese de forma idempotente con `bucket`+`key`+`sequencer`
   y escriba particiones completas ([§9.5](#95-idempotencia)).
@@ -4582,7 +4794,7 @@ output "lambda_trigger_name" { value = module.triggers.lambda_trigger_name }
 
 ```bash
 task infra:validate MODULE=triggers
-task infra:apply MODULE=triggers
+task infra:apply
 ```
 
 <details>
@@ -4593,7 +4805,7 @@ terraform fmt -check -recursive infra/
 terraform -chdir=infra/modules/triggers init -backend=false && terraform -chdir=infra/modules/triggers validate
 
 terraform -chdir=infra/envs/prod init
-terraform -chdir=infra/envs/prod apply -target=module.triggers
+terraform -chdir=infra/envs/prod apply
 ```
 
 </details>
@@ -4601,7 +4813,7 @@ terraform -chdir=infra/envs/prod apply -target=module.triggers
 > **Checkpoint §7.1** — invocar la Lambda tiene que disparar un DAG run de verdad:
 >
 > ```bash
-> PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+> source ./scripts/prod-env.sh
 > aws lambda invoke --function-name "$LAMBDA_TRIGGER_NAME" \
 >   --cli-binary-format raw-in-base64-out --payload '{}' /dev/stdout
 > ```
@@ -4610,10 +4822,10 @@ terraform -chdir=infra/envs/prod apply -target=module.triggers
 > fallo de política. Compruébelo
 > con `aws ssm describe-instance-information` antes de tocar IAM.
 
-> **Gotcha §7.1 — `-target=module.triggers` sin `module.storage` aplicado.** El módulo referencia
-> `var.datalake_arn`; si el bucket no existe todavía, el grafo lo arrastra y el apply crea *también*
-> storage. No es un error, pero amplía el plan: revíselo antes de
-> confirmar.
+> **Gotcha §7.1 — el plan no debe encontrar storage pendiente.** `triggers` recibe
+> `var.datalake_arn`; si el bucket no fue aplicado en §6.1, el plan completo revelará también ese
+> cambio. Deténgase y complete §6.1: un trigger sin lake es un orden inválido, no una razón para
+> recortar el plan.
 
 <details>
 <summary>🖱️ A mano en la consola AWS — Lambda trigger-airflow</summary>
@@ -4637,7 +4849,7 @@ terraform -chdir=infra/envs/prod apply -target=module.triggers
 ```bash
 # Verifique.
 task infra:apply   # crea la Lambda trigger-airflow + su rol de arriba
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh   # publica lambda_trigger_name
+source ./scripts/prod-env.sh   # publica lambda_trigger_name
 ```
 
 Confirme SSM y después invoque la Lambda:
@@ -4717,7 +4929,7 @@ output "schedule_daily_etl_name" { value = module.triggers.schedule_daily_etl_na
 ```bash
 # Verifique.
 task infra:apply   # crea el schedule + su rol de invocación de arriba
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+source ./scripts/prod-env.sh
 ```
 
 Consulte los tres schedules con un solo bucle:
@@ -4745,6 +4957,8 @@ vuelve a ser visible después del *visibility timeout* y se reprocesa automátic
 resource "aws_sqs_queue" "trigger_events" {
   name                       = "${var.name_prefix}-trigger-events"
   visibility_timeout_seconds = 360
+  message_retention_seconds  = 1209600 # 14 días: margen para investigar/replay
+  sqs_managed_sse_enabled    = true
   # redrive_policy todavía NO va acá: la cola aws_sqs_queue.trigger_airflow_dlq se declara en
   # §18.1; esa sección vuelve a este resource para agregar el bloque. Agregarlo ahora hace fallar
   # el `apply` de esta sección con "Reference to undeclared resource".
@@ -4764,6 +4978,13 @@ data "aws_iam_policy_document" "trigger_events_queue" {
       test     = "ArnEquals"
       variable = "aws:SourceArn"
       values   = [var.datalake_arn]
+    }
+    # Un ARN de bucket S3 no contiene account id. Acotar ambas claves evita que un servicio
+    # actúe como confused deputy en nombre de otra cuenta.
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [var.account_id]
     }
   }
 }
@@ -4825,6 +5046,9 @@ queda creado pero en estado `Disabled` y los mensajes se acumulan sin que nadie 
 > El evento se emite solamente al publicar un manifest JSON después de cargar los tres objetos.
 > El DAG recibe bucket, key y run_date por `dag_run.conf`; archivos parciales, marcadores y nombres
 > desconocidos no disparan EMR. Una sobreescritura legítima obtiene otro `sequencer` y otro run id.
+> **No active este camino con datos reales todavía:** §18 debe agregar DLQ, alarma y replay, y
+> §20 debe aprobar el contrato/calidad. La activación final tiene que ser un cambio explícito y
+> revisado; mientras ese flag no esté materializado, esta notificación es solo un smoke test.
 
 **Terraform — outputs.** La URL de la cola incluye región y account ID: publíquela en lugar de
 componerla a mano.
@@ -4844,7 +5068,7 @@ output "sqs_trigger_queue_arn" { value = module.triggers.sqs_trigger_queue_arn }
 ```bash
 # Verifique.
 task infra:apply   # crea la cola SQS + la notificación S3 de arriba
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+source ./scripts/prod-env.sh
 ```
 
 La cola debe existir y mostrar sus atributos:
@@ -5013,25 +5237,25 @@ task infra:output                         # el state crudo; NAME=public_ip devue
 Salida esperada (con §4–§7 aplicadas, todas las obligatorias con valor):
 
 ```text
-Contexto de producción  (fuente: terraform · región: us-east-1)
-  lectura fresca del state
-  AWS_REGION               us-east-1
-  NAME_PREFIX              pyspark-stack
-  ACCOUNT_ID               123456789012
-  INSTANCE_ID              i-0a1b2c3d4e5f67890
-  PUBLIC_IP                203.0.113.10
-  DATALAKE_BUCKET          pyspark-stack-datalake-123456789012
-  ARTIFACTS_BUCKET         pyspark-stack-artifacts-123456789012
-  EMR_APP_ID               00fabc123def4gh5
-  SQS_TRIGGER_QUEUE_URL    https://sqs.us-east-1.amazonaws.com/123456789012/pyspark-stack-trigger-events
-  AIRFLOW_URL              https://airflow.midominio.com
-
-  ok: contexto completo
+Contexto de producción (fuente: terraform; lectura fresca del state)
+AWS_REGION               us-east-1
+NAME_PREFIX              pyspark-stack
+ACCOUNT_ID               123456789012
+INSTANCE_ID              i-0a1b2c3d4e5f67890
+PUBLIC_IP                203.0.113.10
+DATALAKE_BUCKET          pyspark-stack-datalake-123456789012
+ARTIFACTS_BUCKET         pyspark-stack-artifacts-123456789012
+EMR_APP_ID               00fabc123def4gh5
+SQS_TRIGGER_QUEUE_URL    https://sqs.us-east-1.amazonaws.com/123456789012/pyspark-stack-trigger-events
+AIRFLOW_URL              https://airflow.midominio.com
+prod-env: contexto completo
 ```
 
 `— (sin definir aún)` indica que falta aplicar la sección que crea el recurso.
 Ejemplos: `AIRFLOW_URL` → §5.6, `EMR_APP_ID` → §6.4 y `SQS_TRIGGER_QUEUE_URL` → §7.3.
-Si aparece `caché de hace Ns`, recárguelo con `PROD_ENV_REFRESH=1`; puede ser anterior al último apply.
+Recargue con `source ./scripts/prod-env.sh` después de todo `apply` que publique outputs. Use
+`./scripts/prod-env.sh --check --strict` en un gate final: el modo sin `--strict` informa el
+contexto parcial durante el recorrido incremental y termina correctamente.
 
 > **Desde este punto, todos los comandos requieren este contexto cargado.** Ante `unbound variable`
 > o un argumento vacío, verifique primero el contexto y después el comando.
@@ -5299,7 +5523,7 @@ flowchart TD
 | 10 | Un DAG nuevo no aparece en la UI | Error de import: dependencia faltante o error de sintaxis | `airflow dags list-import-errors` dentro del contenedor. Que no aparezca en la UI **no** significa que Airflow no lo vio: significa que lo vio y no lo pudo importar. El test de [§11.3](#113-test-de-integridad-de-dags) atrapa esto antes de desplegar |
 | 11 | El DAG aparece pero queda en cola | DAG pausado, scheduler caído o pool sin capacidad | Revisar, en ese orden: estado del toggle, `docker ps` del scheduler, pools de Airflow |
 | 12 | El stack no arranca: `variable is not set` / un servicio queda `Exited` | Una variable que el Compose declara con `:?` no existe en el `.env` | El `.env` sale de SSM: revisar el inventario de [§13.4](#134-materializar-env) y que el parámetro exista bajo `/<prefijo>/config/` |
-| 13 | `StartJobRun` falla con `ValidationException` | `$EMR_APP_ID` vacío: falta aplicar [§6.4](#64-cómputo-spark-emr-serverless), o el contexto es anterior a ese apply | `PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh`. Es el caso canónico de por qué existe §3.1 |
+| 13 | `StartJobRun` falla con `ValidationException` | `$EMR_APP_ID` vacío: falta aplicar [§6.4](#64-cómputo-spark-emr-serverless), o el contexto es anterior a ese apply | `source ./scripts/prod-env.sh`. Es el caso canónico de por qué existe §3.1 |
 | 14 | El job de EMR queda en `PENDING` mucho tiempo | Cuota de vCPU de la cuenta, o límite de concurrencia de la aplicación | Revisar Service Quotas para EMR Serverless y `maximumCapacity` de la app ([§6.4](#64-cómputo-spark-emr-serverless)) |
 | 15 | El job de EMR termina en `FAILED` | Los permisos S3 se asignaron al rol de EC2, pero el job usa su propio rol de ejecución. Otras causas: código o memoria | Revise primero `stateDetails` y después los logs de S3. Ante `AccessDenied`, corrija el rol de [§6.4](#64-cómputo-spark-emr-serverless), no el de [§6.2](#62-iam-permitir-s3a-a-la-ec2-sin-keys) |
 | 16 | Se cargan datos pero no ocurre nada. La DLQ está vacía | Falta publicar el manifest o no coincide con `raw/manifests/customer_etl/*.json`; el evento **nunca se generó** | Publique el manifest al final del lote y verifique el filtro de [§7.3](#73-disparo-por-evento-archivo-nuevo-en-s3-vía-sqs) |
@@ -5307,7 +5531,7 @@ flowchart TD
 | 18 | GitHub Actions: `Could not assume role` | El `sub` del trust policy no coincide con `repo:<org>/<repo>:*` reales | Corrija `github_org`/`github_repo` y vuelva a aplicar. Un error aquí no falla al aplicar: aparece en el primer workflow ([§11.4](#114-workflow-de-despliegue)) |
 | 19 | GitHub Actions: `Unable to locate credentials` | Falta `permissions: id-token: write` en el job | Agregarlo al YAML. Parece un problema de AWS y es de GitHub: sin eso no se emite el token OIDC ([§11.4](#114-workflow-de-despliegue)) |
 | 20 | El HTTPS de Airflow funcionaba y se rompió después de un deploy | Las 5 variables HTTPS se escribieron a mano en el `.env` de la EC2. `load-secrets.sh` regenera ese archivo **desde cero** y las borró | Publicarlas en SSM, que es donde tienen que vivir ([§5.6](#56-exponer-la-web-de-airflow-https-nativo-acceso-desde-la-ip-del-operador) y [§13.4](#134-materializar-env)) |
-| 21 | La factura no baja aunque la EC2 esté apagada | EBS, snapshots y la IPv4 pública facturan con la instancia apagada; la EIP se cobra **asociada o no** | Es esperado: PAUSA LARGA cuesta ~$14/mes, no $0 ([§1.1](#11-ciclo-de-vida-los-4-modos)). Para llegar a $0 debe destruir la infraestructura ([§21.4](#214-teardown)). Si el costo es mayor, revise presupuesto y anomalías ([§18.3](#183-budget)) |
+| 21 | La factura no baja aunque la EC2 esté apagada | EBS, snapshots, S3, logs y la IPv4 pública siguen facturando | Es esperado: PAUSA LARGA reduce cómputo, no deja la cuenta en cero ([§1.1](#11-ciclo-de-vida-los-4-modos)). Para eliminar los recursos de esta guía use el teardown (§21.4) y revise cargos compartidos; si el gasto supera la línea base, revise Budget y anomalías (§18.3) |
 
 > **No asumas que el error es de la fase donde aparece.** Un `AccessDenied` sobre S3 puede ser
 > el rol de la EC2 ([§6.2](#62-iam-permitir-s3a-a-la-ec2-sin-keys)), el de ejecución de EMR
@@ -5532,9 +5756,9 @@ flowchart TD
   admin no demuestra nada sobre el rol de OIDC. Son dos identidades distintas y el
   fallo típico —`Could not assume role`, o un `AccessDenied` en una sola acción— solo
   aparece del lado de GitHub.
-- **El `sub` del trust policy es literal.** `repo:org/repo:*` tiene que coincidir con
-  la organización y el repositorio reales; un error allí no falla al aplicar, sino en el primer
-  workflow, con un mensaje que no identifica la causa.
+- **El `sub` del trust policy es literal.** Debe coincidir con el claim emitido por GitHub para
+  este repositorio y environment; no lo generalice con `repo:org/repo:*`. Un error allí no falla
+  al aplicar, sino en el primer workflow, con un mensaje que no identifica la causa.
 - **El workflow necesita `permissions: id-token: write`.** Sin eso GitHub no emite el
   token OIDC y el paso de credenciales falla con `Unable to locate credentials`,
   que parece un problema de AWS y no lo es.
@@ -5619,14 +5843,6 @@ jobs:
       # Una sola línea: la misma task que usa el operador (§3.0b). Si CI duplicara los comandos,
       # a la tercera edición de la guía las dos copias dirían cosas distintas.
       - run: task infra:validate
-
-  docs:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: go install github.com/go-task/task/v3/cmd/task@v3.45.4
-      - run: task doc:check   # enlaces, anclas, § y contrato de variables
 
   compose:
     runs-on: ubuntu-latest
@@ -5724,6 +5940,10 @@ variable "region"      { type = string }
 variable "github_org"  { type = string }
 variable "github_repo" { type = string }
 
+# El claim sub cambió de formato para algunos repositorios en 2026. Copie el valor observado en
+# un token OIDC de este repo/environment; no lo sustituya por repo:<org>/<repo>:*.
+variable "github_oidc_subject" { type = string }
+
 variable "artifacts_arn" { type = string }
 variable "instance_id"   { type = string }
 ```
@@ -5733,10 +5953,9 @@ variable "instance_id"   { type = string }
 resource "aws_iam_openid_connect_provider" "github" {
   url             = "https://token.actions.githubusercontent.com"
   client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
 }
 
-# El trust acota por repo Y por environment: un push a otra rama no obtiene el rol.
+# El trust acota por el subject exacto del repo Y environment: otro ref no obtiene el rol.
 data "aws_iam_policy_document" "deploy_assume" {
   statement {
     actions = ["sts:AssumeRoleWithWebIdentity"]
@@ -5752,7 +5971,7 @@ data "aws_iam_policy_document" "deploy_assume" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_org}/${var.github_repo}:environment:production"]
+      values   = [var.github_oidc_subject]
     }
   }
 }
@@ -5815,6 +6034,7 @@ module "cicd" {
   region        = local.region
   github_org    = var.github_org
   github_repo   = var.github_repo
+  github_oidc_subject = var.github_oidc_subject
   artifacts_arn = module.storage.artifacts_arn
   instance_id   = module.orchestrator.instance_id
 }
@@ -5827,7 +6047,7 @@ output "deploy_role_arn" { value = module.cicd.deploy_role_arn }
 
 ```bash
 task infra:validate MODULE=cicd
-task infra:apply MODULE=cicd
+task infra:apply
 ```
 
 <details>
@@ -5837,30 +6057,33 @@ task infra:apply MODULE=cicd
 terraform fmt -check -recursive infra/
 terraform -chdir=infra/modules/cicd init -backend=false && terraform -chdir=infra/modules/cicd validate
 terraform -chdir=infra/envs/prod init
-terraform -chdir=infra/envs/prod apply -target=module.cicd
+terraform -chdir=infra/envs/prod apply
 ```
 
 </details>
 
-> **Checkpoint §11.4** — el rol existe y su trust apunta al repositorio previsto:
+> **Checkpoint §11.4** — el rol existe y su trust apunta al subject previsto:
 >
 > ```bash
-> PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+> source ./scripts/prod-env.sh
 > aws iam get-role --role-name "${NAME_PREFIX}-gha-deploy" \
 >   --query 'Role.AssumeRolePolicyDocument.Statement[0].Condition'
 > ```
 >
-> El `sub` debe ser `repo:<org>/<repo>:environment:production`. Un error aquí no falla durante el
-> apply: falla en el primer deploy, con un error que parece de credenciales.
+> El `sub` debe ser exactamente el valor registrado en `github_oidc_subject`. Un error aquí no
+> falla durante el apply: falla en el primer deploy, con un error que parece de credenciales.
 
 > **Gotcha §11.4 — el OIDC provider es de la cuenta, no del stack.** Si otro repo ya lo creó, el
-> apply falla con `EntityAlreadyExists`. Cambialo por un `data` y referencialo; no lo borres para
-> recrearlo, le romperías el deploy al otro repo.
+> apply falla con `EntityAlreadyExists`. Cámbielo por un `data` y referéncielo; no lo borre para
+> recrearlo, le rompería el deploy al otro repo. El proveedor actual de GitHub no requiere
+> `thumbprint_list`: no vuelva a fijar un thumbprint histórico.
 
-> Declare `github_org` y `github_repo` en `variables.tf` y asígnelos en `terraform.tfvars`. Como
-> el `sub` del trust incluye `environment:production`, el job **tiene que** declarar
-> `environment: production`; sin eso el runner falla con el mismo `Unable to locate credentials`
-> de la fila 19 del catálogo de §8.6.
+> Declare `github_org`, `github_repo` y `github_oidc_subject` en `variables.tf` y asígnelos en
+> `terraform.tfvars`. Obtenga `github_oidc_subject` de un token emitido por el workflow real en el
+> environment `production`: repositorios recientes pueden incluir identificadores de organización
+> y repositorio además de `repo:<org>/<repo>:environment:production`. El trust debe coincidir con
+> **ese valor exacto**, no con un comodín. El job tiene que declarar `environment: production`; sin
+> eso el runner falla con el mismo `Unable to locate credentials` de la fila 19 del catálogo de §8.6.
 
 **Archivo:** `.github/workflows/deploy.yml`.
 
@@ -5890,10 +6113,11 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: aws-actions/configure-aws-credentials@v6.2.3
+      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
 
       - name: Publicar artifacts
         env:
@@ -5996,6 +6220,8 @@ gh variable set ARTIFACTS_BUCKET --body "$ARTIFACTS_BUCKET"
 ```bash
 gh variable set DATALAKE_BUCKET  --body "$DATALAKE_BUCKET"
 gh variable set EMR_APP_ID       --body "$EMR_APP_ID"
+
+gh variable set AWS_ACCOUNT_ID   --body "$ACCOUNT_ID"
 ```
 
 Confirme que pertenecen a esta cuenta:
@@ -6015,8 +6241,10 @@ gh variable list      # confirme que contiene los valores de esta cuenta
 
 ## 12. Observabilidad e incidentes
 
-> **CONSULTAR. Es *roadmap* y no bloquea el primer despliegue. Resultado:** inventario de métricas
-> y logs, más playbooks para los tres incidentes principales.
+> **CONSULTAR.** Prometheus/Grafana/Loki son *roadmap* y no bloquean el primer despliegue, pero
+> CloudWatch Logs, alarmas de Lambda/SQS/EMR, disco de la EC2 y una ruta de notificación sí bloquean
+> la autorización de datos reales. Resultado: inventario de métricas y logs, más playbooks para los
+> tres incidentes principales.
 
 Sin `monitoring/` desplegado el diagnóstico sigue siendo posible —todo lo de
 [§8.6](#86-diagnóstico-rápido) más CloudWatch; solo se pierde la señal *anticipada*.
@@ -6251,8 +6479,9 @@ flowchart TD
   agregada manualmente dentro del host desaparece en el siguiente `load-secrets.sh`. Si
   una variable tiene que sobrevivir, se publica en SSM — no se edita el archivo.
 - **Toda variable que el Compose interpole tiene que estar en el inventario de
-  [§13.4](#134-materializar-env).** No es burocracia: `check-doc-env.py` lo verifica, porque una
-  variable de Compose sin su parámetro en SSM impide el arranque del stack.
+  [§13.4](#134-materializar-env).** No es burocracia: cuando se materialice, el validador
+  documental debe verificarlo; una variable de Compose sin su parámetro en SSM impide el arranque
+  del stack.
 - **Un rol por identidad**: EC2, job de EMR, Lambda y GitHub tienen roles distintos.
   Un rol compartido convierte cualquier compromiso en un compromiso total.
 
@@ -6355,7 +6584,7 @@ module "secrets" {
 
 ```bash
 task infra:validate MODULE=secrets
-task infra:apply MODULE=secrets
+task infra:apply
 ```
 
 <details>
@@ -6365,7 +6594,7 @@ task infra:apply MODULE=secrets
 terraform fmt -check -recursive infra/
 terraform -chdir=infra/modules/secrets init -backend=false && terraform -chdir=infra/modules/secrets validate
 terraform -chdir=infra/envs/prod init
-terraform -chdir=infra/envs/prod apply -target=module.secrets
+terraform -chdir=infra/envs/prod apply
 ```
 
 </details>
@@ -6424,7 +6653,7 @@ resource "aws_ssm_parameter" "config_name_prefix" {
 ```
 
 ```bash
-task infra:apply MODULE=secrets
+task infra:apply
 
 # El inventario completo, tal como lo va a leer load-secrets.sh:
 aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" --recursive \
@@ -7064,7 +7293,8 @@ Las UIs quedan en `127.0.0.1` y se acceden por túnel SSH (§12.3): ninguna se p
 ## 15. Runbook de puesta en producción
 
 > **EJECUTAR los siete pasos en orden** durante **cada** promoción. **Resultado:** despliegue
-> verificado y registrado con evidencia operativa.
+> verificado y registrado con evidencia operativa. Antes de la primera carga real, complete además
+> el gate de etapa A de §1.2; esta promoción técnica no sustituye calidad, alarmas ni restore test.
 
 ### Mapa del camino — sección 15
 
@@ -7076,6 +7306,8 @@ Las UIs quedan en `127.0.0.1` y se acceden por túnel SSH (§12.3): ninguna se p
 - Árbol de trabajo limpio y commit etiquetado: si no se identifica el commit desplegado, el
   paso 7 no puede registrar nada.
 - Ventana acordada: el paso 2 puede reemplazar la EC2 y cortar lo que esté corriendo.
+- Antes de datos reales: evidencia de calidad/promoción del data product, DLQ+replay, confirmación
+  SNS/alertas, Budget/anomalías, CloudTrail/Access Analyzer y restore probado (§1.2).
 
 ```mermaid
 flowchart TD
@@ -7086,7 +7318,7 @@ flowchart TD
     R5["5 · Publicar entrypoints EMR<br/><i>s3 sync spark-apps/emr/</i>"]
     R6["6 · Validar<br/><i>§8.2 smoke + §8.3 end-to-end</i>"]
     R7["7 · Registrar evidencia<br/><i>commit · plan · DAG run id · EMR job id</i>"]
-    GATE["✅ Gate de promoción<br/>sin errores de import · DAG termina ·<br/>EMR SUCCESS · datos en curated/ ·<br/>DLQ sin mensajes inesperados"]
+    GATE["✅ Gate de promoción<br/>sin errores de import · DAG termina · EMR SUCCESS ·<br/>calidad aprobada antes de curated/ · DLQ sin mensajes inesperados"]
 
     R1 --> R2 --> R3 --> R4 --> R5 --> R6 --> R7 --> GATE
 
@@ -7100,9 +7332,11 @@ flowchart TD
   determine primero la causa.
 - **Recargar el contexto entre el paso 2 y el 3 es obligatorio.** El `apply` pudo
   cambiar la IP, recrear la instancia o publicar outputs nuevos. Sin
-  `PROD_ENV_REFRESH=1`, los pasos 3–5 operan contra el host viejo.
+  `source ./scripts/prod-env.sh`, los pasos 3–5 operan contra el host viejo.
 - **El paso 6 no es opcional aunque el 4 haya salido limpio.** `docker compose up`
   exitoso prueba que los contenedores arrancaron, no que el pipeline funciona.
+- **La promoción no autoriza un dominio nuevo.** Para el primer lote de un data product, agregue
+  al paso 7 su contrato, resultado de calidad, manifest, evidencia de replay y estado de alarmas.
 
 > **Gotcha §15 — el paso 7 es el que convierte esto en ingeniería.** Sin commit, plan, DAG run
 > id y EMR job id registrados, el despliegue es irreproducible y la próxima falla no tiene
@@ -7118,7 +7352,7 @@ flowchart TD
     cmds:
       - |
         {{.CTX}}
-        ./scripts/prod-env.sh --check
+        ./scripts/prod-env.sh --check --strict
         aws sts get-caller-identity
       - task: infra:validate
       - task: infra:plan
@@ -7149,7 +7383,7 @@ flowchart TD
       - terraform -chdir={{.ENV_DIR}} apply tfplan
       - |
         echo "Recargue el contexto en su shell:"
-        echo "  PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh"
+        echo "  source ./scripts/prod-env.sh"
 
   release:deploy:
     desc: "§15 pasos 3-5 — esperar el host, desplegar y publicar los entrypoints"
@@ -7174,7 +7408,7 @@ Revise el plan. Si reemplaza EC2, EBS o buckets fuera del alcance del cambio, de
 
 ```bash
 task release:apply
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+source ./scripts/prod-env.sh
 ```
 
 **Pasos 3–6 — desplegar y ejecutar el smoke test:**
@@ -7195,7 +7429,7 @@ task prod:e2e
 
 ```bash
 # ─── Paso 1: release:check ───
-./scripts/prod-env.sh --check      # confirma el destino antes de aplicar
+./scripts/prod-env.sh --check --strict  # confirma el contexto completo antes de aplicar
 aws sts get-caller-identity
 terraform fmt -check -recursive infra/
 for m in infra/modules/*/; do terraform -chdir="$m" init -backend=false && terraform -chdir="$m" validate; done
@@ -7320,7 +7554,7 @@ output "glue_database"    { value = module.emr.glue_database }
 
 ```bash
 task infra:validate MODULE=athena
-task infra:apply MODULE=athena
+task infra:apply
 ```
 
 <details>
@@ -7330,7 +7564,7 @@ task infra:apply MODULE=athena
 terraform fmt -check -recursive infra/
 terraform -chdir=infra/modules/athena init -backend=false && terraform -chdir=infra/modules/athena validate
 terraform -chdir=infra/envs/prod init
-terraform -chdir=infra/envs/prod apply -target=module.athena
+terraform -chdir=infra/envs/prod apply
 ```
 
 </details>
@@ -7494,6 +7728,7 @@ Separarlo en gobierno crearía una dependencia circular.
 resource "aws_sqs_queue" "trigger_airflow_dlq" {
   name                      = "${var.name_prefix}-trigger-airflow-dlq"
   message_retention_seconds = 1209600   # 14 días, el máximo
+  sqs_managed_sse_enabled   = true
 }
 ```
 
@@ -7549,8 +7784,8 @@ output "sqs_trigger_dlq_url" { value = module.triggers.sqs_trigger_dlq_url }
 ```
 
 ```bash
-task infra:apply MODULE=triggers
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+task infra:apply
+source ./scripts/prod-env.sh
 ```
 
 Verifique el redrive de la cola primaria y que la DLQ esté vacía:
@@ -7577,6 +7812,7 @@ vive en `triggers`, así que `scheduler` publica el ARN y `triggers` lo recibe c
 resource "aws_sqs_queue" "scheduler_dlq" {
   name                      = "${var.name_prefix}-scheduler-dlq"
   message_retention_seconds = 1209600   # 14 días, el máximo
+  sqs_managed_sse_enabled   = true
 }
 
 # Sin esto el schedule no puede depositar el evento fallido y la DLQ queda vacía aunque falle todo.
@@ -7631,8 +7867,8 @@ output "sqs_scheduler_dlq_url" { value = module.scheduler.sqs_scheduler_dlq_url 
 
 ```bash
 # Verifique.
-task infra:apply MODULE="scheduler triggers"
-PROD_ENV_REFRESH=1 source ./scripts/prod-env.sh
+task infra:apply
+source ./scripts/prod-env.sh
 ```
 
 La DLQ del Scheduler también debe estar vacía:
@@ -7647,8 +7883,10 @@ aws sqs get-queue-attributes --queue-url "$SQS_SCHEDULER_DLQ_URL" \
 
 Un mensaje en una DLQ significa que algo falló **y nadie se enteró**: es lo primero que hay que
 alarmar. El resto de la lista mínima —errores y throttles de Lambda, edad del mensaje más viejo
-en SQS, jobs EMR fallidos, EC2 fuera de ventana, gasto real y proyectado— sigue el mismo patrón:
-`aws_cloudwatch_metric_alarm` contra el mismo topic.
+en SQS, jobs EMR fallidos, EC2 fuera de ventana, gasto real y proyectado— usa el mismo patrón:
+`aws_cloudwatch_metric_alarm` contra el mismo topic. **Este documento solo materializa la alarma
+de DLQ:** antes de datos reales agregue y pruebe las demás con umbrales basados en el SLO; no marque
+la etapa A como autorizada por tener únicamente el topic SNS.
 
 ```hcl
 # infra/modules/governance/main.tf
@@ -7691,8 +7929,9 @@ output "sns_topic_arn" { value = aws_sns_topic.alerts.arn }
 
 ### 18.3 Budget
 
-El último módulo: `governance`. No publica nada que otro módulo necesite, así que es el único que
-se puede sacar de la composición sin romper el resto.
+El último módulo: `governance`. No publica nada que otro módulo necesite, pero eso **no** lo vuelve
+opcional para producción: Budget, anomalías, alarmas de DLQ y Access Analyzer son el mínimo de
+operación para datos reales. Solo se pueden diferir en un sandbox o demo explícitamente etiquetado.
 
 Primero agregue la entrada a `infra/envs/prod/variables.tf`. Se introduce aquí, no en §5.1:
 declararla sin valor predeterminado al principio interrumpiría el recorrido incremental al solicitar
@@ -7809,7 +8048,7 @@ module "governance" {
 
 ```bash
 task infra:validate MODULE=governance
-task infra:apply MODULE=governance
+task infra:apply
 ```
 
 <details>
@@ -7819,7 +8058,7 @@ task infra:apply MODULE=governance
 terraform fmt -check -recursive infra/
 terraform -chdir=infra/modules/governance init -backend=false && terraform -chdir=infra/modules/governance validate
 terraform -chdir=infra/envs/prod init
-terraform -chdir=infra/envs/prod apply -target=module.governance
+terraform -chdir=infra/envs/prod apply
 ```
 
 </details>
@@ -7906,9 +8145,10 @@ En CI, database y prefijo S3 separados: un pull request nunca escribe en las tab
 
 ## 20. Calidad de datos
 
-> **LEER (~10 min) e implementar §20.1–§20.2 para servir datos reales.** Great Expectations
-> es *roadmap*; los controles mínimos son obligatorios. **Resultado:** gate SQL que detiene el pipeline antes de
-> publicar en `curated/`, en vez de descubrir el problema en un dashboard tres días después.
+> **LEER y completar por data product antes de datos reales.** Great Expectations es *roadmap*;
+> los controles mínimos son obligatorios, pero no hay una consulta genérica que certifique todos los
+> dominios. **Resultado:** gate versionado que detiene el pipeline antes de publicar en `curated`,
+> en vez de descubrir el problema en un dashboard tres días después.
 
 La calidad es una puerta antes de `curated`, no un reporte posterior: escriba primero en staging,
 valide y promueva después ([§20.3](#203-orden-del-pipeline)). Un gate que consulta una tabla ya
@@ -7946,9 +8186,9 @@ quality_gate = SQLCheckOperator(
 ```
 
 `SQLCheckOperator` convierte cada valor de la primera fila a booleano y falla si alguno es falso.
-La tabla/vista de staging y su promoción todavía no están implementadas en la guía: son un bloqueo
-de producción, no un nombre para copiar a ciegas. Para suites grandes, Great Expectations con
-versión fijada y el checkpoint como task aparte.
+La tabla/vista de staging, las reglas por dominio, cuarentena, reconciliación y promoción todavía
+no están implementadas en la guía: son un **bloqueo de producción**, no nombres para copiar a
+ciega. Para suites grandes, Great Expectations con versión fijada y el checkpoint como task aparte.
 
 ### 20.3 Orden del pipeline
 
@@ -8013,7 +8253,9 @@ desplegar por un solo canal → smoke test y corrida controlada → promover o r
 
 ### 21.3 Recuperación
 
-Pruebe trimestralmente:
+Pruebe **antes de autorizar datos reales y después trimestralmente**. Registre fecha, snapshot,
+dump, tiempo, RPO observado, RTO observado y quién aprobó el resultado; sin esa evidencia el RPO
+de 24 h y el RTO de 2 h son objetivos, no compromisos.
 
 1. crear una EC2 de recuperación;
 2. adjuntar un snapshot de `/data`;
@@ -8022,6 +8264,11 @@ Pruebe trimestralmente:
 5. sincronizar DAGs desde artifacts y disparar un DAG de prueba;
 6. comprobar **RPO ≤24 h** y **RTO ≤2 h**;
 7. registrar tiempos, evidencia y problemas encontrados.
+
+Si el requisito exige evidencia continua o protección ante borrado privilegiado, migre los
+snapshots gestionados por DLM a un plan de AWS Backup y evalúe restore testing y Vault Lock. Es una
+mejora de resiliencia, no un cambio cosmético: Vault Lock fija la retención y puede mantener costes
+hasta que venza el ciclo de vida.
 
 ### 21.4 Teardown
 
@@ -8173,9 +8420,9 @@ durante muchas horas diarias, una instancia de costo fijo puede ser más eficien
 
 #### B.3 Por qué Airflow en una EC2 y no MWAA
 
-Porque MWAA cobra un entorno siempre encendido —del orden de $350/mes— para orquestar un puñado
-de DAGs que no computan nada pesado. Una `t3.large` hace lo mismo por ~$12 con auto start/stop, y
-corre el mismo Compose que en local. El precio está declarado: punto único de fallo para Airflow,
+Porque un entorno MWAA permanece activo y una EC2 se puede apagar fuera de horario. Cotice ambas
+opciones con la región, SLO y necesidad de alta disponibilidad reales; una `t3.large` no ofrece la
+resiliencia administrada de MWAA. El precio del ahorro es un punto único de fallo para Airflow,
 Postgres y monitoreo ([§21.1](#211-límites-aceptados)).
 
 #### B.4 Por qué OIDC y no un usuario de IAM con keys
@@ -8236,11 +8483,11 @@ pyspark_stack/
 ├── dags/
 │   └── customer_etl_emr_dag.py          §6.6  el DAG de referencia contra EMR
 ├── spark-apps/emr/                      §6.4  entrypoints que se suben a S3
-├── Taskfile.yml                         ✅ versionado (tasks locales y productivas) · §3.0b explica las etapas
+├── Taskfile.yml                         local hoy; §3.0b agrega las tasks productivas por etapas
 ├── scripts/
-│   ├── prod-env.sh                      ✅ versionado — el cargador. NO lo edites
-│   ├── check-doc-links.py               ✅ versionado — validador de enlaces y §
-│   ├── check-doc-env.py                 ✅ versionado — validador del contrato
+│   ├── prod-env.sh                      §3.1 crea el cargador; versionarlo después
+│   ├── check-doc-links.py               opcional: materializar antes de usar task doc:check
+│   ├── check-doc-env.py                 opcional: materializar antes de usar task doc:check
 │   ├── load-secrets.sh                  §13.4 corre EN LA EC2, genera el .env 0600
 │   └── update-sg-ip.sh                  §5.1  actualiza la IP /32 del operador en el SG
 └── .github/workflows/                   §11.2 CI · §11.4 despliegue con OIDC
@@ -8254,9 +8501,14 @@ pyspark_stack/
 ## Referencias operativas oficiales
 
 - [EMR Serverless: comportamiento de aplicaciones](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/app-behavior.html)
+- [Terraform AWS provider: EMR Serverless application](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/emrserverless_application)
+- [EMR Serverless: concurrencia y cola de jobs](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/applications-concurrency-queuing.html)
+- [EMR Serverless: timeout y recursos facturados por job](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/considerations.html)
 - [EMR Serverless: métricas y monitoreo](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/app-job-metrics.html)
 - [EMR Serverless: almacenamiento de logs](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/logging.html)
 - [S3 Event Notifications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html)
 - [DLQ de EventBridge Scheduler](https://docs.aws.amazon.com/scheduler/latest/UserGuide/configuring-schedule-dlq.html)
 - [IAM Access Analyzer](https://docs.aws.amazon.com/IAM/latest/UserGuide/what-is-access-analyzer.html)
+- [AWS Backup: restore testing](https://docs.aws.amazon.com/aws-backup/latest/devguide/restore-testing.html)
+- [AWS Well-Architected: Data Analytics Lens](https://docs.aws.amazon.com/wellarchitected/latest/analytics-lens/design-principles-by-pillar.html)
 - [Airflow: operadores deferrable](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/deferring.html)

@@ -4,9 +4,9 @@
 
 ## Contexto
 
-La EC2 se apaga fuera de horario para que la factura siga la forma del uso: convierte ~$60/mes fijos
-en ~$12 con una ventana de 8 h × 22 días. La forma simple de hacerlo es que EventBridge Scheduler
-llame directamente a `ec2:StopInstances` por cron.
+La EC2 se apaga fuera de horario para que la factura siga la forma del uso: reduce sus horas
+facturables, aunque EBS, snapshots, IPv4, S3 y logs siguen facturando. La forma simple de hacerlo
+es que EventBridge Scheduler llame directamente a `ec2:StopInstances` por cron.
 
 El problema es obvio en cuanto se piensa en la operación: si la ventana de stop cae mientras un DAG
 está corriendo, el apagado lo corta a la mitad, y Airflow ni siquiera llega a registrar el estado
@@ -36,8 +36,8 @@ cortado a la mitad cuesta un incidente.
   más permisos y más piezas que un `StopInstances` a secas.
 - **Un stop que "no funciona" suele ser la guarda funcionando.** `{"msg": "N DAG run(s) activos, no
   apago"}` es el comportamiento correcto, y es la confusión más común de la sección.
-- Si el agente SSM está caído, la Lambda es conservadora y no apaga: se paga la EC2 hasta que
-  alguien lo note.
+- Si el agente SSM está caído, la Lambda es conservadora y no apaga: se mantiene coste de EC2 hasta
+  que una alarma o el operador lo detecte.
 
 ## Alternativas descartadas
 

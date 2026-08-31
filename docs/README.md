@@ -18,7 +18,7 @@ repetible. Lo marcado como **roadmap** no forma parte todavía del runbook de pr
 
 ### Cómo está ordenada la carpeta
 
-Arriba quedan **solo los seis documentos que se leen de punta a punta**. Lo que se
+Arriba quedan **solo los cuatro documentos que se leen de punta a punta**. Lo que se
 consulta —el material de referencia— vive un nivel adentro, para que abrir `docs/`
 muestre el camino y no el inventario.
 
@@ -27,8 +27,6 @@ docs/
 ├── 01-stack-local.md                  desarrollo local
 ├── 02-produccion-aws-terraform.md     producción en AWS: la guía completa
 ├── 03-arquitectura.md                 el porqué
-├── 04-dataops-local.md                proyectos medallion y operación local
-├── 05-hdfs-desde-la-terminal.md       operar el lakehouse a mano, sin tasks
 ├── 06-medallion-desde-cero.md         el taller: escribir los 15 proyectos, en orden
 ├── adr/                               decisiones estructurales, con sus alternativas descartadas
 └── README.md                          este índice
@@ -37,14 +35,12 @@ docs/
 | Documento | Propósito | Estado |
 |---|---|---|
 | [01 — Stack local](01-stack-local.md) | Anatomía del Compose y de los contenedores | Implementado |
-| [02 — Producción con Terraform](02-produccion-aws-terraform.md) | Arquitectura objetivo y runbook IaC, §1–§22 en un solo documento | Referencia; artefactos no presentes |
-| [03 — Arquitectura](03-arquitectura.md) | Vista lógica, seguridad y evolución | Implementado + roadmap |
-| [04 — DataOps local](04-dataops-local.md) | Operación de 15 pipelines medallion | Implementado |
-| [05 — HDFS desde la terminal](05-hdfs-desde-la-terminal.md) | Ver, buscar, subir, consultar y exportar data del lakehouse con los comandos crudos | Implementado; comandos verificados contra el stack |
+| [02 — Producción con Terraform](02-produccion-aws-terraform.md) | Guía IaC incremental, gates de producción y runbook, §1–§22 | Referencia copy-paste; artefactos AWS aún no materializados ni probados E2E |
+| [03 — Arquitectura](03-arquitectura.md) | Decisiones, fronteras y criterio de evolución; sin recetas operativas | Referencia de arquitectura; etapa A definida, B/C condicionadas por SLO/riesgo |
 | [06 — Medallion desde cero](06-medallion-desde-cero.md) | Taller copy-paste: los 15 proyectos en orden creciente, más la metodología | **Es la fuente del código de `dags/`** |
 
 Las decisiones que no se rediscuten mientras seguís las guías están en
-[`adr/`](adr/README.md) — ocho ADR con su contexto, sus consecuencias y lo que se descartó.
+[`adr/`](adr/README.md) — nueve ADR con su contexto, sus consecuencias y lo que se descartó.
 
 ### Cómo está organizada la guía 02
 
@@ -53,8 +49,9 @@ construye la plataforma: cada sección usa lo que dejó la anterior. Se recorre 
 tramos, y el [índice](02-produccion-aws-terraform.md#índice) enlaza sección por sección.
 
 La infraestructura objetivo se describe como **composición Terraform**, pero este checkout no
-incluye `infra/` ni los scripts o Compose de producción. La guía 02 es una referencia de diseño:
-no es un runbook ejecutable ni debe promoverse desde este árbol.
+incluye `infra/` ni los scripts o Compose de producción. La guía 02 es incremental y contiene los
+bloques a materializar, pero no debe declararse desplegada ni promoverse con datos reales desde este
+árbol hasta completar sus gates de producción y probarlos.
 
 | Tramo | Secciones | Qué resuelve |
 |---|---|---|
@@ -63,7 +60,7 @@ no es un runbook ejecutable ni debe promoverse desde este árbol.
 | [3 · Datos y cómputo](02-produccion-aws-terraform.md#6-data-lake-en-s3) | §6–§7 | Buckets, backups, EMR Serverless y los disparadores |
 | [4 · Operación](02-produccion-aws-terraform.md#8-operación-diaria-y-diagnóstico) | §8–§10 | Día a día, diagnóstico, patrones DataOps y despliegue |
 | [5 · Entrega y hardening](02-produccion-aws-terraform.md#11-cicd-con-github-actions-y-oidc) | §11–§15 | CI/CD con OIDC, observabilidad, secretos, Compose y runbook |
-| [6 · Evolución](02-produccion-aws-terraform.md#16-athena-e-iceberg) | §16–§22 + apéndices | Athena, gobierno, costos y lo marcado *roadmap* |
+| [6 · Gobierno y evolución](02-produccion-aws-terraform.md#16-athena-e-iceberg) | §16–§22 + apéndices | Gate de datos reales: gobierno/costo/recuperación, más Iceberg y extensiones |
 
 ## Por dónde empezar
 
@@ -76,8 +73,7 @@ flowchart TD
     Q --> L{"Aprender / desarrollar<br/>en mi máquina"}
     L --> L1["01 · Stack local<br/><i>cómo está armado el Compose</i>"]
     L1 --> L6["06 · Medallion desde cero<br/><i>escribir los 15 proyectos</i>"]
-    L6 --> L2["04 · DataOps local<br/><i>cómo se operan</i>"]
-    L2 --> L3["05 · HDFS desde la terminal<br/><i>subir, buscar y sacar TU data</i>"]
+    L6 --> L3["03 · Arquitectura<br/><i>entender los límites antes de producción</i>"]
 
     Q --> P{"Desplegar en AWS"}
     P --> P0["03 · Arquitectura<br/><i>el porqué, antes del cómo</i>"]
@@ -88,14 +84,14 @@ flowchart TD
 
     Q --> H{"Entender por qué<br/>algo está así"}
     H --> H1["03 · Arquitectura"]
-    H --> H2["adr/<br/><i>las ocho decisiones y lo descartado</i>"]
+    H --> H2["adr/<br/><i>las nueve decisiones y lo descartado</i>"]
 
     style P1 fill:#d1ecf1,stroke:#0c5460
     style L1 fill:#d1ecf1,stroke:#0c5460
     style L6 fill:#d4edda,stroke:#155724
 ```
 
-**El orden que sí importa**: 01 → **06** → 04 → 05 → 03 → 02. La 06 es donde se escribe
+**El orden que sí importa**: 01 → **06** → 03 → 02. La 06 es donde se escribe
 el código: `dags/` arranca vacío y esa guía lo entrega completo, en quince pasos.
  El stack local es el
 prerrequisito real del de producción —se desarrolla acá y se despliega allá—, y la
@@ -114,7 +110,7 @@ Terraform, va `terraform import` antes del siguiente `apply`.
 | Convención | Qué significa |
 |---|---|
 | **Dónde corre el bloque** | Tres contextos, no intercambiables: tu máquina (el default), dentro de la EC2 (`# EN LA EC2`, credenciales del rol de instancia) o GitHub Actions con OIDC. Un bloque de CI ejecutado en local no demuestra nada: prueba tus permisos de admin, no los del rol de OIDC |
-| **`task` arriba, desplegable abajo** | Los bloques ejecutables de la guía 02 muestran la task que corrés y, en «Qué corre por dentro», el `terraform`/`aws` equivalente. Las tasks de producción se escriben en [guía 02 §3.0b](02-produccion-aws-terraform.md#30b-el-orquestador-de-comandos-taskfileyml); las locales ya están en el repo. Son las mismas que corre el CI |
+| **`task` arriba, desplegable abajo** | Los bloques ejecutables de la guía 02 muestran la task y, en «Qué corre por dentro», el `terraform`/`aws` equivalente. Las tasks de producción se materializan desde [guía 02 §3.0b](02-produccion-aws-terraform.md#30b-el-orquestador-de-comandos-taskfileyml); las locales ya están en el repo |
 | **En esta sección / Salís con** | El encabezado de cada sección dice si toca **leer**, **ejecutar** o **consultar**, y cuánto lleva. Las de «consultar» no se leen de corrido |
 | **Mapa del camino** | Prerrequisitos, diagrama de pasos y reglas de la sección, antes del primer comando |
 | ✅ **Gate** | El criterio de aceptación de una sección. Si no lo cumplís, no sigas a la siguiente |
@@ -128,10 +124,10 @@ significa que exista, esté desplegado o haya pasado una prueba integrada en AWS
 
 | Capacidad | Dónde vive |
 |---|---|
-| Spark, HDFS, Jupyter y Airflow en local | Repositorio — implementado |
+| Spark, HDFS, Jupyter y Airflow en local | [Guía 01 §0](01-stack-local.md#0-construcción-incremental-del-entorno) — bootstrap copy-paste |
 | Los 15 pipelines medallion y su runtime | [Guía 06](06-medallion-desde-cero.md) — el código vive en la guía, no en `dags/` |
-| Orquestador de comandos (`Taskfile.yml`) | Repositorio — implementación completa para local |
-| Terraform de red, EC2, S3, EMR Serverless y automatización | Arquitectura objetivo — no materializado |
+| Orquestador de comandos (`Taskfile.yml`) | [Guía 01 §0.15](01-stack-local.md#015--crear-los-comandos-repetibles) — se crea durante el bootstrap local |
+| Terraform de red, EC2, S3, EMR Serverless y automatización | Guía 02 — bloques copy-paste, no materializados ni validados E2E |
 | DAG de Airflow contra EMR Serverless | Guía 02 §9.4 |
 | Jobs Spark para EMR Serverless | Guía 02 §6.4 |
 | Compose de producción y carga de secretos desde SSM | Guía 02 §13.4 y §14.1 |
@@ -142,10 +138,11 @@ significa que exista, esté desplegado o haya pasado una prueba integrada en AWS
 
 ## Regla de mantenimiento
 
-Los comandos, políticas y configuraciones ejecutables viven en sus archivos canónicos. La
-documentación explica decisiones y enlaza esos archivos; no mantiene una segunda copia que pueda
-divergir. Cada cambio de arquitectura debe actualizar esta matriz.
+Mientras producción exista solo como guía, sus bloques son la fuente de verdad y se copian de forma
+incremental. Después de materializarlos, los archivos versionados pasan a ser canónicos y la guía
+se actualiza en el mismo cambio; cada cambio de arquitectura actualiza esta matriz, la guía 02, la
+arquitectura 03 y el ADR correspondiente.
 
 Los comandos locales no llevan valores escritos a mano: leen las variables de `.env` y el Compose
-versionado. La guía 02 conserva su contrato de variables como referencia de diseño, no como
-automatización activa. La documentación se revisa junto con cada cambio de contrato u operación.
+versionado. En producción, el contrato de variables de guía 02 §3.1 se materializa antes del primer
+apply y se revisa junto con cada cambio de contrato u operación.

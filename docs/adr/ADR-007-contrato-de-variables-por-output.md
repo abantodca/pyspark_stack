@@ -16,15 +16,16 @@ tiene dos modos de falla caros:
 ## Decisión
 
 Todo valor que decide AWS o Terraform se publica como `output` en la sección que crea el recurso;
-`scripts/prod-env.sh` los exporta en MAYÚSCULAS a la shell; los comandos usan la variable. Los
-únicos `<entre-ángulos>` que quedan son valores que solo el lector puede elegir (un dominio, un job
-id puntual).
+el bloque de guía 02 §3.1 materializa `scripts/prod-env.sh`, que los exporta en MAYÚSCULAS a la
+shell; los comandos usan la variable. Los únicos `<entre-ángulos>` que quedan son valores que solo
+el lector puede elegir (un dominio, un job id puntual).
 
 La regla en una línea: *si un valor lo decide AWS o Terraform, se publica como `output`; si lo decide
 tu máquina (rutas locales), tiene default overridable en el cargador.*
 
-Dos validadores sin credenciales sostienen el invariante en cada cambio de la documentación:
-`scripts/check-doc-links.py` y `scripts/check-doc-env.py`.
+Cuando los artefactos de producción se versionen, un validador documental sin credenciales debe
+sostener este invariante (enlaces, orden de outputs y Taskfile). Este checkout aún no lo contiene,
+así que no debe declararse como un gate existente.
 
 ## Consecuencias
 
@@ -33,8 +34,8 @@ Dos validadores sin credenciales sostienen el invariante en cada cambio de la do
 - El mismo bloque copiado tal cual funciona en otra cuenta, otra región y con otro `name_prefix`.
 - El error típico es ruidoso y temprano: un nombre de recurso vacío por no haber sourceado el
   contexto, en vez de un comando que corre contra el recurso equivocado.
-- `check-doc-env.py` detecta el uso de una variable **antes** de la sección que la crea: el modo de
-  falla más caro de una guía incremental.
+- Cuando se materialice, el validador documental debe detectar el uso de una variable **antes** de
+  la sección que la crea: el modo de falla más caro de una guía incremental.
 
 **Se pierde:**
 
@@ -55,4 +56,4 @@ Dos validadores sin credenciales sostienen el invariante en cada cambio de la do
 
 Guía 02 [guía 02 §3.1](../02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando),
 [guía 02 §13.3b](../02-produccion-aws-terraform.md#133b-cerrar-la-configuración-no-secreta-en-ssm) (el mismo
-contrato para la EC2) y `scripts/prod-env.sh` (versionado, no se edita).
+contrato para la EC2) y `scripts/prod-env.sh` (materializado desde la guía y luego versionado).
