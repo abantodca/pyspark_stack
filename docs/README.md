@@ -126,7 +126,7 @@ significa que exista, esté desplegado o haya pasado una prueba integrada en AWS
 |---|---|
 | Spark, HDFS, Jupyter y Airflow en local | [Guía 01 §0](01-stack-local.md#0-construcción-incremental-del-entorno) — bootstrap copy-paste |
 | Los 15 pipelines medallion y su runtime | [Guía 06](06-medallion-desde-cero.md) — el código vive en la guía, no en `dags/` |
-| Orquestador de comandos (`Taskfile.yml`) | [Guía 01 §0.15](01-stack-local.md#015--crear-los-comandos-repetibles) — se crea durante el bootstrap local |
+| Orquestador de comandos (`Taskfile.yml` + módulos) | [Guía 01 §0.15](01-stack-local.md#015--crear-los-comandos-repetibles) — lanzador y módulo local; guía 02 §3.0b agrega el módulo de producción cuando se necesita |
 | Terraform de red, EC2, S3, EMR Serverless y automatización | Guía 02 — bloques copy-paste, no materializados ni validados E2E |
 | DAG de Airflow contra EMR Serverless | Guía 02 §9.4 |
 | Jobs Spark para EMR Serverless | Guía 02 §6.4 |

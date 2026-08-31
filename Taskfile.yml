@@ -1,0 +1,12 @@
+version: "3"
+
+# Lanzador del stack local. Sus tareas viven en el módulo local.
+includes:
+  local:
+    taskfile: ./taskfiles/Taskfile.local.yml
+
+tasks:
+  default:
+    desc: "Ayuda del stack local"
+    cmds:
+      - task local:default

@@ -102,7 +102,7 @@ los artefactos de producción se crean desde esta guía:
 |---|---|---|
 | `infra/bootstrap/`, `infra/envs/prod/`, módulos `network` y `orchestrator` | **no existen en este checkout** | Crearlos desde las secciones 3 a 5, validar y revisar antes de aplicar |
 | Módulos storage, EMR, Lambdas, gobierno y demás producción | **por crear** | Escribirlos, probarlos y revisarlos antes de desplegar |
-| `Taskfile.yml` | **por crear desde la guía local** | Materializarlo con [sección 0 de `01-stack-local.md`](01-stack-local.md#0-construcción-incremental-del-entorno) e integrar después los bloques de la sección 3.0b, sección 5.5, sección 6.4, sección 8, sección 10.1, sección 13.4 y sección 15 |
+| `Taskfile.yml` + `taskfiles/Taskfile.local.yml` | **por crear desde la guía local** | Materializarlos con [sección 0 de `01-stack-local.md`](01-stack-local.md#0-construcción-incremental-del-entorno); sección 3.0b crea `taskfiles/Taskfile.prod.yml`, que luego crece en las secciones 5.5, 6.4, 8, 10.1, 13.4 y 15 |
 | `Dockerfile.airflow.prod` | **por crear** | Crearlo desde [sección 5.5](#55-desplegar-subir-código-y-túnel-ssh) |
 | `docker-compose.prod.yml` (+ `.https.yml`, + `.monitoring.yml`) | **por crear** | Crearlo desde [sección 14.1](#141-docker-composeprodyml--base), [sección 5.6](#56-exponer-la-web-de-airflow-https-nativo-acceso-desde-la-ip-del-operador) y [sección 14.2](#142-docker-composeprodmonitoringyml--override-de-observabilidad) |
 | `scripts/prod-env.sh`, `scripts/load-secrets.sh`, `scripts/update-sg-ip.sh` | **por crear** | Crearlos desde [sección 3.1](#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando), [sección 13.4](#134-materializar-env) y [sección 5.1](#51-variables-y-red) |
@@ -112,7 +112,7 @@ los artefactos de producción se crean desde esta guía:
 
 El stack local se genera siguiendo [sección 0 de `01-stack-local.md`](01-stack-local.md#0-construcción-incremental-del-entorno).
 Los validadores y artefactos productivos que menciona esta guía deben existir en la rama de
-producción antes de usarlos como gates ejecutables. Por ello, `task infra:validate` solo comprueba
+producción antes de usarlos como gates ejecutables. Por ello, `task prod:infra:validate` solo comprueba
 el HCL materializado; los validadores documentales no demuestran el comportamiento real en AWS.
 
 ### Gate de entrada
@@ -482,9 +482,9 @@ Validar el módulo primero atrapa errores antes del `apply`; aplicarlo por separ
 El [Taskfile de la sección 3.0b](#30b-el-orquestador-de-comandos-taskfileyml) reduce el ciclo a **dos comandos** iguales en cada sección.
 
 ```text
-task infra:validate MODULE="<mod>"   # paso 2: valida el módulo aislado
-task infra:plan                     # paso 4: plan completo que se revisa
-task infra:apply                    # aplica el plan revisado; no usa -target
+task prod:infra:validate MODULE="<mod>"   # paso 2: valida el módulo aislado
+task prod:infra:plan                     # paso 4: plan completo que se revisa
+task prod:infra:apply                    # aplica el plan revisado; no usa -target
 ```
 
 **Cuando un módulo falla a mitad del apply**, Terraform no hace rollback: lo que se creó,
@@ -514,33 +514,96 @@ El bucle de la sección 3.0 se repite catorce veces, el deploy otras tantas y el
 encadena. Escritos a mano serían catorce copias divergiendo, más una quinceava en el CI
 (sección 11.2). Se definen **una sola vez**: el operador y CI ejecutan la misma task.
 
-Primero materialice el `Taskfile.yml` con [sección 0 de la guía local](01-stack-local.md#0-construcción-incremental-del-entorno).
+La [sección 0.15 de la guía local](01-stack-local.md#015--crear-los-comandos-repetibles) deja un
+lanzador `Taskfile.yml` y el módulo `taskfiles/Taskfile.local.yml`. Al comenzar producción, el
+módulo local no cambia. Esta sección hace dos cosas, en este orden: agrega al lanzador una inclusión
+opcional de producción y crea `taskfiles/Taskfile.prod.yml`. Al aparecer el segundo archivo queda
+disponible automáticamente bajo el prefijo `prod:`.
+
+Cada bloque de esta guía se agrega una sola vez, en la sección que lo necesita, dentro del mapa
+`tasks:` de ese módulo. Por ejemplo, una task interna `infra:plan` se ejecuta como
+`task prod:infra:plan`; una `status` se ejecuta como `task prod:status`. Esto permite ejecutar
+solo local (`task local:up`), solo producción (`task prod:infra:plan`) o una secuencia de ambos
+(`task local:up prod:infra:plan`) sin mezclar su código.
+
 La siguiente tabla indica qué bloque integrar en cada etapa y cuál es su dependencia. Esta guía es
 la fuente de verdad hasta que los bloques queden versionados en una rama de producción. Si añade un
 validador documental, compárelo contra el archivo para impedir divergencias.
 
 | Bloque incremental | Se incorpora en | Consumidor |
 |---|---|---|
-| `vars:` + `infra:*` (7 tasks) | **en esta guía** | sección 4 en adelante |
-| `prod:trust-host` · `prod:wait` · `prod:deploy` · `prod:tunnel` | [sección 5.5](#55-desplegar-subir-código-y-túnel-ssh) | sección 5.5, sección 15 |
-| `emr:sync` | [sección 6.4](#64-cómputo-spark-emr-serverless) | sección 6.4, sección 15 |
-| `prod:status` · `prod:smoke` · `prod:e2e` · `prod:logs` | [sección 8](#8-operación-diaria-y-diagnóstico) | operación diaria |
-| `dev:sync` | [sección 10.1](#101-iteración-rápida) | iteración de DAGs |
-| `prod:secrets` | [sección 13.4](#134-materializar-env) | materialización; la rotación coordinada está en la sección 13.4.1 |
+| variables de infraestructura + `infra:*` (7 tasks) | **en esta guía** | sección 4 en adelante |
+| `trust-host` · `wait` · `deploy` · `tunnel` | [sección 5.5](#55-desplegar-subir-código-y-túnel-ssh) | `task prod:<task>` |
+| `emr:sync` | [sección 6.4](#64-cómputo-spark-emr-serverless) | `task prod:emr:sync` |
+| `status` · `smoke` · `e2e` · `logs` | [sección 8](#8-operación-diaria-y-diagnóstico) | operación diaria |
+| `dev:sync` | [sección 10.1](#101-iteración-rápida) | `task prod:dev:sync` |
+| `secrets` | [sección 13.4](#134-materializar-env) | `task prod:secrets` |
 | `release:check` · `release:apply` · `release:deploy` | [sección 15](#15-runbook-de-puesta-en-producción) | cada promoción |
+
+**Regla de guardado para toda la guía de producción:** después de agregar uno de esos bloques,
+guarde `./taskfiles/Taskfile.prod.yml` y ejecute `task --list-all`. Deben seguir apareciendo
+`local:*` y todas las `prod:*` de etapas ya terminadas; si desaparece una, restauró o guardó el
+archivo equivocado. Antes de invocar una task nueva, confirme su nombre en ese catálogo.
 
 Requiere [go-task](https://taskfile.dev/installation/), incluido en el bloque de la sección 3.
 
-**1 — las tres variables** del bloque `vars:`:
+**1 — EDITAR Y GUARDAR desde la raíz del repositorio:** `./Taskfile.yml`
+
+Abra `pyspark_stack/Taskfile.yml`. Dentro de `includes:`, inmediatamente debajo del bloque `local:`,
+agregue este bloque. No cambie `taskfiles/Taskfile.local.yml`:
 
 ```yaml
+  prod:
+    taskfile: ./taskfiles/Taskfile.prod.yml
+    optional: true
+```
+
+**2 — CREAR Y GUARDAR desde la raíz del repositorio:** `./taskfiles/Taskfile.prod.yml`
+
+En VS Code, abra `pyspark_stack/taskfiles/` y cree ahí `Taskfile.prod.yml`. La carpeta ya fue
+creada por la guía local. **No** reemplace `./Taskfile.yml`, no edite
+`./taskfiles/Taskfile.local.yml` y no guarde este archivo dentro de `docs/`.
+
+```yaml
+version: "3"
+
 vars:
+
+tasks:
+  default:
+    desc: "Ayuda del módulo de producción"
+    silent: true
+    cmds:
+      - |
+        echo "pyspark_stack · módulo de producción"
+        echo "Infraestructura: task prod:infra:plan"
+        echo "Catálogo:        task --list-all"
+```
+
+**3 — EDITAR, GUARDAR y permanecer en `./taskfiles/Taskfile.prod.yml`.** Agregue estas tres líneas
+debajo de `vars:`:
+
+```yaml
   ENV_DIR: infra/envs/prod
   MODULES: infra/modules
   CTX: 'set -a; source ./scripts/prod-env.sh >/dev/null; set +a;'   # el subshell no hereda el contexto
 ```
 
-**2 — las tasks de infraestructura** dentro de `tasks:`:
+Al terminar, el comienzo del módulo de producción queda así; el módulo local no cambia:
+
+```yaml
+vars:
+  ENV_DIR: infra/envs/prod
+  MODULES: infra/modules
+  CTX: 'set -a; source ./scripts/prod-env.sh >/dev/null; set +a;'
+
+tasks:
+  default:
+```
+
+**4 — EDITAR Y GUARDAR `./taskfiles/Taskfile.prod.yml`.** Pegue las tasks de infraestructura al
+final de ese mapa, con los dos espacios iniciales que ya trae el bloque. No las pegue en el
+`Taskfile.yml` de la raíz ni en el módulo local:
 
 ```yaml
   # ── infraestructura ──────────────────────────────────────────────────────────
@@ -616,15 +679,16 @@ vars:
 ```
 
 > **Los bloques YAML de la guía son la fuente de verdad de las tasks de producción** hasta que se
-> versionen. Las locales viven solo en el archivo. Después de materializarlos, incorpore un
-> validador que compare guía y `Taskfile.yml`; de lo contrario, editar uno sin el otro los hará
+> versionen en `taskfiles/Taskfile.prod.yml`. Las locales viven en su módulo separado. Después de materializarlos, incorpore un
+> validador que compare guía y el módulo correspondiente; de lo contrario, editar uno sin el otro los hará
 > divergir.
 
-Después de pegar los bloques anteriores en el `Taskfile.yml`, estas líneas corren sin credenciales
+Después de pegar los bloques anteriores en `taskfiles/Taskfile.prod.yml`, estas líneas corren sin credenciales
 AWS y sin un solo `.tf` escrito.
 
 ```bash
-task --list          # las 7 de infra, junto a las locales que ya estaban
+test -f ./taskfiles/Taskfile.prod.yml || { echo "Falta ./taskfiles/Taskfile.prod.yml" >&2; exit 1; }
+task --list-all      # local:* y las 7 prod:infra:* recién incorporadas
 ```
 
 `task doc:check` solo debe usarse cuando los validadores documentales hayan sido materializados;
@@ -633,7 +697,7 @@ no existe en este checkout local.
 Con el esqueleto vacío, la validación debe terminar en cero sin tocar AWS:
 
 ```bash
-task infra:validate
+task prod:infra:validate
 ```
 
 #### Convención utilizada desde este punto
@@ -656,7 +720,7 @@ archivos completos, tablas y desplegables conservan el detalle técnico dentro d
   sin leer el YAML.
 
 **Mantenimiento: la sección que enseña una operación repetible es la dueña de su task.** Un
-comando que aparece dos veces en la guía y no está en el Taskfile es una copia esperando a
+comando que aparece dos veces en la guía y no está en `taskfiles/Taskfile.prod.yml` es una copia esperando a
 divergir.
 
 ---
@@ -938,7 +1002,7 @@ output "state_bucket" { value = local.state_bucket }
 ```
 
 ```bash
-task infra:bootstrap
+task prod:infra:bootstrap
 ```
 
 <details>
@@ -1065,7 +1129,7 @@ aws s3api head-bucket --bucket "$TFSTATE_BUCKET"                            # si
 
 ```bash
 # el backend responde y la composición (todavía sin módulos) inicializa
-task infra:init
+task prod:infra:init
 ```
 
 <details>
@@ -1428,15 +1492,15 @@ EOF
 Primero valide el módulo aislado; después aplique la composición contra AWS:
 
 ```bash
-task infra:validate MODULE=network   # el módulo aislado: Success! The configuration is valid.
-task infra:apply                     # init + apply completo: revise todo el grafo
+task prod:infra:validate MODULE=network   # el módulo aislado: Success! The configuration is valid.
+task prod:infra:apply                     # init + apply completo: revise todo el grafo
 ```
 
 <details>
 <summary>Qué corre por dentro</summary>
 
 ```bash
-terraform fmt -check -recursive infra/               # si falla, `task infra:fmt` lo reformatea
+terraform fmt -check -recursive infra/               # si falla, `task prod:infra:fmt` lo reformatea
 terraform -chdir=infra/modules/network init -backend=false
 terraform -chdir=infra/modules/network validate      # Success! The configuration is valid.
 
@@ -1444,7 +1508,7 @@ terraform -chdir=infra/envs/prod init                # instala el módulo recié
 terraform -chdir=infra/envs/prod apply
 ```
 
-- `fmt -check` no reescribe nada — para arreglar el formato, `task infra:fmt`.
+- `fmt -check` no reescribe nada — para arreglar el formato, `task prod:infra:fmt`.
 - `init -backend=false` valida el módulo **sin credenciales ni state**: por eso corre en CI (sección 11.2).
 - El `init` de la composición instala el `source` del módulo nuevo. Sin él, *Module not installed*.
 
@@ -1498,7 +1562,7 @@ agregó el bloque `module` en una ubicación incorrecta.
 >
 > ```bash
 > sed -i "s#^my_ip_cidr .*#my_ip_cidr = \"$(curl -s https://checkip.amazonaws.com)/32\"#" infra/envs/prod/terraform.tfvars
-> task infra:apply
+> task prod:infra:apply
 > ```
 >
 > Este mantenimiento ocurre cuando ya existe la regla creada en la sección 5.1.
@@ -1914,8 +1978,8 @@ module "orchestrator" {
 #### 5.3.5 Validar y aplicar (~3-4 min: el boot de la EC2 domina)
 
 ```bash
-task infra:validate MODULE=orchestrator
-task infra:apply
+task prod:infra:validate MODULE=orchestrator
+task prod:infra:apply
 ```
 
 <details>
@@ -2254,8 +2318,8 @@ module "scheduler" {
 #### 5.4.6 Validar y aplicar (~1 min)
 
 ```bash
-task infra:validate MODULE=scheduler
-task infra:apply
+task prod:infra:validate MODULE=scheduler
+task prod:infra:apply
 ```
 
 <details>
@@ -2554,13 +2618,15 @@ A esta altura ya trae los cuatro outputs de la sección 5.1 (`$NAME_PREFIX`, `$A
 es por lo que el Paso 2 recarga. Para cargarlo al entrar al repo,
 `echo 'source ./scripts/prod-env.sh' > .envrc` (con direnv, opcional).
 
-**Paso 0d — las tres tasks de deploy**, apendeadas a `tasks:` en `Taskfile.yml` a
-continuación de las de infraestructura de [sección 3.0b](#30b-el-orquestador-de-comandos-taskfileyml):
+**Paso 0d — EDITAR Y GUARDAR `./taskfiles/Taskfile.prod.yml`.** Agregue las tasks de deploy al
+final de su mapa `tasks:`, a continuación de las de infraestructura de
+[sección 3.0b](#30b-el-orquestador-de-comandos-taskfileyml). No modifique el lanzador ni el
+módulo local:
 
 ```yaml
   # ── operación ────────────────────────────────────────────────────────────────
 
-  prod:wait:
+  wait:
     desc: "sección 5.5 — espera el boot: status-ok, cloud-init y /data montado"
     cmds:
       - |
@@ -2569,7 +2635,7 @@ continuación de las de infraestructura de [sección 3.0b](#30b-el-orquestador-d
         $SSH -o StrictHostKeyChecking=yes "$SSH_TARGET" \
           'cloud-init status --wait && mountpoint /data && systemctl is-active docker'
 
-  prod:trust-host:
+  trust-host:
     desc: "sección 5.5 — registra la host key obtenida por el canal autenticado SSM"
     cmds:
       - |
@@ -2592,7 +2658,7 @@ continuación de las de infraestructura de [sección 3.0b](#30b-el-orquestador-d
         ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$PUBLIC_IP" >/dev/null 2>&1 || true
         printf '%s %s\n' "$PUBLIC_IP" "$HOST_KEY" >> "$HOME/.ssh/known_hosts"
 
-  prod:deploy:
+  deploy:
     desc: "sección 5.5 y sección 15 paso 4 — rsync del repo + load-secrets + up --build"
     cmds:
       - |
@@ -2607,7 +2673,7 @@ continuación de las de infraestructura de [sección 3.0b](#30b-el-orquestador-d
           if [ -x scripts/load-secrets.sh ]; then ./scripts/load-secrets.sh; fi && \
           docker compose $COMPOSE_ARGS up -d --build"
 
-  prod:tunnel:
+  tunnel:
     desc: "sección 5.5 — túnel a la UI de Airflow en localhost:8082. Ocupa la terminal"
     interactive: true
     cmds:
@@ -2622,7 +2688,7 @@ desde donde está el `Taskfile.yml`). Del 3 al 5 no aparece ni un valor escrito 
 **Pasos 1–2 — crear la infraestructura y cargar sus outputs:**
 
 ```bash
-task infra:apply
+task prod:infra:apply
 source ./scripts/prod-env.sh
 ```
 
@@ -2892,8 +2958,8 @@ define el segundo; ejecute ambos en la misma terminal.
 **Paso 1 — validar y aplicar el módulo HTTPS:**
 
 ```bash
-task infra:validate MODULE=https
-task infra:apply
+task prod:infra:validate MODULE=https
+task prod:infra:apply
 ```
 
 **Pasos 2–3 — recargar el contexto y comprobar el DNS:**
@@ -2990,7 +3056,7 @@ resource "aws_ssm_parameter" "airflow_https" {
 ```
 
 ```bash
-task infra:apply
+task prod:infra:apply
 aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" --recursive \
   --query 'Parameters[].Name' --output text     # deben aparecer las 5 airflow_*
 ```
@@ -3382,8 +3448,8 @@ output "artifacts_bucket" { value = module.storage.artifacts_bucket }
 #### 6.1.5 Validar y aplicar (~1 min)
 
 ```bash
-task infra:validate MODULE=storage
-task infra:apply
+task prod:infra:validate MODULE=storage
+task prod:infra:apply
 ```
 
 <details>
@@ -3447,7 +3513,7 @@ resource "aws_ssm_parameter" "artifacts_bucket" {
 ```
 
 ```bash
-task infra:apply
+task prod:infra:apply
 # El último segmento del path es el nombre de la variable en el .env:
 #   /pyspark-stack/config/datalake_bucket  →  DATALAKE_BUCKET
 aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" \
@@ -3511,7 +3577,7 @@ profile):
 
 ```bash
 # Verifique.
-task infra:apply   # crea la policy ec2-s3a de arriba — sin esto el s3 cp de abajo da AccessDenied
+task prod:infra:apply   # crea la policy ec2-s3a de arriba — sin esto el s3 cp de abajo da AccessDenied
 source ./scripts/prod-env.sh
 ```
 
@@ -3617,8 +3683,8 @@ module "backups" {
 #### 6.3.5 Validar y aplicar (~1 min)
 
 ```bash
-task infra:validate MODULE=backups
-task infra:apply
+task prod:infra:validate MODULE=backups
+task prod:infra:apply
 ```
 
 <details>
@@ -3993,8 +4059,8 @@ Agregue a `module "scheduler"` la entrada que habilita el apagado consciente de 
 #### 6.4.6 Validar y aplicar (~2 min)
 
 ```bash
-task infra:validate MODULE="emr scheduler"
-task infra:apply
+task prod:infra:validate MODULE="emr scheduler"
+task prod:infra:apply
 ```
 
 <details>
@@ -4167,8 +4233,9 @@ if __name__ == "__main__":
 
 #### 6.4.8 Empaquetado y submit
 
-Los entrypoints de la sección 6.4.7 se publican en `s3://<artifacts>/emr/`: es lo que EMR ejecuta. La
-task que lo hace se apendea al `Taskfile.yml`, y el CD la reusa en cada deploy (sección 11.3):
+Los entrypoints de la sección 6.4.7 se publican en `s3://<artifacts>/emr/`: es lo que EMR ejecuta.
+**EDITE Y GUARDE `./taskfiles/Taskfile.prod.yml`**: agregue esta task al final de `tasks:`; el CD
+la reusa en cada deploy (sección 11.3):
 
 ```yaml
   emr:sync:
@@ -4182,7 +4249,7 @@ task que lo hace se apendea al `Taskfile.yml`, y el CD la reusa en cada deploy (
 ```bash
 # Recargue el contexto: este apply publicó emr_app_id y emr_job_role_arn.
 source ./scripts/prod-env.sh
-task emr:sync
+task prod:emr:sync
 ```
 
 Los logs van a `$EMR_LOGS_URI`. El `StartJobRun` de abajo es el equivalente CLI de lo que arma
@@ -4251,7 +4318,7 @@ retries. Nunca compense un timeout incierto con reintentos automáticos del subm
 
 ```bash
 # Verifique.
-task infra:apply
+task prod:infra:apply
 source ./scripts/prod-env.sh
 ```
 
@@ -4313,7 +4380,7 @@ resource "aws_vpc_endpoint" "s3" {
 
 ```bash
 # Verifique.
-task infra:apply   # crea el gateway endpoint de arriba
+task prod:infra:apply   # crea el gateway endpoint de arriba
 # El nombre del servicio lleva la región adentro: con $AWS_REGION esto sigue funcionando
 # si el stack se migra a otra región.
 aws ec2 describe-vpc-endpoints \
@@ -4790,8 +4857,8 @@ output "lambda_trigger_name" { value = module.triggers.lambda_trigger_name }
 #### 7.1.5 Validar y aplicar (~1 min)
 
 ```bash
-task infra:validate MODULE=triggers
-task infra:apply
+task prod:infra:validate MODULE=triggers
+task prod:infra:apply
 ```
 
 <details>
@@ -4845,7 +4912,7 @@ recortar el plan.
 
 ```bash
 # Verifique.
-task infra:apply   # crea la Lambda trigger-airflow + su rol de arriba
+task prod:infra:apply   # crea la Lambda trigger-airflow + su rol de arriba
 source ./scripts/prod-env.sh   # publica lambda_trigger_name
 ```
 
@@ -4925,7 +4992,7 @@ output "schedule_daily_etl_name" { value = module.triggers.schedule_daily_etl_na
 
 ```bash
 # Verifique.
-task infra:apply   # crea el schedule + su rol de invocación de arriba
+task prod:infra:apply   # crea el schedule + su rol de invocación de arriba
 source ./scripts/prod-env.sh
 ```
 
@@ -5064,7 +5131,7 @@ output "sqs_trigger_queue_arn" { value = module.triggers.sqs_trigger_queue_arn }
 
 ```bash
 # Verifique.
-task infra:apply   # crea la cola SQS + la notificación S3 de arriba
+task prod:infra:apply   # crea la cola SQS + la notificación S3 de arriba
 source ./scripts/prod-env.sh
 ```
 
@@ -5098,11 +5165,11 @@ Detenga el análisis en la primera capa que falle: no diagnostique un DAG mientr
 o el scheduler
 caído.
 
-**Las cuatro tasks de operación**, apendeadas a `tasks:` en `Taskfile.yml` — una por
-subsección desde este punto:
+**EDITE Y GUARDE `./taskfiles/Taskfile.prod.yml`.** Agregue las cuatro tasks de operación al final
+de `tasks:` —una por subsección desde este punto—; no reemplace ninguna task anterior:
 
 ```yaml
-  prod:status:
+  status:
     desc: "sección 8.1 — estado real: EC2, agente SSM y contenedores"
     cmds:
       - |
@@ -5114,7 +5181,7 @@ subsección desde este punto:
           --query 'InstanceInformationList[].PingStatus' --output text
         $SSH "$SSH_TARGET" "docker ps --format '{{`{{.Names}}`}}\t{{`{{.Status}}`}}'" || true
 
-  prod:smoke:
+  smoke:
     desc: "sección 8.2 — smoke test por SSM: el mismo canal que usan las automatizaciones"
     cmds:
       # No `terraform validate` suelto: sin init previo falla con "Module not installed".
@@ -5149,7 +5216,7 @@ subsección desde este punto:
         [ "$(aws ssm get-command-invocation --command-id "$CMD_ID" \
              --instance-id "$INSTANCE_ID" --query Status --output text)" = "Success" ]
 
-  prod:e2e:
+  e2e:
     desc: "sección 8.3 — espera Lambda → SSM → Airflow → EMR y exige SUCCESS. DAG=<id> para otro DAG"
     vars:
       DAG: '{{.DAG | default "customer_etl_emr"}}'
@@ -5194,7 +5261,7 @@ subsección desde este punto:
           [ "$KEY_COUNT" -gt 0 ]
         fi
 
-  prod:logs:
+  logs:
     desc: "sección 8.6 — último job de EMR y logs de los contenedores"
     cmds:
       - |
@@ -5228,7 +5295,7 @@ Después, contraste la operación con el state:
 
 ```bash
 task prod:status                          # EC2, agente SSM y contenedores en una sola operación
-task infra:output                         # el state crudo; NAME=public_ip devuelve uno solo
+task prod:infra:output                         # el state crudo; NAME=public_ip devuelve uno solo
 ```
 
 Salida esperada (con las secciones 4 a 7 aplicadas, todas las obligatorias con valor):
@@ -5273,7 +5340,7 @@ distinto y es el procedimiento manual ante un fallo.
 <summary>Qué corre por dentro — 1: la infra y los servicios</summary>
 
 ```bash
-task infra:validate     # fmt -check de infra/ + validate de cada módulo y del entorno
+task prod:infra:validate     # fmt -check de infra/ + validate de cada módulo y del entorno
 
 aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
 
@@ -5675,7 +5742,7 @@ $SSH "$SSH_TARGET" \
    docker compose -f $COMPOSE_PROD exec -T airflow-scheduler airflow dags list-import-errors --output json"
 ```
 
-Su task, apendeada a `tasks:` en `Taskfile.yml`:
+**EDITE Y GUARDE `./taskfiles/Taskfile.prod.yml`.** Agregue esta task al final de `tasks:`:
 
 ```yaml
   dev:sync:
@@ -5686,7 +5753,7 @@ Su task, apendeada a `tasks:` en `Taskfile.yml`:
 
 ```bash
 chmod +x scripts/deploy-dev.sh
-task dev:sync
+task prod:dev:sync
 ```
 
 Solo para desarrollo: sincroniza sin pasar por git ni CI, así que lo que queda en la EC2 puede
@@ -5839,7 +5906,7 @@ jobs:
       - run: go install github.com/go-task/task/v3/cmd/task@v3.45.4
       # Una sola línea: la misma task que usa el operador (sección 3.0b). Si CI duplicara los comandos,
       # a la tercera edición de la guía las dos copias dirían cosas distintas.
-      - run: task infra:validate
+      - run: task prod:infra:validate
 
   compose:
     runs-on: ubuntu-latest
@@ -6043,8 +6110,8 @@ output "deploy_role_arn" { value = module.cicd.deploy_role_arn }
 ```
 
 ```bash
-task infra:validate MODULE=cicd
-task infra:apply
+task prod:infra:validate MODULE=cicd
+task prod:infra:apply
 ```
 
 <details>
@@ -6580,8 +6647,8 @@ module "secrets" {
 ```
 
 ```bash
-task infra:validate MODULE=secrets
-task infra:apply
+task prod:infra:validate MODULE=secrets
+task prod:infra:apply
 ```
 
 <details>
@@ -6650,7 +6717,7 @@ resource "aws_ssm_parameter" "config_name_prefix" {
 ```
 
 ```bash
-task infra:apply
+task prod:infra:apply
 
 # El inventario completo, tal como lo va a leer load-secrets.sh:
 aws ssm get-parameters-by-path --path "/${NAME_PREFIX}/config" --recursive \
@@ -6796,10 +6863,11 @@ $SSH "$SSH_TARGET" "ls -l $REMOTE_DIR/.env"
 
 Desde esta sección, `prod:deploy` cambia de comportamiento sin modificar el Taskfile: la línea
 `if [ -x scripts/load-secrets.sh ]` deja de ser un no-op. Para regenerar solo el `.env`, sin
-resincronizar el repositorio, agregue esta task:
+resincronizar el repositorio, **EDITE Y GUARDE `./taskfiles/Taskfile.prod.yml`** y agregue esta
+task al final de `tasks:`:
 
 ```yaml
-  prod:secrets:
+  secrets:
     desc: "sección 13.4 — rematerializa .env desde SSM; no rota credenciales"
     cmds:
       - |
@@ -7339,7 +7407,8 @@ flowchart TD
 id y EMR job id registrados, el despliegue es irreproducible y la próxima falla no tiene
 respuesta a «¿qué cambió?». Dos minutos.
 
-**Las tres tasks del runbook**, el último bloque que se apendea al `Taskfile.yml`:
+**EDITE Y GUARDE `./taskfiles/Taskfile.prod.yml`.** Este es el último bloque: agregue las tasks
+del runbook al final de `tasks:` sin modificar el lanzador ni `Taskfile.local.yml`:
 
 ```yaml
   # ── promoción (sección 15) ──────────────────────────────────────────────────────────
@@ -7385,9 +7454,9 @@ respuesta a «¿qué cambió?». Dos minutos.
   release:deploy:
     desc: "sección 15 pasos 3-5 — esperar el host, desplegar y publicar los entrypoints"
     cmds:
-      - task: prod:trust-host
-      - task: prod:wait
-      - task: prod:deploy
+      - task: trust-host
+      - task: wait
+      - task: deploy
       - task: emr:sync
 ```
 
@@ -7398,20 +7467,20 @@ que ninguna task debe automatizar: aprobar el plan.
 
 ```bash
 source ./scripts/prod-env.sh
-task release:check
+task prod:release:check
 ```
 
 Revise el plan. Si reemplaza EC2, EBS o buckets fuera del alcance del cambio, detenga la promoción.
 
 ```bash
-task release:apply
+task prod:release:apply
 source ./scripts/prod-env.sh
 ```
 
 **Pasos 3–6 — desplegar y ejecutar el smoke test:**
 
 ```bash
-task release:deploy
+task prod:release:deploy
 task prod:smoke
 ```
 
@@ -7550,8 +7619,8 @@ output "glue_database"    { value = module.emr.glue_database }
 ```
 
 ```bash
-task infra:validate MODULE=athena
-task infra:apply
+task prod:infra:validate MODULE=athena
+task prod:infra:apply
 ```
 
 <details>
@@ -7781,7 +7850,7 @@ output "sqs_trigger_dlq_url" { value = module.triggers.sqs_trigger_dlq_url }
 ```
 
 ```bash
-task infra:apply
+task prod:infra:apply
 source ./scripts/prod-env.sh
 ```
 
@@ -7864,7 +7933,7 @@ output "sqs_scheduler_dlq_url" { value = module.scheduler.sqs_scheduler_dlq_url 
 
 ```bash
 # Verifique.
-task infra:apply
+task prod:infra:apply
 source ./scripts/prod-env.sh
 ```
 
@@ -8044,8 +8113,8 @@ module "governance" {
 ```
 
 ```bash
-task infra:validate MODULE=governance
-task infra:apply
+task prod:infra:validate MODULE=governance
+task prod:infra:apply
 ```
 
 <details>
@@ -8222,7 +8291,7 @@ Los datos que no pasan calidad no deben promoverse a `curated` ni `analytics`.
 ### 21.2 Cambio seguro
 
 ```bash
-task release:check                        # fmt, validate, plan -out=tfplan, compose config y pytest
+task prod:release:check                        # fmt, validate, plan -out=tfplan, compose config y pytest
 python -m compileall infra/lambdas dags spark-apps
 ```
 
@@ -8480,7 +8549,10 @@ pyspark_stack/
 ├── dags/
 │   └── customer_etl_emr_dag.py          sección 6.6  el DAG de referencia contra EMR
 ├── spark-apps/emr/                      sección 6.4  entrypoints que se suben a S3
-├── Taskfile.yml                         se crea en la guía local; sección 3.0b agrega las tasks productivas por etapas
+├── Taskfile.yml                         lanzador de módulos; se crea en la guía local
+├── taskfiles/
+│   ├── Taskfile.local.yml               sección 0.15: tasks locales
+│   └── Taskfile.prod.yml                sección 3.0b: tasks productivas, por etapas
 ├── scripts/
 │   ├── prod-env.sh                      sección 3.1 crea el cargador; versionarlo después
 │   ├── check-doc-links.py               opcional: materializar antes de usar task doc:check

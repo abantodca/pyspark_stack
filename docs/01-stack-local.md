@@ -27,7 +27,7 @@
 
 > **En esta sección: CREAR, ~30 min.** El checkout no trae los archivos de infraestructura:
 > los generás una vez, en este orden, copiando cada bloque completo. Esta sección es la fuente
-> canónica de `docker-compose.yml`, los Dockerfiles, el Taskfile y sus archivos de soporte.
+> canónica de `docker-compose.yml`, los Dockerfiles, los Taskfiles modulares y sus archivos de soporte.
 >
 > **Salís con**: una raíz lista para ejecutar `task local:check`, sin configuración oculta ni
 > archivos de infraestructura preinstalados.
@@ -37,7 +37,7 @@ directorios que recibirán los archivos y el código que escribirás más adelan
 
 ```bash
 mkdir -p dags dags/guia dags/medallion dags/medallion_dags \
-  hadoop-config ops notebooks spark-apps/projects spark-events
+  hadoop-config ops notebooks spark-apps/projects spark-events taskfiles
 ```
 
 Para cada bloque siguiente: **CREAR** el archivo indicado, copiá su contenido completo y guardalo
@@ -943,20 +943,46 @@ JUPYTER_TOKEN=                       # obligatorio con perfil dev: openssl rand 
 
 ### 0.15 · Crear los comandos repetibles
 
-**CREAR:** `Taskfile.yml`
+El orquestador local se divide en dos archivos: un lanzador en la raíz y el módulo de tareas
+locales. En esta guía solo se crean y usan esos dos archivos.
+
+**CREAR Y GUARDAR desde la raíz del repositorio:** `./Taskfile.yml`
+
+En el explorador de VS Code, seleccione la carpeta raíz `pyspark_stack` —**no** `docs/`— y cree
+el archivo `Taskfile.yml` allí. Es el lanzador: no pegue este bloque dentro de
+`taskfiles/Taskfile.local.yml`.
 
 ```yaml
 version: "3"
 
-# Contrato ejecutable del stack local. La arquitectura AWS se conserva como
-# referencia documental; no hay artefactos de producción en este árbol.
+# Lanzador del stack local. Sus tareas viven en el módulo local.
+includes:
+  local:
+    taskfile: ./taskfiles/Taskfile.local.yml
+
+tasks:
+  default:
+    desc: "Ayuda del stack local"
+    cmds:
+      - task local:default
+```
+
+**CREAR Y GUARDAR desde la raíz del repositorio:** `./taskfiles/Taskfile.local.yml`
+
+En el explorador, abra la carpeta `pyspark_stack/taskfiles/` creada al inicio de la sección y cree
+allí `Taskfile.local.yml`; **no** lo guarde en `docs/`, ni al lado de `Taskfile.yml` en la raíz.
+Este bloque es un **archivo completo**, no un fragmento. Al terminar la guía local deben existir
+ambos archivos: el lanzador de la raíz y este módulo. `task --list-all` debe mostrar `local:*`.
+
+```yaml
+version: "3"
 
 vars:
   LOCAL_COMPOSE: docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml
 
 tasks:
   default:
-    desc: "Qué correr primero. El catálogo completo: task --list"
+    desc: "Ayuda del módulo local"
     silent: true
     cmds:
       - |
@@ -985,9 +1011,8 @@ tasks:
         echo "  task local:urls             lista URLs y estados"
         echo "  task local:credentials      muestra los accesos locales"
         echo
-        echo "Arquitectura AWS: docs/02-produccion-aws-terraform.md es referencia; no hay tareas de despliegue en este checkout."
 
-  local:check:
+  check:
     desc: "Valida secretos, permisos y configuración efectiva del stack local"
     cmds:
       - |
@@ -1006,7 +1031,7 @@ tasks:
         test -f ops/sources.env || { echo "Falta ops/sources.env con los orígenes de datos" >&2; exit 1; }
       - '{{.LOCAL_COMPOSE}} config --quiet'
 
-  local:gate:
+  gate:
     desc: "Verifica que los 15 proyectos de la guía 06 están escritos"
     cmds:
       - |
@@ -1015,33 +1040,33 @@ tasks:
         test "$count" -eq 15 || { echo "Hay $count de 15 proyectos en dags/medallion_dags (guía 06)" >&2; exit 1; }
         echo "Guía 06 completa: runtime + 15 proyectos medallion"
 
-  local:up:
+  up:
     desc: "Valida el entorno y levanta el stack local completo"
-    deps: [local:check]
+    deps: [check]
     cmds:
       - '{{.LOCAL_COMPOSE}} up -d --build'
 
-  local:up-dev:
+  up-dev:
     desc: "Valida el entorno y levanta el núcleo más Jupyter para trabajar con notebooks"
-    deps: [local:check]
+    deps: [check]
     cmds:
       - 'COMPOSE_PROFILES=dev {{.LOCAL_COMPOSE}} up -d --build'
 
-  local:resources:
+  resources:
     desc: "Muestra CPU, memoria y procesos de los contenedores que están arriba"
     cmds:
       - 'docker stats --no-stream'
 
-  local:down:
+  down:
     desc: "Baja todos los perfiles del stack local conservando los volúmenes"
     cmds:
       # Incluye Jupyter aunque COMPOSE_PROFILES esté vacío: de otro modo un notebook
       # iniciado antes como perfil dev quedaría consumiendo recursos en segundo plano.
       - 'COMPOSE_PROFILES=dev {{.LOCAL_COMPOSE}} down'
 
-  local:smoke:
+  smoke:
     desc: "Ejecuta Web Events Bronze/Silver/Gold contra Spark y HDFS reales"
-    deps: [local:check]
+    deps: [check]
     preconditions:
       - sh: test -f dags/medallion_dags/web_events_medallion_dag.py
         msg: "Falta el proyecto Web Events. Escribilo siguiendo docs/06-medallion-desde-cero.md sección 16"
@@ -1063,7 +1088,7 @@ tasks:
         done
         echo "Smoke medallion OK: web_events run_date=$run_date"
 
-  local:credentials:
+  credentials:
     desc: "Muestra los accesos locales de Airflow y Jupyter desde .env"
     preconditions:
       - sh: test -f .env
@@ -1077,7 +1102,7 @@ tasks:
         echo "Airflow: http://localhost:8082  usuario: $user  contraseña: $password"
         echo "Jupyter: http://localhost:8888/?token=$token"
 
-  local:urls:
+  urls:
     desc: "Lista las URLs del stack local y marca cuáles están arriba"
     silent: true
     cmds:
@@ -1091,6 +1116,14 @@ tasks:
         printf '%-14s %-24s %s\n' "Spark jobs" http://localhost:4055 "$(state jupyter)"
         printf '%-14s %-24s %s\n' HDFS http://localhost:9870 "$(state hdfs-namenode)"
         echo "Spark jobs es la UI del driver de Jupyter: responde solo mientras un notebook tiene sesión abierta."
+```
+
+**GUARDAR Y VERIFICAR** antes de seguir con `.env`:
+
+```bash
+test -f ./Taskfile.yml || { echo "Falta ./Taskfile.yml" >&2; exit 1; }
+test -f ./taskfiles/Taskfile.local.yml || { echo "Falta ./taskfiles/Taskfile.local.yml" >&2; exit 1; }
+task --list-all  # debe mostrar default y local:check, local:up, ...
 ```
 
 El único archivo que todavía falta es `.env`: se crea a partir del template en [sección 8.1](#81-secretos-en-un-env),
@@ -1174,7 +1207,7 @@ Las secciones 1–7 quedan como referencia para entender o diagnosticar el stack
 
 | Sección | Qué hacés | Detalle |
 |---|---|---|
-| **0** | **Crear** (~30 min) | Generás Dockerfiles, Compose, Taskfile y soportes desde bloques completos |
+| **0** | **Crear** (~30 min) | Generás Dockerfiles, Compose, Taskfiles modulares y soportes desde bloques completos |
 | **1–2** | **Leer** (~10 min) | El mapa de los 4 subsistemas y el patrón de anclas YAML que evita repetir configuración |
 | **3–6** | **Leer** (~20 min) | Un subsistema por sección: HDFS, Spark, Jupyter, Airflow. Se leen en orden: cada uno asume el anterior |
 | **7** | **Leer** (~5 min) | Red, volúmenes y orden de arranque — por qué `depends_on` no alcanza |
@@ -1217,9 +1250,8 @@ El Compose levanta cuatro subsistemas en una sola red de Docker (`hadoopnet`):
 | Interactivo | `jupyter` | Driver PySpark para trabajo exploratorio |
 | Orquestación | `airflow-*` (6) + `airflow-db` | Airflow 3.2.2 + Postgres 16 |
 
-**Los comandos del día a día están en el `Taskfile.yml` de la raíz**, que creaste en la sección 0.15, para
-que sean los mismos en tu máquina y en el CI. Este checkout parte sin tasks locales; los comandos
-AWS de la guía 02 son referencia y requieren artefactos de producción que no están en este árbol:
+**Los comandos del día a día se resuelven desde el `Taskfile.yml` de la raíz**, pero viven en
+`taskfiles/Taskfile.local.yml`, que creaste en la sección 0.15.
 
 | Task | Qué hace |
 |---|---|
@@ -1229,10 +1261,10 @@ AWS de la guía 02 son referencia y requieren artefactos de producción que no e
 | `task local:down` | Baja el stack **conservando** los volúmenes (los datos de HDFS y Postgres siguen ahí) |
 | `task local:credentials` | Muestra los accesos locales de Airflow y la URL con token de Jupyter |
 | `task local:urls` | Lista las URLs locales y marca qué servicio está arriba |
-| `task --list` | El catálogo completo de tareas locales disponibles en este checkout |
+| `task --list-all` | El catálogo completo de módulos y tareas disponibles en este checkout |
 
 No son obligatorias: cuando la guía invoca Compose directamente muestra los dos archivos que lo
-componen. El Taskfile es un atajo repetible para el uso diario, una vez que ya conocés el stack.
+componen. El módulo local es un atajo repetible para el uso diario, una vez que ya conocés el stack.
 Este checkout no contiene tareas ni artefactos de producción; la guía 02 sigue siendo referencia.
 
 Regla base: dentro de una red de Compose, el nombre del servicio **es** el hostname DNS. Por eso

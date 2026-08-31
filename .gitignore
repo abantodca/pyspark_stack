@@ -1,6 +1,6 @@
 # --- Secretos / entorno ---
 .env
-# Overrides locales del cargador de contexto (guía 02 §3.1): rutas y perfil de TU máquina.
+# Overrides locales del cargador de contexto (guía 02, sección 3.1): rutas y perfil de TU máquina.
 # El patrón `.env` de arriba NO lo cubre: gitignore compara nombres completos, y este se
 # llama prod.env. Commitearlo apuntaría los comandos de otra persona a tu cuenta o tu clave.
 **/prod.env
