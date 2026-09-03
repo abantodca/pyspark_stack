@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "Route53ChangeRecordsInZone", "Effect": "Allow",
+      "Action": ["route53:ChangeResourceRecordSets"],
+      "Resource": ["arn:aws:route53:::hostedzone/${zone_id}"] },
+    { "Sid": "Route53ReadForDns01", "Effect": "Allow",
+      "Action": ["route53:GetChange", "route53:ListHostedZones", "route53:ListResourceRecordSets"],
+      "Resource": ["*"] }
+  ]
+}

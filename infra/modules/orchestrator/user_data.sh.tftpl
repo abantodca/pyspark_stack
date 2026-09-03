@@ -1,0 +1,94 @@
+#!/bin/bash
+set -euxo pipefail
+# Bootstrap no secreto: vincula de forma explícita este host con el prefijo Terraform.
+printf 'PARAMETER_PREFIX=%q\n' '${parameter_prefix}' > /etc/pyspark-stack.env
+chmod 600 /etc/pyspark-stack.env
+# Instala solo las dependencias requeridas. Los parches del sistema deben aplicarse mediante
+# una actualización controlada de la AMI o una ventana de mantenimiento; `dnf update -y` en cada
+# recreación hace que dos boots puedan producir hosts distintos.
+dnf install -y docker git && systemctl enable --now docker
+
+# Versiones exactas y binarios verificados por checksum: un boot no consume silenciosamente otra
+# release. Actualice versión y checksum mediante un cambio controlado.
+COMPOSE_VERSION=v5.3.1
+BUILDX_VERSION=v0.35.0
+DOCKER_CONFIG=/usr/local/lib/docker
+mkdir -p $DOCKER_CONFIG/cli-plugins
+# OJO: templatefile() trata TODO este archivo como plantilla, comentarios incluidos. Cualquier
+# apertura de variable sin escapar rompe el parseo ("Invalid expression") aunque esté dentro de
+# un comentario, o -si el parseo no rompe- Terraform la interpreta como variable SUYA y falla
+# ("vars map does not contain key"). Para que bash expanda una variable en el boot hay que
+# escribirla con el símbolo de pesos duplicado antes de la llave, como en la línea de abajo. Todo
+# Toda variable Bash entre llaves que se agregue a este archivo requiere el mismo escape.
+# El .sha256 nombra al archivo publicado, no al destino: se descarga y verifica en /tmp con ese
+# nombre, y recién después se instala con el nombre que espera el plugin de Docker.
+curl --fail --silent --show-error --location --retry 5 --retry-all-errors "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+  -o /tmp/docker-compose-linux-x86_64
+curl --fail --silent --show-error --location "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-x86_64.sha256" \
+  -o /tmp/docker-compose.sha256
+(cd /tmp && sha256sum -c docker-compose.sha256)
+install -m 0755 /tmp/docker-compose-linux-x86_64 $DOCKER_CONFIG/cli-plugins/docker-compose
+# El paquete `docker` de dnf en AL2023 no trae buildx (o trae uno viejo): sin esto, el deploy
+# falla con "compose build requires buildx 0.17.0 or later" al ejecutar `up --build`.
+curl --fail --silent --show-error --location --retry 5 --retry-all-errors "https://github.com/docker/buildx/releases/download/$${BUILDX_VERSION}/buildx-$${BUILDX_VERSION}.linux-amd64" \
+  -o /tmp/buildx-$${BUILDX_VERSION}.linux-amd64
+curl --fail --silent --show-error --location "https://github.com/docker/buildx/releases/download/$${BUILDX_VERSION}/checksums.txt" \
+  -o /tmp/buildx-checksums.txt
+# checksums.txt marca modo binario: el nombre viene precedido de un asterisco, y el grep debe
+# incluirlo o no encuentra la línea (con pipefail, eso aborta el boot).
+(cd /tmp && grep " \*buildx-$${BUILDX_VERSION}.linux-amd64$" buildx-checksums.txt | sha256sum -c -)
+install -m 0755 /tmp/buildx-$${BUILDX_VERSION}.linux-amd64 $DOCKER_CONFIG/cli-plugins/docker-buildx
+usermod -aG docker ec2-user
+
+# Disco de datos: resolver el NVMe por el ID exacto del volumen EBS recibido desde Terraform.
+# AWS expone el serial como vol0123... (sin guion); nunca seleccionar "el primer nvme" porque la
+# enumeración puede cambiar entre boots y formatear el dispositivo equivocado sería destructivo.
+EXPECTED_VOLUME_ID="${data_volume_id}"
+EXPECTED_SERIAL="$(printf '%s' "$EXPECTED_VOLUME_ID" | tr -d '-')"
+DATA_DEV=""
+
+for _ in $(seq 1 60); do
+  while read -r dev serial; do
+    if [ "$serial" = "$EXPECTED_SERIAL" ]; then
+      DATA_DEV="/dev/$dev"
+      break
+    fi
+  done < <(lsblk -ndo NAME,SERIAL)
+
+  [ -n "$DATA_DEV" ] && break
+  sleep 2
+done
+
+if [ -z "$DATA_DEV" ]; then
+  echo "ERROR: no se encontró el volumen EBS esperado $EXPECTED_VOLUME_ID" >&2
+  exit 1
+fi
+
+ROOT_SOURCE="$(findmnt -n -o SOURCE /)"
+ROOT_PARENT="$(lsblk -n -o PKNAME "$ROOT_SOURCE" | head -n1)"
+ROOT_DEV="/dev/$${ROOT_PARENT:-$(basename "$ROOT_SOURCE")}"
+if [ "$DATA_DEV" = "$ROOT_DEV" ]; then
+  echo "ERROR: el volumen de datos resuelto coincide con el dispositivo root" >&2
+  exit 1
+fi
+
+if ! blkid "$DATA_DEV" >/dev/null 2>&1; then
+  # Solo formatea el volumen exacto y únicamente si no tiene filesystem.
+  mkfs -t xfs "$DATA_DEV"
+fi
+
+mkdir -p /data
+mountpoint -q /data || mount "$DATA_DEV" /data
+DATA_UUID="$(blkid -s UUID -o value "$DATA_DEV")"
+grep -q "UUID=$DATA_UUID " /etc/fstab || echo "UUID=$DATA_UUID /data xfs defaults,nofail 0 2" >> /etc/fstab
+
+chown -R ec2-user:ec2-user /data
+# Bind mounts del compose de prod. Los UID están ligados a las imágenes pineadas; validar los
+# permisos al actualizar imágenes.
+mkdir -p /data/postgres /data/airflow-logs /data/backups/postgres /data/prometheus /data/grafana /data/loki
+chown 50000:0     /data/airflow-logs
+printf 'e /data/airflow-logs - - - 7d\n' > /etc/tmpfiles.d/airflow-logs.conf
+chown 65534:65534 /data/prometheus
+chown 472:472     /data/grafana
+chown 10001:10001 /data/loki
+echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-pyspark.conf && sysctl --system

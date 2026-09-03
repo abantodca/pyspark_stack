@@ -1,9 +1,12 @@
 version: "3"
 
-# Lanzador del stack local. Sus tareas viven en el módulo local.
+# Lanzador. Las tareas locales y de producción viven en módulos separados.
 includes:
   local:
     taskfile: ./taskfiles/Taskfile.local.yml
+  prod:
+    taskfile: ./taskfiles/Taskfile.prod.yml
+    optional: true
 
 tasks:
   default:

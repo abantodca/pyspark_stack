@@ -1,0 +1,137 @@
+version: "3"
+
+vars:
+  LOCAL_COMPOSE: docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml
+
+tasks:
+  default:
+    desc: "Ayuda del módulo local"
+    silent: true
+    cmds:
+      - |
+        echo "pyspark_stack · plataforma local de datos con Airflow + Spark + HDFS"
+        echo
+        echo "── PRIMERA VEZ ──────────────────────────────────────────────────────────"
+        echo "  1  cp .env.example .env"
+        echo "  2  chmod 600 .env"
+        echo "  3  completá los cuatro secretos con: openssl rand -hex 32"
+        echo "  4  task local:up"
+        echo "  5  task local:urls"
+        echo
+        echo "Necesitás Docker y Docker Compose; el stack completo tiene un techo de ~11.1 GiB."
+        echo
+        echo "── ESCRIBIR LOS PIPELINES ────────────────────────────────────────────────"
+        echo "  dags/ arranca vacío. El código de los 15 proyectos está en la guía:"
+        echo "      docs/06-medallion-desde-cero.md   (copy-paste, en orden)"
+        echo "  task local:gate             verifica que los 15 estén escritos"
+        echo
+        echo "── OPERACIÓN LOCAL ───────────────────────────────────────────────────────"
+        echo "  task local:up               levanta el stack completo (incluido Jupyter)"
+        echo "  task local:up-dev           levanta núcleo + Jupyter para notebooks"
+        echo "  task local:smoke            valida Web Events contra Spark + HDFS"
+        echo "  task local:down             lo apaga y conserva los volúmenes"
+        echo "  task local:check            valida .env, estructura y Compose"
+        echo "  task local:urls             lista URLs y estados"
+        echo "  task local:credentials      muestra secretos de acceso del entorno local (no producción)"
+
+  check:
+    desc: "Valida secretos, permisos y configuración efectiva del stack local"
+    cmds:
+      - |
+        test -f .env || { echo "Falta .env" >&2; exit 1; }
+        test "$(stat -c %a .env)" = 600 || { echo ".env debe tener permisos 0600" >&2; exit 1; }
+        for key in POSTGRES_PASSWORD AIRFLOW_JWT_SECRET AIRFLOW_ADMIN_PASSWORD JUPYTER_TOKEN; do
+          value="$(sed -n "s/^$key=//p" .env | tail -n 1)"
+          test "${#value}" -ge 24 || { echo "$key falta o es corto" >&2; exit 1; }
+        done
+        test -d dags || { echo "Falta la carpeta dags/" >&2; exit 1; }
+        test "$(find dags -maxdepth 1 -name '*_dag.py' -type f | wc -l)" -eq 0 || {
+          echo "Los DAGs deben estar clasificados en dags/medallion_dags/ o dags/guia/" >&2; exit 1;
+        }
+        test -f ops/airflow_log_retention.sh || { echo "Falta el limpiador de logs" >&2; exit 1; }
+        test -f ops/sources.env || { echo "Falta ops/sources.env con los orígenes de datos" >&2; exit 1; }
+      - '{{.LOCAL_COMPOSE}} config --quiet'
+
+  gate:
+    desc: "Verifica que los 15 proyectos de la guía 06 están escritos"
+    cmds:
+      - |
+        test -f dags/medallion/runtime.py || { echo "Falta dags/medallion/runtime.py (guía 06, sección 13)" >&2; exit 1; }
+        count="$(find dags/medallion_dags -maxdepth 1 -name '*_medallion_dag.py' -type f 2>/dev/null | wc -l)"
+        test "$count" -eq 15 || { echo "Hay $count de 15 proyectos en dags/medallion_dags (guía 06)" >&2; exit 1; }
+        echo "Guía 06 completa: runtime + 15 proyectos medallion"
+
+  up:
+    desc: "Valida el entorno y levanta el stack local completo"
+    deps: [check]
+    cmds:
+      - '{{.LOCAL_COMPOSE}} up -d --build'
+
+  up-dev:
+    desc: "Valida el entorno y levanta el núcleo más Jupyter para trabajar con notebooks"
+    deps: [check]
+    cmds:
+      - 'COMPOSE_PROFILES=dev {{.LOCAL_COMPOSE}} up -d --build'
+
+  resources:
+    desc: "Muestra CPU, memoria y procesos de los contenedores que están arriba"
+    cmds:
+      - docker stats --no-stream
+
+  down:
+    desc: "Baja todos los perfiles del stack local conservando los volúmenes"
+    cmds:
+      - 'COMPOSE_PROFILES=dev {{.LOCAL_COMPOSE}} down'
+
+  smoke:
+    desc: "Ejecuta Web Events Bronze/Silver/Gold contra Spark y HDFS reales"
+    deps: [check]
+    preconditions:
+      - sh: test -f dags/medallion_dags/web_events_medallion_dag.py
+        msg: "Falta el proyecto Web Events. Escribilo siguiendo docs/06-medallion-desde-cero.md sección 16"
+    cmds:
+      - |
+        set -eu
+        run_date="${RUN_DATE:-$(date -u +%F)}"
+        {{.LOCAL_COMPOSE}} exec -T -e MEDALLION_SMOKE_RUN_DATE="$run_date" airflow-scheduler python -c '
+        import os
+        from airflow.dag_processing.dagbag import DagBag
+        bag = DagBag("/opt/airflow/dags", include_examples=False)
+        assert not bag.import_errors, bag.import_errors
+        dag = bag.dags["medallion_web_events"]
+        for task in dag.task_group.topological_sort():
+            task.python_callable(run_date=os.environ["MEDALLION_SMOKE_RUN_DATE"])
+        '
+        for layer in bronze silver gold quality quarantine; do
+          {{.LOCAL_COMPOSE}} exec -T hdfs-namenode hdfs dfs -test -e "/lakehouse/$layer/web_events/run_date=$run_date/_SUCCESS"
+        done
+        echo "Smoke medallion OK: web_events run_date=$run_date"
+
+  credentials:
+    desc: "Muestra secretos de acceso de Airflow y Jupyter del entorno local; no de producción"
+    preconditions:
+      - sh: test -f .env
+        msg: "Falta .env. Crealo con: cp .env.example .env"
+    cmds:
+      - |
+        value() { sed -n "s/^$1=//p" .env | tail -n 1; }
+        user="$(value AIRFLOW_ADMIN_USER)"; password="$(value AIRFLOW_ADMIN_PASSWORD)"; token="$(value JUPYTER_TOKEN)"
+        [ -n "$user" ] && [ -n "$password" ] && [ -n "$token" ] || { echo "Faltan credenciales en .env. Ejecutá: task local:check" >&2; exit 1; }
+        echo "No compartas esta salida: contiene secretos locales."
+        echo "Airflow: http://localhost:8082  usuario: $user  contraseña: $password"
+        echo "Jupyter: http://localhost:8888/?token=$token"
+
+  urls:
+    desc: "Lista las URLs del stack local y marca cuáles están arriba"
+    silent: true
+    cmds:
+      - |
+        up="$({{.LOCAL_COMPOSE}} ps --services --status running)"
+        state() { echo "$up" | grep -qx "$1" && echo arriba || echo apagado; }
+        printf '%-14s %-24s %s\n' SERVICIO URL ESTADO
+        printf '%-14s %-24s %s\n' Airflow http://localhost:8082 "$(state airflow-apiserver)"
+        printf '%-14s %-24s %s\n' Jupyter http://localhost:8888 "$(state jupyter)"
+        printf '%-14s %-24s %s\n' "Spark master" http://localhost:8081 "$(state spark-master)"
+        printf '%-14s %-24s %s\n' "Spark jobs" http://localhost:4055 "$(state jupyter)"
+        printf '%-14s %-24s %s\n' HDFS http://localhost:9870 "$(state hdfs-namenode)"
+        echo "Spark jobs es la UI del driver de Jupyter: responde solo mientras un notebook tiene sesión abierta."

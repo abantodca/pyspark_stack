@@ -1,0 +1,145 @@
+version: "3"
+
+vars:
+  ENV_DIR: infra/envs/prod
+  MODULES: infra/modules
+  CTX: 'set -a; source ./scripts/prod-env.sh >/dev/null; set +a;'   # el subshell no hereda el contexto
+
+tasks:
+  default:
+    desc: "Ayuda del módulo de producción"
+    silent: true
+    cmds:
+      - |
+        echo "pyspark_stack · módulo de producción"
+        echo "Infraestructura: task prod:infra:plan"
+        echo "URLs e IDs:       task prod:infra:output  (no muestra secretos)"
+        echo "Secretos:         se gestionan en AWS SSM; nunca se imprimen con task"
+        echo "Catálogo:        task --list-all"
+
+  # ── infraestructura ──────────────────────────────────────────────────────────
+
+  infra:bootstrap:
+    desc: "sección 4 — crea el bucket del state. State local, una vez por cuenta"
+    cmds:
+      - terraform -chdir=infra/bootstrap init
+      - terraform -chdir=infra/bootstrap apply
+
+  infra:fmt:
+    desc: "Formatea infra/ (lo que infra:validate solo verifica)"
+    cmds:
+      - terraform fmt -recursive infra/
+
+  infra:validate:
+    desc: "fmt -check + validate de los módulos y del entorno. MODULE=<n> acota. Sin credenciales"
+    cmds:
+      - terraform fmt -check -recursive infra/
+      - |
+        # Solo los módulos que ya tienen .tf: sección 3.0 crea los 13 directorios de una vez.
+        for m in $(if [ -n "{{.MODULE}}" ]; then
+                     for x in {{.MODULE}}; do echo "{{.MODULES}}/$x"; done
+                   else echo {{.MODULES}}/*; fi); do
+          if ! ls "$m"/*.tf >/dev/null 2>&1; then
+            # Vacío sin MODULE: aún no está implementado. Vacío CON MODULE: nombre incorrecto.
+            [ -z "{{.MODULE}}" ] || { echo "sin .tf en $m — ¿el nombre está bien escrito?" >&2; exit 1; }
+            continue
+          fi
+          terraform -chdir="$m" init -backend=false -input=false >/dev/null
+          terraform -chdir="$m" validate || exit 1
+        done
+      - |
+        # Las trust policies de la sección 5.2 son JSON suelto: terraform no las mira.
+        for f in {{.MODULES}}/_shared/*.json; do
+          [ -e "$f" ] || continue
+          jq -e . "$f" >/dev/null
+        done
+      - |
+        # La composición, en cuanto exista.
+        [ -f {{.ENV_DIR}}/main.tf ] || exit 0
+        terraform -chdir={{.ENV_DIR}} init -backend=false -input=false >/dev/null
+        terraform -chdir={{.ENV_DIR}} validate
+
+  infra:init:
+    desc: "init contra el backend S3. Hace falta tras componer un módulo nuevo"
+    cmds:
+      - terraform -chdir={{.ENV_DIR}} init
+
+  infra:plan:
+    desc: "Plan completo guardado en tfplan. Es el que se revisa antes de aplicar"
+    deps: [infra:init]
+    cmds:
+      - terraform -chdir={{.ENV_DIR}} plan -out=tfplan
+      - terraform -chdir={{.ENV_DIR}} show tfplan
+
+  infra:apply:
+    desc: "Aplica el plan completo aprobado; no admite -target"
+    deps: [infra:init]
+    cmds:
+      - terraform -chdir={{.ENV_DIR}} apply
+
+  infra:output:
+    desc: "Muestra URLs e IDs publicados por Terraform; NAME=<output> devuelve uno (nunca secretos)"
+    cmds:
+      - |
+        if [ -n "{{.NAME}}" ]; then
+          terraform -chdir={{.ENV_DIR}} output -raw {{.NAME}}
+        else
+          terraform -chdir={{.ENV_DIR}} output
+        fi
+
+  # ── operación ────────────────────────────────────────────────────────────────
+
+  wait:
+    desc: "sección 5.5 — espera el boot: status-ok, cloud-init y /data montado"
+    cmds:
+      - |
+        {{.CTX}}
+        aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+        $SSH -o StrictHostKeyChecking=yes "$SSH_TARGET" \
+          'cloud-init status --wait && mountpoint /data && systemctl is-active docker'
+
+  trust-host:
+    desc: "sección 5.5 — registra la host key obtenida por el canal autenticado SSM"
+    cmds:
+      - |
+        {{.CTX}}
+        aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+        for _ in $(seq 1 60); do
+          [ "$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+            --query 'InstanceInformationList[0].PingStatus' --output text)" = "Online" ] && break
+          sleep 10
+        done
+        PARAMS='{"commands":["cat /etc/ssh/ssh_host_ed25519_key.pub"]}'
+        CMD_ID="$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+          --document-name AWS-RunShellScript --parameters "$PARAMS" \
+          --query 'Command.CommandId' --output text)"
+        aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID"
+        HOST_KEY="$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+          --query StandardOutputContent --output text | awk 'NF >= 2 {print $1, $2; exit}')"
+        printf '%s\n' "$HOST_KEY" | grep -Eq '^ssh-ed25519 [A-Za-z0-9+/=]+$'
+        mkdir -p "$HOME/.ssh"; touch "$HOME/.ssh/known_hosts"; chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/known_hosts"
+        ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$PUBLIC_IP" >/dev/null 2>&1 || true
+        printf '%s %s\n' "$PUBLIC_IP" "$HOST_KEY" >> "$HOME/.ssh/known_hosts"
+
+  deploy:
+    desc: "sección 5.5 y sección 15 paso 4 — rsync del repo + load-secrets + up --build --wait"
+    cmds:
+      - |
+        {{.CTX}}
+        COMPOSE_ARGS="-f $COMPOSE_PROD"
+        [ "${PROD_HTTPS:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.https.yml"
+        [ "${PROD_MONITORING:-0}" = 1 ] && COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.monitoring.yml"
+        rsync -az --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
+          -e "$RSYNC_SSH" ./ "$SSH_TARGET:$REMOTE_DIR/"
+        # load-secrets.sh existe recién desde la sección 13.4; antes de eso esta línea no hace nada.
+        $SSH "$SSH_TARGET" "cd $REMOTE_DIR && \
+          if [ -x scripts/load-secrets.sh ]; then ./scripts/load-secrets.sh; fi && \
+          docker compose $COMPOSE_ARGS up -d --build --wait"
+
+  tunnel:
+    desc: "sección 5.5 — túnel a la UI de Airflow en localhost:8082. Ocupa la terminal"
+    interactive: true
+    cmds:
+      - |
+        {{.CTX}}
+        $SSH -L 8082:localhost:8082 "$SSH_TARGET"

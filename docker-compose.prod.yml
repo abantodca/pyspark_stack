@@ -1,0 +1,108 @@
+# docker-compose.prod.yml — stack de PRODUCCIÓN, standalone (un solo archivo, sin merge).
+# Arranque mínimo: Airflow + Postgres. Sin Spark/HDFS (esos jobs van a EMR Serverless, sección 6.4) y sin
+# Jupyter (no se usa en prod: exploración interactiva queda para el dev local, docs/01).
+# La versión definitiva de este archivo está en la sección 14.1 (y el monitoreo, en su override sección 14.2).
+#   docker compose -f docker-compose.prod.yml up -d --build --wait
+x-airflow-common: &airflow-common
+  image: pyspark_stack-airflow-prod:3.2.2
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow.prod   # liviana (Paso 0b): sin JDK/Spark/Hadoop
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow-db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+    # El scheduler/worker habla con el api-server via la Task Execution API (Airflow 3); debe
+    # apuntar al hostname del contenedor, NO a localhost.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET:-change-me-in-prod}'
+    AIRFLOW_UID: 50000
+  volumes:
+    - ./dags:/opt/airflow/dags
+  # Sin este bloque por servicio, `restart`/`logging` no se hereda mediante `<<: *airflow-common`.
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+  networks:
+    - platform
+
+services:
+  airflow-db:
+    image: postgres:16.14-bookworm
+    container_name: airflow-db
+    restart: unless-stopped
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+    deploy: { resources: { limits: { memory: 512m } } } # calibrado a t3.large 8GB, sin Spark compitiendo
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-airflow}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-airflow}
+      - POSTGRES_DB=${POSTGRES_DB:-airflow}
+    volumes:
+      - /data/postgres:/var/lib/postgresql/data   # EBS persistente (sección 5.3), no un volumen Docker
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - platform
+
+  # Init one-shot: migra el esquema (core + FAB) y crea el admin, luego sale.
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    restart: "no"   # one-shot: pisa el `unless-stopped` heredado, no reintenta en loop
+    depends_on:
+      airflow-db: { condition: service_healthy }
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow fab-db migrate &&
+        airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - 127.0.0.1:8082:8080   # solo túnel SSH; sección 5.6 agrega 443 al exponer la web
+    # El api-server tarda ~30 s en aceptar conexiones: sin healthcheck, `up -d` vuelve antes
+    # y la verificación externa falla con "could not connect" contra un puerto todavía cerrado.
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    depends_on:
+      airflow-db: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+networks:
+  platform:

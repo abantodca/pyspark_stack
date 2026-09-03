@@ -426,7 +426,7 @@ infra/
 │   ├── orchestrator/                   # sección 5.2 + sección 5.3 — key pair, rol de instancia, EC2 + EBS + EIP
 │   │   └── user_data.sh.tftpl
 │   ├── scheduler/                      # sección 5.4 — Lambda startstop + reglas de EventBridge
-│   ├── https/                          # sección 5.6 — OPCIONAL: Route 53 + permiso DNS-01 de certbot
+│   ├── https/                          # sección 5.6 — OPCIONAL: hosted zone + delegación + A record + DNS-01
 │   │   └── policies/route53-certbot.json.tftpl
 │   ├── storage/                        # sección 6.1 + sección 6.2 — buckets del lake y permiso s3a de la EC2
 │   ├── backups/                        # sección 6.3 — DLM: snapshots del EBS de datos
@@ -562,12 +562,17 @@ agregue este bloque. No cambie `taskfiles/Taskfile.local.yml`:
 
 En VS Code, abra `pyspark_stack/taskfiles/` y cree ahí `Taskfile.prod.yml`. La carpeta ya fue
 creada por la guía local. **No** reemplace `./Taskfile.yml`, no edite
-`./taskfiles/Taskfile.local.yml` y no guarde este archivo dentro de `docs/`.
+`./taskfiles/Taskfile.local.yml` y no guarde este archivo dentro de `docs/`. Copie y guarde el
+bloque completo: **estas tres líneas son las variables (`vars`) del módulo de producción** y deben
+quedar exactamente debajo de `vars:`, con dos espacios al inicio.
 
 ```yaml
 version: "3"
 
 vars:
+  ENV_DIR: infra/envs/prod
+  MODULES: infra/modules
+  CTX: 'set -a; source ./scripts/prod-env.sh >/dev/null; set +a;'   # el subshell no hereda el contexto
 
 tasks:
   default:
@@ -577,31 +582,12 @@ tasks:
       - |
         echo "pyspark_stack · módulo de producción"
         echo "Infraestructura: task prod:infra:plan"
+        echo "URLs e IDs:       task prod:infra:output  (no muestra secretos)"
+        echo "Secretos:         se gestionan en AWS SSM; nunca se imprimen con task"
         echo "Catálogo:        task --list-all"
 ```
 
-**3 — EDITAR, GUARDAR y permanecer en `./taskfiles/Taskfile.prod.yml`.** Agregue estas tres líneas
-debajo de `vars:`:
-
-```yaml
-  ENV_DIR: infra/envs/prod
-  MODULES: infra/modules
-  CTX: 'set -a; source ./scripts/prod-env.sh >/dev/null; set +a;'   # el subshell no hereda el contexto
-```
-
-Al terminar, el comienzo del módulo de producción queda así; el módulo local no cambia:
-
-```yaml
-vars:
-  ENV_DIR: infra/envs/prod
-  MODULES: infra/modules
-  CTX: 'set -a; source ./scripts/prod-env.sh >/dev/null; set +a;'
-
-tasks:
-  default:
-```
-
-**4 — EDITAR Y GUARDAR `./taskfiles/Taskfile.prod.yml`.** Pegue las tasks de infraestructura al
+**3 — EDITAR Y GUARDAR `./taskfiles/Taskfile.prod.yml`.** Pegue las tasks de infraestructura al
 final de ese mapa, con los dos espacios iniciales que ya trae el bloque. No las pegue en el
 `Taskfile.yml` de la raíz ni en el módulo local:
 
@@ -667,7 +653,7 @@ final de ese mapa, con los dos espacios iniciales que ya trae el bloque. No las 
       - terraform -chdir={{.ENV_DIR}} apply
 
   infra:output:
-    desc: "Todos los outputs. NAME=<output> devuelve uno solo, en crudo"
+    desc: "Muestra URLs e IDs publicados por Terraform; NAME=<output> devuelve uno (nunca secretos)"
     cmds:
       - |
         if [ -n "{{.NAME}}" ]; then
@@ -758,6 +744,9 @@ Ningún bloque de este documento vuelve a calcular lo que un paso anterior ya de
 `terraform output -json`, deriva las rutas operativas y sigue en modo parcial antes del primer
 apply. Las secciones posteriores agregan outputs, no listas de variables al script.
 
+Escríbalo en shell POSIX: además de su terminal lo sourcea el intérprete propio de `task`, que no
+define `BASH_SOURCE` ni acepta `cd -- dir` (falla con `usage: cd [dir]`).
+
 **`scripts/prod-env.sh`:**
 
 ```bash
@@ -765,7 +754,17 @@ apply. Las secciones posteriores agregan outputs, no listas de variables al scri
 # Sourcear en la terminal: source ./scripts/prod-env.sh
 # Ejecutar con --check solo informa el contexto; no puede exportarlo al proceso padre.
 _pe_sourced=0; (return 0 2>/dev/null) && _pe_sourced=1
-_pe_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+# Raíz del repo: BASH_SOURCE si lo sourcea bash; el shell de task no la define, ahí se busca hacia arriba.
+_pe_self="${BASH_SOURCE[0]:-}"
+if [ -n "$_pe_self" ]; then
+  _pe_root="$(CDPATH= cd "$(dirname "$_pe_self")/.." && pwd)"
+else
+  _pe_root="$PWD"; _pe_dir="$PWD"
+  while [ "$_pe_dir" != / ]; do
+    [ -f "$_pe_dir/Taskfile.yml" ] && { _pe_root="$_pe_dir"; break; }
+    _pe_dir="$(dirname "$_pe_dir")"
+  done
+fi
 _pe_infra="${INFRA_DIR:-$_pe_root/infra/envs/prod}"
 
 # Overrides exclusivamente locales (perfil AWS, clave SSH). Debe ser un archivo de asignaciones
@@ -830,7 +829,7 @@ if [ "${1:-}" = "--check" ]; then
     echo 'prod-env: contexto completo'
   fi
 fi
-unset _pe_json _pe_value _pe_var _pe_missing _pe_overrides _pe_infra _pe_root _pe_sourced _pe_strict
+unset _pe_json _pe_value _pe_var _pe_missing _pe_overrides _pe_infra _pe_root _pe_self _pe_dir _pe_sourced _pe_strict
 ```
 
 ```bash
@@ -1098,7 +1097,7 @@ data "aws_region" "current" {}
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
-  region     = data.aws_region.current.name
+  region     = data.aws_region.current.region   # `.name` está deprecado en el provider 6.x
 }
 ```
 
@@ -1309,9 +1308,23 @@ variable "airflow_domain" {
   default     = ""
 }
 variable "dns_zone" {
-  description = "Hosted zone de Route 53 donde vive airflow_domain, p.ej. midominio.com (sin punto final)."
+  description = "Hosted zone de Route 53 que Terraform crea para airflow_domain, p.ej. midominio.com (sin punto final)."
   type        = string
   default     = ""
+
+  # airflow_domain tiene que ser un subdominio de dns_zone: si no, el A record se crea en una zona
+  # que no delega ese nombre y `dig` no devuelve nada, sin ningún error de Terraform.
+  validation {
+    condition     = var.airflow_domain == "" || endswith(var.airflow_domain, ".${var.dns_zone}")
+    error_message = "airflow_domain debe ser un subdominio de dns_zone, por ejemplo airflow.midominio.com dentro de midominio.com."
+  }
+}
+# El dominio está registrado en Route 53 Domains de esta cuenta: Terraform re-delega los NS a la
+# zona que crea. En otro registrador (GoDaddy, Namecheap) déjelo en false y copie a mano el output
+# dns_zone_name_servers en el panel del registrador.
+variable "manage_registrar_ns" {
+  type    = bool
+  default = false
 }
 variable "letsencrypt_email" {
   description = "Email para el registro de Let's Encrypt (avisos de expiración del cert)."
@@ -1821,21 +1834,24 @@ mkdir -p $DOCKER_CONFIG/cli-plugins
 # ("vars map does not contain key"). Para que bash expanda una variable en el boot hay que
 # escribirla con el símbolo de pesos duplicado antes de la llave, como en la línea de abajo. Todo
 # Toda variable Bash entre llaves que se agregue a este archivo requiere el mismo escape.
+# El .sha256 nombra al archivo publicado, no al destino: se descarga y verifica en /tmp con ese
+# nombre, y recién después se instala con el nombre que espera el plugin de Docker.
 curl --fail --silent --show-error --location --retry 5 --retry-all-errors "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
-  -o $DOCKER_CONFIG/cli-plugins/docker-compose
+  -o /tmp/docker-compose-linux-x86_64
 curl --fail --silent --show-error --location "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-x86_64.sha256" \
   -o /tmp/docker-compose.sha256
-(cd $DOCKER_CONFIG/cli-plugins && sha256sum -c /tmp/docker-compose.sha256)
-chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
+(cd /tmp && sha256sum -c docker-compose.sha256)
+install -m 0755 /tmp/docker-compose-linux-x86_64 $DOCKER_CONFIG/cli-plugins/docker-compose
 # El paquete `docker` de dnf en AL2023 no trae buildx (o trae uno viejo): sin esto, el deploy
 # falla con "compose build requires buildx 0.17.0 or later" al ejecutar `up --build`.
 curl --fail --silent --show-error --location --retry 5 --retry-all-errors "https://github.com/docker/buildx/releases/download/$${BUILDX_VERSION}/buildx-$${BUILDX_VERSION}.linux-amd64" \
   -o /tmp/buildx-$${BUILDX_VERSION}.linux-amd64
 curl --fail --silent --show-error --location "https://github.com/docker/buildx/releases/download/$${BUILDX_VERSION}/checksums.txt" \
   -o /tmp/buildx-checksums.txt
-(cd /tmp && grep " buildx-$${BUILDX_VERSION}.linux-amd64$" buildx-checksums.txt | sha256sum -c -)
+# checksums.txt marca modo binario: el nombre viene precedido de un asterisco, y el grep debe
+# incluirlo o no encuentra la línea (con pipefail, eso aborta el boot).
+(cd /tmp && grep " \*buildx-$${BUILDX_VERSION}.linux-amd64$" buildx-checksums.txt | sha256sum -c -)
 install -m 0755 /tmp/buildx-$${BUILDX_VERSION}.linux-amd64 $DOCKER_CONFIG/cli-plugins/docker-buildx
-chmod +x $DOCKER_CONFIG/cli-plugins/docker-buildx
 usermod -aG docker ec2-user
 
 # Disco de datos: resolver el NVMe por el ID exacto del volumen EBS recibido desde Terraform.
@@ -1975,7 +1991,27 @@ module "orchestrator" {
 }
 ```
 
-#### 5.3.5 Validar y aplicar (~3-4 min: el boot de la EC2 domina)
+#### 5.3.5 Publicar los outputs del entorno
+
+El módulo declara sus outputs en `infra/modules/orchestrator/outputs.tf`, pero los comandos
+ejecutados desde `infra/envs/prod` solo pueden leer outputs del entorno raíz. Agregue estos
+bloques a `infra/envs/prod/outputs.tf` **antes** de aplicar el módulo:
+
+```hcl
+# infra/envs/prod/outputs.tf (continuación)
+output "instance_id"        { value = module.orchestrator.instance_id }
+output "public_ip"          { value = module.orchestrator.public_ip }
+output "data_volume_id"     { value = module.orchestrator.data_volume_id }
+output "key_name"           { value = module.orchestrator.key_name }
+output "instance_role_name" { value = module.orchestrator.instance_role_name }
+output "instance_role_arn"  { value = module.orchestrator.instance_role_arn }
+```
+
+No consulte `module.orchestrator.public_ip` con `terraform output`: esa sintaxis solo sirve dentro
+de HCL. `terraform output` siempre recibe el nombre publicado por el entorno, por ejemplo
+`public_ip`.
+
+#### 5.3.6 Validar y aplicar (~3-4 min: el boot de la EC2 domina)
 
 ```bash
 task prod:infra:validate MODULE=orchestrator
@@ -2005,8 +2041,14 @@ instancia, EIP + asociación, volumen y su attachment. Si dice `1 to destroy` so
 >
 > ```bash
 > terraform -chdir=infra/envs/prod state list | grep module.orchestrator   # 9 recursos
+> terraform -chdir=infra/envs/prod output                        # debe incluir public_ip
 > terraform -chdir=infra/envs/prod output -raw public_ip
 > ```
+
+Si la máquina ya fue creada y el output no aparece, no destruya ni recree la infraestructura:
+con el bloque anterior guardado en `infra/envs/prod/outputs.tf`, ejecute únicamente
+`task prod:infra:apply`. Terraform actualizará el contrato del state y el segundo comando
+resolverá la EIP existente.
 >
 > **Resultado en la consola:** EC2 → Instances → `pyspark-stack-node` en `running` con el tag
 > `AutoStartStop=true`; Volumes → **dos** (root 40 GiB + `pyspark-stack-data` 30 GiB, ambos
@@ -2315,12 +2357,29 @@ module "scheduler" {
 }
 ```
 
-#### 5.4.6 Validar y aplicar (~1 min)
+#### 5.4.6 Publicar los outputs del entorno
+
+Antes de validar y aplicar, publique en el entorno los outputs que usará la terminal. Deben
+quedar en `infra/envs/prod/outputs.tf` **en esta sección**, para que estén disponibles después
+del mismo apply que crea la Lambda:
+
+```hcl
+# infra/envs/prod/outputs.tf — sección 5.4
+output "lambda_startstop_name" { value = module.scheduler.lambda_startstop_name }
+output "schedule_start_name"   { value = module.scheduler.schedule_start_name }
+output "schedule_stop_name"    { value = module.scheduler.schedule_stop_name }
+```
+
+#### 5.4.7 Validar y aplicar (~1 min)
 
 ```bash
 task prod:infra:validate MODULE=scheduler
 task prod:infra:apply
 ```
+
+El `source` del checkpoint lee el state actualizado y exporta `lambda_startstop_name` como
+`$LAMBDA_STARTSTOP_NAME`. Si ya aplicó la infraestructura sin estos outputs, agregarlos al archivo
+requiere un `task prod:infra:apply` adicional (no recrea recursos; solo publica el state output).
 
 <details>
 <summary>Qué corre por dentro</summary>
@@ -2414,8 +2473,9 @@ aws lambda invoke --function-name "$LAMBDA_STARTSTOP_NAME" \
 
 ### 5.5 Desplegar, subir código y túnel SSH
 
-Amplíe el `outputs.tf` creado en la sección 5.1 con las salidas de la sección 5.3 y sección 5.4. **Agregue; no reemplace**:
-los cuatro outputs de la sección 5.1 siguen haciendo falta.
+Amplíe el `outputs.tf` creado en la sección 5.1 con las salidas adicionales de esta sección. Los outputs de
+`orchestrator` ya se publicaron en la sección 5.3; no los vuelva a declarar porque Terraform
+rechazaría nombres duplicados. **Agregue; no reemplace**: los outputs anteriores siguen haciendo falta.
 
 ```hcl
 # infra/envs/prod/outputs.tf (continuación)
@@ -2423,17 +2483,11 @@ los cuatro outputs de la sección 5.1 siguen haciendo falta.
 # como variable en MAYÚSCULAS (public_ip → $PUBLIC_IP). Regla: si un comando de la guía lo
 # necesita, se define aquí. No incluya secretos: se almacenan en SSM (sección 13).
 
-# ── Cómputo/red
-# public_ip sale de la EIP (estable entre stop/start), no de la IP efímera de la instancia.
-output "public_ip"         { value = module.orchestrator.public_ip }
-output "instance_id"       { value = module.orchestrator.instance_id }
+# ── Cómputo/red adicional
 output "availability_zone" { value = var.availability_zone }
-output "data_volume_id"    { value = module.orchestrator.data_volume_id }   # crecimiento online del disco (sección 12.4)
 
-# ── Automatización de la sección 5.4: los comandos invocan por nombre, no por ARN.
-output "lambda_startstop_name" { value = module.scheduler.lambda_startstop_name }
-output "schedule_start_name"   { value = module.scheduler.schedule_start_name }
-output "schedule_stop_name"    { value = module.scheduler.schedule_stop_name }
+# Los outputs de la automatización de la sección 5.4 ya fueron publicados allí;
+# no los vuelva a declarar porque Terraform rechazaría nombres duplicados.
 
 # ── Comodidad: comandos listos para pegar, ya resueltos con los valores reales.
 output "tunnel_command" {
@@ -2491,7 +2545,7 @@ completa en **sección 14.1** y reemplaza el archivo entero. No lo parchees por 
 # Arranque mínimo: Airflow + Postgres. Sin Spark/HDFS (esos jobs van a EMR Serverless, sección 6.4) y sin
 # Jupyter (no se usa en prod: exploración interactiva queda para el dev local, docs/01).
 # La versión definitiva de este archivo está en la sección 14.1 (y el monitoreo, en su override sección 14.2).
-#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml up -d --build --wait
 x-airflow-common: &airflow-common
   image: pyspark_stack-airflow-prod:3.2.2
   build:
@@ -2557,6 +2611,14 @@ services:
     command: api-server
     ports:
       - 127.0.0.1:8082:8080   # solo túnel SSH; sección 5.6 agrega 443 al exponer la web
+    # El api-server tarda ~30 s en aceptar conexiones: sin healthcheck, `up -d` vuelve antes
+    # y la verificación externa falla con "could not connect" contra un puerto todavía cerrado.
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     depends_on:
       airflow-db: { condition: service_healthy }
       airflow-init: { condition: service_completed_successfully }
@@ -2659,7 +2721,7 @@ módulo local:
         printf '%s %s\n' "$PUBLIC_IP" "$HOST_KEY" >> "$HOME/.ssh/known_hosts"
 
   deploy:
-    desc: "sección 5.5 y sección 15 paso 4 — rsync del repo + load-secrets + up --build"
+    desc: "sección 5.5 y sección 15 paso 4 — rsync del repo + load-secrets + up --build --wait"
     cmds:
       - |
         {{.CTX}}
@@ -2671,7 +2733,7 @@ módulo local:
         # load-secrets.sh existe recién desde la sección 13.4; antes de eso esta línea no hace nada.
         $SSH "$SSH_TARGET" "cd $REMOTE_DIR && \
           if [ -x scripts/load-secrets.sh ]; then ./scripts/load-secrets.sh; fi && \
-          docker compose $COMPOSE_ARGS up -d --build"
+          docker compose $COMPOSE_ARGS up -d --build --wait"
 
   tunnel:
     desc: "sección 5.5 — túnel a la UI de Airflow en localhost:8082. Ocupa la terminal"
@@ -2730,7 +2792,7 @@ $SSH -o StrictHostKeyChecking=yes "$SSH_TARGET" \
 rsync -az --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pycache__' \
   -e "$RSYNC_SSH" ./ "$SSH_TARGET:$REMOTE_DIR/"
 $SSH "$SSH_TARGET" \
-  "cd $REMOTE_DIR && docker compose -f $COMPOSE_PROD up -d --build"
+  "cd $REMOTE_DIR && docker compose -f $COMPOSE_PROD up -d --build --wait"
 
 # 5 — prod:tunnel
 $SSH -L 8082:localhost:8082 "$SSH_TARGET"
@@ -2787,7 +2849,8 @@ UIs sigue por túnel. Quedan dos modos explícitos:
 variables y rutas que todavía no existen.
 
 1. configurar dominio, zona DNS y correo en Terraform;
-2. aplicar Terraform y comprobar que el dominio resuelve a la EIP;
+2. aplicar Terraform (crea la hosted zone, delega los NS y publica el A record) y comprobar que
+   el dominio resuelve a la EIP;
 3. emitir el certificado en la EC2;
 4. configurar las variables HTTPS en el `.env` de la EC2;
 5. crear el override en el repo local, subirlo y arrancar ambos archivos;
@@ -2795,7 +2858,10 @@ variables y rutas que todavía no existen.
 
 Cuatro piezas, todas parametrizadas (nada hardcodeado — sale de `terraform output`):
 
-1. **DNS** — un `A record` `airflow.midominio.com → EIP` de la EC2, gestionado por Terraform.
+1. **DNS** — la **hosted zone** de `midominio.com` y un `A record` `airflow.midominio.com → EIP`
+   de la EC2, ambos gestionados por Terraform. Registrar el dominio **no** crea la zona (y un
+   `destroy` se la lleva dejando el dominio registrado): por eso el módulo la crea y, si el
+   dominio está en Route 53 Domains de la misma cuenta, re-delega los nameservers.
 2. **Cert** — Let's Encrypt por **DNS-01** con `certbot/dns-route53`: usa el **rol de la EC2** para
    crear el TXT del reto en Route 53. **No abre el puerto 80** y mantiene el SG restringido a la IP del operador.
 3. **TLS nativo** — el `api-server` de Airflow sirve HTTPS él mismo (`AIRFLOW__API__SSL_CERT/KEY`).
@@ -2823,6 +2889,12 @@ variable "airflow_domain"     { type = string }
 variable "dns_zone"           { type = string }
 variable "letsencrypt_email"  { type = string }
 
+variable "manage_registrar_ns" {
+  description = "true = el dominio está registrado en Route 53 Domains de esta cuenta y Terraform re-delega los NS."
+  type        = bool
+  default     = false
+}
+
 variable "public_ip" {
   description = "EIP de la EC2: destino del registro A."
   type        = string
@@ -2836,15 +2908,40 @@ variable "instance_role_name" {
 
 ```hcl
 # infra/modules/https/main.tf
-data "aws_route53_zone" "main" {
-  count = var.airflow_domain == "" ? 0 : 1
-  name  = var.dns_zone                # p.ej. "midominio.com" (la hosted zone, sin punto final)
+# La hosted zone se CREA acá, no se busca con un `data`: tener el dominio registrado en Route 53
+# Domains no implica que exista la zona (un destroy se la lleva y el registro del dominio queda),
+# y un `data "aws_route53_zone"` falla con "no matching Route53Zone found" antes de crear nada.
+resource "aws_route53_zone" "main" {
+  count   = var.airflow_domain == "" ? 0 : 1
+  name    = var.dns_zone              # p.ej. "midominio.com" (sin punto final)
+  comment = "${var.name_prefix} - delegacion de ${var.dns_zone}"
+
+  # Recrearla asigna OTROS 4 nameservers y obliga a re-delegar en el registrador, con la
+  # propagación del TLD de por medio (hasta 48 h). Mismo criterio que el EBS de datos: no es
+  # un recurso desechable, y `prevent_destroy` aborta el plan entero (sección 21.4).
+  lifecycle { prevent_destroy = true }
+}
+
+# Delegación: apunta los nameservers del registrador a los de la zona de arriba. Sin esto la zona
+# existe pero nadie la consulta, y `dig` no devuelve nada aunque el A record esté creado.
+# Solo aplica si el dominio está registrado en Route 53 Domains de ESTA cuenta; en otro
+# registrador deje manage_registrar_ns = false y copie el output dns_zone_name_servers a mano.
+# La API de route53domains vive únicamente en us-east-1: con aws_region distinta, este recurso
+# necesita un provider con alias en esa región.
+resource "aws_route53domains_registered_domain" "main" {
+  count       = var.airflow_domain == "" || !var.manage_registrar_ns ? 0 : 1
+  domain_name = var.dns_zone
+
+  dynamic "name_server" {
+    for_each = aws_route53_zone.main[0].name_servers
+    content { name = name_server.value }
+  }
 }
 
 # A record airflow.midominio.com -> EIP estable de EC2 (sección 5.3). TTL corto para facilitar rotación.
 resource "aws_route53_record" "airflow" {
   count   = var.airflow_domain == "" ? 0 : 1
-  zone_id = data.aws_route53_zone.main[0].zone_id
+  zone_id = aws_route53_zone.main[0].zone_id
   name    = var.airflow_domain
   type    = "A"
   ttl     = 300
@@ -2858,7 +2955,7 @@ resource "aws_iam_role_policy" "ec2_route53_certbot" {
   name  = "ec2-route53-certbot"
   role  = var.instance_role_name
   policy = templatefile("${path.module}/policies/route53-certbot.json.tftpl", {
-    zone_id = data.aws_route53_zone.main[0].zone_id
+    zone_id = aws_route53_zone.main[0].zone_id
   })
 }
 ```
@@ -2890,6 +2987,14 @@ output "airflow_url" {
   value = var.airflow_domain == "" ? "(no expuesto: solo túnel SSH)" : "https://${var.airflow_domain}"
 }
 output "letsencrypt_email" { value = var.letsencrypt_email }
+
+# Para delegar a mano cuando el dominio no está en Route 53 Domains (manage_registrar_ns = false).
+output "dns_zone_id" {
+  value = var.airflow_domain == "" ? "" : aws_route53_zone.main[0].zone_id
+}
+output "dns_zone_name_servers" {
+  value = var.airflow_domain == "" ? [] : aws_route53_zone.main[0].name_servers
+}
 ```
 
 #### Componer: agregar `module "https"` a `infra/envs/prod/main.tf`
@@ -2901,6 +3006,7 @@ module "https" {
   airflow_domain     = var.airflow_domain
   dns_zone           = var.dns_zone
   letsencrypt_email  = var.letsencrypt_email
+  manage_registrar_ns = var.manage_registrar_ns
   public_ip          = module.orchestrator.public_ip
   instance_role_name = module.orchestrator.instance_role_name
 }
@@ -2920,12 +3026,21 @@ output "airflow_domain"    { value = module.https.airflow_domain }
 output "airflow_url"       { value = module.https.airflow_url }
 # Lo consume el comando de emisión del cert (abajo), para no repetir el email a mano.
 output "letsencrypt_email" { value = module.https.letsencrypt_email }
+# La zona la crea el módulo. Los NS se publican para delegar a mano cuando el dominio no está
+# registrado en Route 53 Domains.
+# $DNS_ZONE lo usa el `dig` de verificación de la delegación (más abajo).
+output "dns_zone"              { value = var.dns_zone }
+output "dns_zone_id"           { value = module.https.dns_zone_id }
+output "dns_zone_name_servers" { value = module.https.dns_zone_name_servers }
 ```
 
 <details>
 <summary>🖱️ A mano en la consola AWS — A record + permiso DNS-01 del rol EC2</summary>
 
-1. **Route 53 → Hosted zones** → abra la zona (`midominio.com`) → **Create record**:
+1. **Route 53 → Hosted zones** → si la zona no existe, **Create hosted zone** con el nombre del
+   dominio, tipo *Public*; después, en **Registered domains → el dominio → Actions → Edit name
+   servers**, pegue los cuatro NS que muestra la zona (registro tipo NS). Luego, en la zona,
+   **Create record**:
    *Record name* `airflow` (o el subdominio elegido) · *Record type* **A** · *Value* la **Elastic
    IP** de la EC2 (sección 5.3, output `public_ip`) · *TTL* `300` · routing **Simple**.
 2. Registre el **Hosted zone ID** de la zona; el paso 3 lo requiere.
@@ -2940,15 +3055,33 @@ zona. Ampliarla a `*` permitiría que cualquier proceso de la EC2 modifique todo
 
 </details>
 
-**Defina las variables** en `terraform.tfvars` (creado en la sección 5.1); vacías mantienen el servicio privado:
+**Requisito previo: un dominio registrado.** No hace falta hosted zone (la crea Terraform), pero
+sí un dominio propio. Si está registrado en esta cuenta, el nombre exacto sale del CLI —
+`--region us-east-1` no es opcional: la API de `route53domains` existe solo ahí:
 
-```hcl
-# infra/envs/prod/terraform.tfvars — agregue estas tres líneas al archivo existente (my_ip_cidr,
-# ssh_public_key, sección 4). Es el ÚNICO archivo donde va esta sintaxis de asignación suelta.
-airflow_domain    = "airflow.midominio.com"   # el FQDN de la web
-dns_zone          = "midominio.com"           # hosted zone administrada en Route 53
-letsencrypt_email = "tu@email.com"
+```bash
+aws route53domains list-domains --region us-east-1 --query 'Domains[].DomainName' --output text
+aws route53 list-hosted-zones --query 'HostedZones[].[Name,Id]' --output text   # vacío = normal
 ```
+
+**Defina las variables** en `terraform.tfvars` (creado en la sección 5.1); vacías mantienen el
+servicio privado. Tome el dominio del comando anterior en lugar de escribirlo a mano:
+
+```bash
+DOMAIN="$(aws route53domains list-domains --region us-east-1 --query 'Domains[0].DomainName' --output text)"
+cat >> infra/envs/prod/terraform.tfvars <<EOF
+
+airflow_domain      = "airflow.$DOMAIN"   # el FQDN de la web
+dns_zone            = "$DOMAIN"           # la hosted zone que crea el módulo https
+letsencrypt_email   = "tu@email.com"      # avisos de expiración del cert
+manage_registrar_ns = true                # dominio en Route 53 Domains de esta cuenta
+EOF
+```
+
+> `manage_registrar_ns = true` solo si el dominio está registrado en **Route 53 Domains de esta
+> cuenta**. Con el dominio en otro registrador déjelo en `false` y, después del apply, copie los
+> cuatro NS en su panel:
+> `terraform -chdir=infra/envs/prod output dns_zone_name_servers`.
 
 **Emitir el cert (una vez), todo con `terraform output`** — cero literales a mano:
 
@@ -2962,12 +3095,23 @@ task prod:infra:validate MODULE=https
 task prod:infra:apply
 ```
 
+El plan agrega **9 recursos**: la hosted zone, la delegación en el registrador, el A record, la
+policy DNS-01 del rol EC2 y los 5 parámetros SSM; más un cambio *in-place* en el security group
+(la regla 443). Si la zona ya existía por fuera de Terraform, el apply falla con
+`HostedZoneAlreadyExists`: adóptela en lugar de crear una segunda —
+`terraform -chdir=infra/envs/prod import 'module.https.aws_route53_zone.main[0]' <ZONE_ID>`.
+
 **Pasos 2–3 — recargar el contexto y comprobar el DNS:**
 
 ```bash
 source ./scripts/prod-env.sh
-dig +short "$AIRFLOW_DOMAIN"
+dig +short NS "$DNS_ZONE"          # la delegación: los 4 NS de dns_zone_name_servers
+dig +short "$AIRFLOW_DOMAIN"       # el A record: la EIP de la EC2
 ```
+
+El primer `dig` es el que decide: sin delegación propagada, el segundo no devuelve nada aunque el
+A record exista en la zona. `$DNS_ZONE` y `$AIRFLOW_DOMAIN` los carga `prod-env.sh` desde los
+outputs, igual que el resto del contexto (sección 3.1).
 
 **Paso 4 — emitir el certificado una sola vez:**
 
@@ -2986,6 +3130,7 @@ el límite puede bloquear la emisión durante una hora. El `dig` del paso 3 es e
 | Paso | Lo que conviene saber |
 |---|---|
 | 3 | Si `dig` no responde, espere la propagación. Solicitar antes hace fallar la emisión; Let's Encrypt limita los fallos por hora y dominio |
+| 3 | Zona **recién creada**: lo primero que propaga es la delegación NS del TLD, no el A record. Confírmela con `dig +short NS "$DNS_ZONE"` (deben ser los cuatro de `dns_zone_name_servers`) antes de mirar el A record |
 | 4 | Desafío **DNS-01**: certbot crea un TXT temporal con el rol de EC2 mediante IMDS y lo elimina al terminar. No abre el puerto 80; el SG solo permite la IP del operador |
 | 4 | El `chmod` es obligatorio. El `api-server` usa gid 0 y, sin permiso de grupo, no puede leer `privkey.pem`: el contenedor inicia y falla |
 
@@ -3069,6 +3214,7 @@ publica**. Inventario completo en la sección 13.4.
 ```yaml
 # docker-compose.prod.https.yml
 # Se usa siempre junto con docker-compose.prod.yml; no se arranca por separado.
+# Las cinco variables llegan del .env de la EC2 (SSM, sección 13.4).
 services:
   airflow-apiserver:
     environment:
@@ -3076,6 +3222,10 @@ services:
       AIRFLOW__API__SSL_KEY: '${AIRFLOW_SSL_KEY:?AIRFLOW_SSL_KEY requerido para HTTPS}'
       AIRFLOW__API__BASE_URL: '${AIRFLOW_BASE_URL:?AIRFLOW_BASE_URL requerido para HTTPS}'
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: '${AIRFLOW_EXECUTION_API_URL:?AIRFLOW_EXECUTION_API_URL requerido para HTTPS}'
+    # Con TLS el health va por HTTPS y por el FQDN: comprueba el mismo camino que usan
+    # scheduler, dag-processor y triggerer (alias de red + certificado público).
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "https://${AIRFLOW_DOMAIN}:8080/api/v2/monitor/health"]
     ports:
       - "443:8080"
     volumes:
@@ -3129,20 +3279,28 @@ rsync -avz --exclude '.git' --exclude 'infra' --exclude '.env' --exclude '__pyca
 $SSH "$SSH_TARGET" \
   "cd $REMOTE_DIR &&
    docker compose -f $COMPOSE_PROD -f docker-compose.prod.https.yml config --quiet &&
-   docker compose -f $COMPOSE_PROD -f docker-compose.prod.https.yml up -d"
+   docker compose -f $COMPOSE_PROD -f docker-compose.prod.https.yml up -d --wait"
 ```
 
-Después verifique desde la terminal local; debe responder `200` o `302`:
+`--wait` es lo que hace verificable el paso siguiente: sin él, `up -d` vuelve apenas arrancan los
+contenedores y el `curl` sale contra un puerto todavía cerrado
+(`Failed to connect ... port 443`). Con el `healthcheck` del api-server, el comando no retorna
+hasta que el proceso responde por TLS; la primera vez tarda ~30-60 s.
+
+Después verifique desde la terminal local; debe imprimir `200` (o `302`):
 
 ```bash
-# 2) Verificar desde afuera: 200 o 302
-curl -sSfI "$AIRFLOW_URL/" | head -1
+# 2) Verificar desde afuera. GET con el cuerpo descartado: la UI de Airflow 3 rechaza HEAD
+# con 405, así que `curl -I` marcaría error con el servicio sano. Los reintentos cubren el
+# api-server que todavía no terminó de levantar y la propagación del A record recién creado.
+curl -sS -o /dev/null -w '%{http_code}\n' --retry 12 --retry-delay 5 --retry-connrefused "$AIRFLOW_URL/"
 ```
 
 > **`airflow-init Exited` es lo esperado**, y las repeticiones son el redraw del spinner de
 > Compose: es one-shot (migra el esquema, crea el admin, sale en 0). Los que tienen que quedar
-> `Running` son `apiserver`, `scheduler`, `dag-processor` y `triggerer`. Si el que figura
-> `Exited` es **apiserver**, consulte `docker logs airflow-apiserver --tail 50`.
+> `Running` son `apiserver`, `scheduler`, `dag-processor` y `triggerer`; el `apiserver`, además,
+> `healthy`. Si el que figura `Exited` es **apiserver**, consulte
+> `docker logs airflow-apiserver --tail 50`.
 
 Desde **otra IP** el `curl` tiene que cortar por timeout: el SG solo deja pasar 443 a
 `var.my_ip_cidr`. Si responde, revise la regla antes de continuar. Ingrese con el usuario **admin**
@@ -5295,8 +5453,14 @@ Después, contraste la operación con el state:
 
 ```bash
 task prod:status                          # EC2, agente SSM y contenedores en una sola operación
-task prod:infra:output                         # el state crudo; NAME=public_ip devuelve uno solo
+task prod:infra:output                    # URLs e IDs publicados; NAME=public_ip devuelve uno solo
 ```
+
+`prod:infra:output` es el equivalente operativo para localizar los servicios de producción: expone
+solamente outputs no secretos, por ejemplo `AIRFLOW_URL`, `PUBLIC_IP` o buckets. No cree una task
+`prod:credentials` que lea o imprima contraseñas: los secretos viven como `SecureString` en SSM, no
+son outputs de Terraform y el `load-secrets.sh` de la EC2 los materializa con permisos `0600` (ver
+[sección 13.4](#134-materializar-env)).
 
 Salida esperada (con las secciones 4 a 7 aplicadas, todas las obligatorias con valor):
 
@@ -7083,6 +7247,14 @@ services:
     command: api-server
     ports:
       - 127.0.0.1:8082:8080
+    # El api-server tarda ~30 s en aceptar conexiones: sin healthcheck, `up -d` vuelve antes
+    # y la verificación externa falla con "could not connect" contra un puerto todavía cerrado.
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     depends_on:
       airflow-db:
         condition: service_healthy
@@ -8343,7 +8515,8 @@ El teardown de una plataforma con datos es destructivo. Debe:
 - cancelar jobs EMR activos;
 - destruir `infra/envs/prod` antes de `infra/bootstrap`;
 - vaciar todas las versiones y delete markers de S3 solo con aprobación;
-- desactivar temporalmente `prevent_destroy`;
+- desactivar temporalmente `prevent_destroy` (EBS de datos, buckets y la hosted zone de la
+  sección 5.6: destruir la zona obliga a re-delegar el dominio con propagación de TLD);
 - restaurar las guardas aunque el proceso falle;
 - comprobar en AWS que no quedaron recursos facturando.
 
@@ -8528,7 +8701,7 @@ pyspark_stack/
 │   │   │   ├── main.tf                  sección 5.3  EC2 + EBS + EIP
 │   │   │   └── user_data.sh.tftpl       sección 5.3  ojo con el escape de variables de bash
 │   │   ├── scheduler/                   sección 5.4  Lambda startstop + schedules (+ DLQ sección 18.1)
-│   │   ├── https/                       sección 5.6  SOLO si se habilita HTTPS
+│   │   ├── https/                       sección 5.6  SOLO si se habilita HTTPS (crea la hosted zone)
 │   │   │   └── policies/route53-certbot.json.tftpl   sección 5.6
 │   │   ├── storage/                     sección 6.1  buckets + lifecycle + params (+ s3a sección 6.2)
 │   │   ├── backups/                     sección 6.3  DLM

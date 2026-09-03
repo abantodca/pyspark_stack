@@ -1009,7 +1009,7 @@ tasks:
         echo "  task local:down             lo apaga y conserva los volúmenes"
         echo "  task local:check            valida .env, estructura y Compose"
         echo "  task local:urls             lista URLs y estados"
-        echo "  task local:credentials      muestra los accesos locales"
+        echo "  task local:credentials      muestra secretos de acceso del entorno local (no producción)"
         echo
 
   check:
@@ -1089,7 +1089,7 @@ tasks:
         echo "Smoke medallion OK: web_events run_date=$run_date"
 
   credentials:
-    desc: "Muestra los accesos locales de Airflow y Jupyter desde .env"
+    desc: "Muestra secretos de acceso de Airflow y Jupyter del entorno local; no de producción"
     preconditions:
       - sh: test -f .env
         msg: "Falta .env. Crealo con: cp .env.example .env"
@@ -1259,7 +1259,7 @@ El Compose levanta cuatro subsistemas en una sola red de Docker (`hadoopnet`):
 | `task local:up` | Valida y levanta los cuatro subsistemas con el override endurecido |
 | `task local:smoke` | Ejecuta Web Events end-to-end y exige evidencias en las cinco capas HDFS, después de escribirlo en la guía 06, sección 16 |
 | `task local:down` | Baja el stack **conservando** los volúmenes (los datos de HDFS y Postgres siguen ahí) |
-| `task local:credentials` | Muestra los accesos locales de Airflow y la URL con token de Jupyter |
+| `task local:credentials` | Muestra secretos de acceso del entorno local: Airflow y la URL con token de Jupyter. No consulta ni muestra secretos de producción. |
 | `task local:urls` | Lista las URLs locales y marca qué servicio está arriba |
 | `task --list-all` | El catálogo completo de módulos y tareas disponibles en este checkout |
 
@@ -1982,6 +1982,12 @@ task local:credentials
 
 La tarea imprime el usuario y contraseña de Airflow, y la URL de Jupyter con su token. No compartas
 su salida ni la pegues en tickets, chats o capturas.
+
+Es una comodidad **exclusiva del laboratorio local**: lee tu `.env` para abrir servicios ligados a
+`127.0.0.1`. No existe un equivalente `prod:credentials`: en producción los secretos no se dejan en
+el estado de Terraform ni se imprimen en la terminal; se administran en AWS SSM y la EC2 los carga
+con su rol de instancia. La operación equivalente allí es consultar las URLs e identificadores no
+secretos con `task prod:infra:output`, como explica la [guía 02, sección 8.1](02-produccion-aws-terraform.md#81-cargar-el-contexto-de-producción).
 
 Si necesitás leer los valores directamente desde `.env`:
 

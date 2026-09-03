@@ -85,9 +85,23 @@ variable "airflow_domain" {
   default     = ""
 }
 variable "dns_zone" {
-  description = "Hosted zone de Route 53 donde vive airflow_domain, p.ej. midominio.com (sin punto final)."
+  description = "Hosted zone de Route 53 que Terraform crea para airflow_domain, p.ej. midominio.com (sin punto final)."
   type        = string
   default     = ""
+
+  # airflow_domain tiene que ser un subdominio de dns_zone: si no, el A record se crea en una zona
+  # que no delega ese nombre y `dig` no devuelve nada, sin ningún error de Terraform.
+  validation {
+    condition     = var.airflow_domain == "" || endswith(var.airflow_domain, ".${var.dns_zone}")
+    error_message = "airflow_domain debe ser un subdominio de dns_zone, por ejemplo airflow.midominio.com dentro de midominio.com."
+  }
+}
+# El dominio está registrado en Route 53 Domains de esta cuenta: Terraform re-delega los NS a la
+# zona que crea. En otro registrador (GoDaddy, Namecheap) déjelo en false y copie a mano el output
+# dns_zone_name_servers en el panel del registrador.
+variable "manage_registrar_ns" {
+  type    = bool
+  default = false
 }
 variable "letsencrypt_email" {
   description = "Email para el registro de Let's Encrypt (avisos de expiración del cert)."
