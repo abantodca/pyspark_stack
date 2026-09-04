@@ -49,5 +49,5 @@ cortado a la mitad cuesta un incidente.
 
 ## Dónde vive
 
-Guía 02 [guía 02 §5.4](../02-produccion-aws-terraform.md#54-automatización-eventbridge--lambda) (módulo
+Guía 02 [§4.4](../02-produccion-aws-terraform.md#44-automatización-eventbridge-y-lambda) (módulo
 `scheduler` y el código de la Lambda) y [guía 02 §9.4](../02-produccion-aws-terraform.md#94-dag-de-referencia-para-emr-serverless).

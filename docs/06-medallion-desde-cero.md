@@ -189,11 +189,12 @@ argumento, y por qué las rutas tienen que ser deterministas.
 
 ### La fecha lo es todo
 
-Mirá dónde aparece `run_date` en el esquema de arriba: en la ruta. Cada corrida escribe
-en un directorio propio, `run_date=2026-01-05`, y siempre en modo `overwrite`.
+Mirá dónde aparece `run_date` en el esquema de arriba: en la ruta. Cada corrida diaria escribe
+en un directorio como `run_date=2026-01-05`; una corrida intradía usa una clave como
+`run_date=2026-01-05T14-30`. Ambas escriben siempre en modo `overwrite`.
 
 De ahí sale la propiedad más valiosa de un pipeline: **la idempotencia**. Correr el
-mismo día dos veces produce exactamente el mismo resultado que correrlo una vez.
+mismo intervalo dos veces produce exactamente el mismo resultado que correrlo una vez.
 
 Es lo que te permite reprocesar sin miedo. Sin idempotencia, cada reintento —y Airflow
 reintenta solo— duplicaría filas, y un pipeline que duplica en silencio es peor que uno
@@ -214,14 +215,19 @@ El código de ambos modos conserva la misma escritura:
 RUNTIME.write(frame, "silver", run_date)
 ```
 
-No hay `mode("append")`. El delta de `2026-01-06` queda en su propia partición y el
-reintento de esa fecha hace `overwrite` **solo sobre esa partición**. Así se acumula el
-histórico sin duplicar filas:
+No hay `mode("append")`. El delta de `2026-01-06` —o de `2026-01-06T14-30` en un DAG
+intradía— queda en su propia partición y el reintento del mismo intervalo hace `overwrite`
+**solo sobre esa partición**. Así se acumula el histórico sin duplicar filas:
 
 ```text
 silver/daily_sales/run_date=2026-01-05  ← delta ya confirmado
 silver/daily_sales/run_date=2026-01-06  ← delta de la corrida actual
 ```
+
+Los DAGs diarios reciben `{{ ds }}`. Los cuatro DAGs intradía reciben
+`{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}`; usar `{{ ds }}` allí haría que todas las
+corridas del día se pisaran. `run_date` es el nombre histórico del argumento, pero su contrato real
+es **clave estable del intervalo**.
 
 En los ejemplos incrementales, la URI de entrada debe apuntar al lote de la ventana de
 la corrida —no a todo el histórico— y debe incluir un identificador estable
@@ -736,7 +742,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import datetime
 from typing import Protocol
 from urllib.parse import urlparse
 
@@ -785,7 +791,8 @@ class LakehouseConfig:
     def location(self, layer: str, run_date: str, dataset: str | None = None) -> str:
         if layer not in SUPPORTED_LAYERS:
             raise ValueError(f"Unsupported medallion layer: {layer!r}")
-        date.fromisoformat(run_date)
+        run_format = "%Y-%m-%dT%H-%M" if "T" in run_date else "%Y-%m-%d"
+        datetime.strptime(run_date, run_format)
         if dataset is not None and not SAFE_NAME.fullmatch(dataset):
             raise ValueError(f"Invalid dataset name: {dataset!r}")
 
@@ -809,7 +816,7 @@ Cada validación tapa un agujero concreto:
 |---|---|
 | `SAFE_NAME` sobre `project` y `dataset` | Un nombre con `../` escapando del lakehouse, o un espacio que rompe la ruta |
 | `layer not in SUPPORTED_LAYERS` | Que `"sliver"` cree en silencio un árbol nuevo que nadie va a mirar |
-| `date.fromisoformat(run_date)` | Que `run_date=2026-13-45` se materialice como directorio |
+| `datetime.strptime(run_date, run_format)` | Que una fecha o clave intradía inválida se materialice como directorio |
 | `parsed.scheme != "hdfs"` | Que un pipeline escriba en el disco efímero del contenedor y pierda todo al recrearlo |
 | `not parsed.netloc` | Un `hdfs:///ruta` sin namenode, que falla mucho más lejos y con un error críptico |
 
@@ -1152,7 +1159,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import datetime
 from typing import Protocol
 from urllib.parse import urlparse
 
@@ -1232,7 +1239,8 @@ class LakehouseConfig:
     def location(self, layer: str, run_date: str, dataset: str | None = None) -> str:
         if layer not in SUPPORTED_LAYERS:
             raise ValueError(f"Unsupported medallion layer: {layer!r}")
-        date.fromisoformat(run_date)
+        run_format = "%Y-%m-%dT%H-%M" if "T" in run_date else "%Y-%m-%d"
+        datetime.strptime(run_date, run_format)
         if dataset is not None and not SAFE_NAME.fullmatch(dataset):
             raise ValueError(f"Invalid dataset name: {dataset!r}")
 
@@ -2300,17 +2308,17 @@ with DAG(
     bronze = PythonOperator(
         task_id="bronze_ingest",
         python_callable=bronze_ingest,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     silver = PythonOperator(
         task_id="silver_conform",
         python_callable=silver_conform,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     gold = PythonOperator(
         task_id="gold_publish",
         python_callable=gold_publish,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     bronze >> silver >> gold
 ```
@@ -2375,17 +2383,11 @@ final— lo apague.
 número sale de medir el comportamiento real de la fuente durante unas semanas, no de una
 aspiración.
 
-> **Gotcha: el DAG es horario pero la partición es diaria.**
-> `schedule="@hourly"` dispara 24 veces por día, y las 24 corridas reciben `{{ ds }}`
-> con la **misma fecha**. Como el destino es `run_date=<fecha>` y el modo es
-> `overwrite`, cada hora **pisa** lo que escribió la anterior: al final del día, en HDFS
-> queda solo la última hora.
->
-> Acá funciona porque la fuente de ejemplo entrega el día entero en cada corrida, así que
-> reescribir es correcto. Pero si tu origen entrega solo la última hora, tenés tres
-> salidas: agregar la hora a la ruta de la capa, escribir con
-> `partitionBy("event_date", "event_hour")` y apoyarte en el
-> `partitionOverwriteMode=dynamic` que ya configuró el runtime, o bajar el DAG a diario.
+> **El DAG es horario y su clave también.** `{{ ds }}` no alcanza: las 24 corridas del día
+> recibirían la misma fecha y `overwrite` conservaría solo la última. Por eso este DAG pasa
+> `data_interval_start` como `YYYY-MM-DDTHH-MM`; cada intervalo escribe una ruta independiente y
+> reintentar el mismo intervalo continúa siendo idempotente. La fecha de negocio sigue dentro de
+> las columnas `event_date`/`event_hour`, no se deduce del nombre físico de la partición.
 > Lo que **no** podés es dejarlo como está y suponer que se acumula.
 
 ## 17. Proyecto 04 · Product Catalog
@@ -4149,17 +4151,17 @@ with DAG(
     bronze = PythonOperator(
         task_id="bronze_ingest",
         python_callable=bronze_ingest,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     silver = PythonOperator(
         task_id="silver_conform",
         python_callable=silver_conform,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     gold = PythonOperator(
         task_id="gold_publish",
         python_callable=gold_publish,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     bronze >> silver >> gold
 ```
@@ -5356,17 +5358,17 @@ with DAG(
     bronze = PythonOperator(
         task_id="bronze_ingest",
         python_callable=bronze_ingest,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     silver = PythonOperator(
         task_id="silver_order_lifecycle",
         python_callable=silver_order_lifecycle,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     gold = PythonOperator(
         task_id="gold_publish",
         python_callable=gold_publish,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     bronze >> silver >> gold
 ```
@@ -5687,7 +5689,7 @@ def silver_risk_features(run_date: str) -> None:
             .fillna({"jurisdiction_weight": 0.0, "risk_category": "standard"})
             .withColumn(
                 "kyc_age_days",
-                F.datediff(F.lit(run_date).cast("date"), "kyc_review_date"),
+                F.datediff(F.lit(run_date[:10]).cast("date"), "kyc_review_date"),
             )
         )
         # Un pago sin perfil KYC no se puede screenear: es excepción, no dato válido.
@@ -5793,17 +5795,17 @@ with DAG(
     bronze = PythonOperator(
         task_id="bronze_ingest",
         python_callable=bronze_ingest,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     silver = PythonOperator(
         task_id="silver_risk_features",
         python_callable=silver_risk_features,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     gold = PythonOperator(
         task_id="gold_publish",
         python_callable=gold_publish,
-        op_kwargs={"run_date": "{{ ds }}"},
+        op_kwargs={"run_date": "{{ data_interval_start.strftime('%Y-%m-%dT%H-%M') }}"},
     )
     bronze >> silver >> gold
 ```
@@ -6804,8 +6806,9 @@ Un directorio sin `_SUCCESS` es una escritura interrumpida, no un resultado. Y u
 directorio que no existe para la fecha de ayer, en un DAG diario, significa que la corrida
 nunca se disparó — mirá el scheduler, no el código.
 
-Para operar HDFS con más detalle —subir un archivo, exportar un resultado, inspeccionar un
-Parquet a mano— está la [guía 05](05-hdfs-desde-la-terminal.md).
+Para operar HDFS con más detalle —subir un archivo, exportar un resultado o inspeccionar una
+salida— use los comandos de preparación de la [sección 3](#3-preparar-el-entorno-una-sola-vez) y
+el diagnóstico de esta sección.
 
 ## 33. Antipatrones
 
@@ -6852,13 +6855,14 @@ Que la lista sea tan corta es la consecuencia directa del §12: los quince DAGs 
 cuatro métodos de una fachada. Cambiar de HDFS a S3 es cambiar una validación y una
 configuración.
 
-El diseño completo de esa migración —red, IAM, EMR Serverless, CI/CD, costos— está en la
+El diseño completo de esa migración —red, IAM, EMR Serverless, operación y costos— está en la
 [guía 02](02-produccion-aws-terraform.md), y el porqué de cada decisión en la
 [guía 03](03-arquitectura.md) y en los [ADR](adr/README.md).
 
 > [!IMPORTANT]
-> La guía 02 es **referencia de diseño**: este checkout no incluye el Terraform ni los
-> jobs de EMR. No la ejecutes esperando un runbook probado.
+> La guía 02 es una fuente ejecutable **no materializada ni validada E2E en este checkout**.
+> Copiá sus bloques en orden, revisá cada plan y completá sus checkpoints antes de tratarla como
+> un runbook probado para una cuenta AWS concreta.
 
 ## 35. Proyecto 16: tu turno, sin solución
 
@@ -6946,8 +6950,8 @@ pieza por pieza, y un método para el número dieciséis.
 
 Lo que sigue depende de qué quieras hacer:
 
-- **Meter tu propio dato**: [guía 05](05-hdfs-desde-la-terminal.md) para subirlo a HDFS, y
-  `ops/sources.env` para apuntarle el `*_SOURCE_URI` al proyecto que corresponda.
+- **Meter tu propio dato**: usá la [sección 3](#3-preparar-el-entorno-una-sola-vez) para subirlo a
+  HDFS y `ops/sources.env` para apuntar el `*_SOURCE_URI` al proyecto que corresponda.
 - **Entender el stack que estuviste usando**: [guía 01](01-stack-local.md), el
   `docker-compose.yml` bloque por bloque.
 - **Llevarlo a AWS**: [guía 03](03-arquitectura.md) para el porqué y

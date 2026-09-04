@@ -11,7 +11,7 @@ Si una sección de la guía contradice un ADR, el que está mal es uno de los do
 |---|---|---|
 | [001](ADR-001-emr-serverless-para-spark.md) | El cómputo Spark vive fuera de la EC2, en EMR Serverless | accepted |
 | [002](ADR-002-plano-de-control-single-node.md) | El plano de control es single-node, sin alta disponibilidad | accepted |
-| [003](ADR-003-disparo-por-ssm-no-api-http.md) | Los DAGs se disparan por SSM, nunca exponiendo la API de Airflow | accepted |
+| [003](ADR-003-disparo-por-ssm-no-api-http.md) | Variante event-driven por SSM; el recorrido actual conserva acceso privado pero difiere SQS/Lambda de disparo | superseded en alcance |
 | [004](ADR-004-backend-s3-con-use-lockfile.md) | El lock del state lo hace S3 con `use_lockfile`, sin DynamoDB | accepted |
 | [005](ADR-005-composicion-envs-modules.md) | La infra es una composición `envs/prod` + `modules/*`, no un módulo raíz plano | accepted |
 | [006](ADR-006-el-modulo-que-crea-otorga.md) | El módulo que crea el recurso es el que otorga el acceso a él | accepted |

@@ -9,9 +9,9 @@ responde **cómo materializar y operar**. Los [ADR](adr/README.md) son el regist
 decisión: un cambio de arquitectura requiere un ADR que la sustituya y su actualización en la guía.
 
 > [!IMPORTANT]
-> Esta es una referencia de diseño. El checkout implementa el stack local; los artefactos de AWS
-> descritos por la guía 02 no están presentes ni validados end-to-end. El estado efectivo vive en la
-> [matriz de documentación](README.md).
+> Esta es una referencia de diseño. El checkout documental no materializa el stack local ni los
+> artefactos AWS descritos por la guía 02. El estado efectivo vive en la
+> [matriz de documentación](README.md); cada entorno debe ejecutar sus propios checkpoints.
 
 ## 1. Alcance y fronteras
 
@@ -49,16 +49,11 @@ implementación. Para el estado efectivo, prevalece la [matriz de documentación
 ```mermaid
 flowchart TD
     operator[Operador o desarrollador]
-    producer[Productor de datos]
-    ci[CI/CD con identidad de servicio]
     alerts[Alertas, coste y recuperación fuera del host]
 
     subgraph aws[Entorno AWS de referencia]
-        subgraph triggers[Disparo y automatización]
-            scheduler[Planificador]
-            queue[SQS y DLQ]
-            trigger[Lambda de disparo]
-            ssm[Canal privado de administración]
+        subgraph operations[Acceso y automatización]
+            access[Túnel SSH y SSM]
             lifecycle[Automatización de encendido y apagado]
         end
 
@@ -70,7 +65,6 @@ flowchart TD
         end
 
         emr[EMR Serverless - Spark]
-        catalog[Catálogo de datos]
 
         subgraph lake[Data lake durable]
             raw[raw]
@@ -80,38 +74,29 @@ flowchart TD
         artifacts[Artefactos y logs remotos]
     end
 
-    operator -->|administración privada| ssm
-    ssm -->|dispara DAGs sin API pública| airflow
-    producer -->|publica lote| raw
-    raw -->|evento de datos| queue
-    scheduler -->|ejecución programada| trigger
-    queue -->|evento recuperable| trigger
-    trigger -->|orden privada| ssm
-    scheduler -->|ventana operativa| lifecycle
+    operator -->|Taskfile y canal restringido| access
+    access -->|despliega, opera y dispara| airflow
     lifecycle -->|gestiona el host del control plane| control_plane
     airflow -->|lanza job| emr
-    emr <-->|metadatos de tablas| catalog
     emr -->|lee y escribe| lake
     airflow -->|logs de tareas| artifacts
     emr -->|logs de ejecución| artifacts
-    ci -->|publica artefactos| artifacts
-    artifacts -->|entrega controlada| ssm
     control_plane -->|salud y fallos| alerts
     emr -->|estado y coste| alerts
-    queue -->|mensajes no procesados| alerts
     local_signal -.->|complementa, no sustituye| alerts
 ```
 
-Lectura del flujo: un lote entra a `raw`, su evento queda protegido por una cola y el disparo llega
-a Airflow por un canal privado. Airflow delega el cómputo en EMR Serverless, que usa el catálogo y
-lee/escribe en el data lake. Ni el dato durable ni las señales críticas dependen del host del plano
-de control.
+Lectura del flujo: el operador materializa y opera la plataforma con el Taskfile por canales
+restringidos. Airflow delega el cómputo en EMR Serverless, que lee y escribe el data lake. El
+almacenamiento durable y las señales críticas no dependen del host del plano de control. La guía
+actual no materializa ingesta por eventos, SQS/DLQ, catálogo Glue ni un pipeline CI/CD; incorporarlos
+requiere ampliar primero la arquitectura y la guía.
 
 | Frontera | Decisión | Consecuencia deliberada |
 |---|---|---|
 | Plano de control | Airflow y su metadata comienzan juntos en un único host reemplazable | Hay un SPOF aceptado en etapa A; no se resuelve añadiendo contenedores al mismo host |
 | Plano de datos | Almacenamiento durable y cómputo Spark bajo demanda quedan fuera del host de Airflow | El coste de Spark sigue al uso y la caída del orquestador no implica pérdida de datos |
-| Disparo y acceso | La automatización y administración no dependen de exponer la API de Airflow | La integración usa identidades AWS y canales de administración privados |
+| Disparo y acceso | La operación no depende de exponer públicamente la API de Airflow | El recorrido usa túnel SSH/SSM y acceso HTTPS opcional restringido al `/32` del operador |
 | Señal crítica | Las alertas que deben sobrevivir al host viven fuera de él | Las herramientas de observabilidad locales son auxiliares, no un sustituto |
 
 ## 2. Decisión por etapas
@@ -130,7 +115,7 @@ RTO/RPO, clasificación de datos, número de operadores y coste de una interrupc
 - El cómputo Spark no comparte el host del orquestador.
 - El almacenamiento de datos no depende de discos efímeros del plano de control.
 - Una identidad tiene permisos mínimos para una responsabilidad; no se distribuyen access keys.
-- Todo disparo es recuperable e idempotente antes de procesar datos reales.
+- Todo DAG y job es idempotente; cualquier disparo automático futuro debe definir reintento y recuperación antes de procesar datos reales.
 - Ningún dataset se promueve sin owner, contrato, validaciones y un procedimiento de reversión.
 - Un backup no cuenta como recuperación hasta que se prueba contra el RPO/RTO acordado.
 - Un presupuesto, una alerta y un responsable son parte del sistema, no anexos operativos.
@@ -144,7 +129,7 @@ debe justificar explícitamente en un ADR y en el gate de producción.
 |---|---|---|
 | Spark fuera del control plane | Evitar cómputo ocioso y aislar recursos del orquestador | [ADR-001](adr/ADR-001-emr-serverless-para-spark.md) |
 | Control plane single-node en A | Coste y complejidad proporcionales al SLO inicial | [ADR-002](adr/ADR-002-plano-de-control-single-node.md) |
-| Disparo privado, sin API HTTP de Airflow | Reducir superficie de exposición y usar identidad de servicio | [ADR-003](adr/ADR-003-disparo-por-ssm-no-api-http.md) |
+| Operación privada, sin API pública de automatización | Reducir superficie de exposición; la variante event-driven quedó diferida | [ADR-003](adr/ADR-003-disparo-por-ssm-no-api-http.md) (alcance revisado) |
 | State de Terraform con lock nativo de S3 | Estado único y bloqueo sin servicio adicional | [ADR-004](adr/ADR-004-backend-s3-con-use-lockfile.md) |
 | Infraestructura compuesta por entorno y módulos | Límites claros entre componentes y contratos explícitos | [ADR-005](adr/ADR-005-composicion-envs-modules.md) |
 | El creador de un recurso concede su acceso | Reducir dependencias cruzadas y permisos implícitos | [ADR-006](adr/ADR-006-el-modulo-que-crea-otorga.md) |
@@ -166,7 +151,7 @@ existir evidencia de los siguientes resultados:
 | Coste | ¿Qué límite, señal y owner detienen o investigan un incremento anómalo? |
 | Seguridad | ¿El acceso, los cambios de control y el ciclo de parches tienen dueño y evidencia? |
 
-El detalle de controles y la evidencia requerida están en la guía 02: [gate de producción (§1.2)](02-produccion-aws-terraform.md#12-gate-de-producción-qué-falta-y-qué-no-se-negocia), [runbook (§15)](02-produccion-aws-terraform.md#15-runbook-de-puesta-en-producción), [gobierno (§18)](02-produccion-aws-terraform.md#18-gobierno-resiliencia-y-costos), [calidad (§20)](02-produccion-aws-terraform.md#20-calidad-de-datos) y [recuperación (§21.3)](02-produccion-aws-terraform.md#213-recuperación).
+El detalle de controles y la evidencia requerida están en la guía 02: [gate de producción (§1.2)](02-produccion-aws-terraform.md#12-gate-de-producción-qué-falta-y-qué-no-se-negocia), [runbook (§10.8)](02-produccion-aws-terraform.md#108-runbook-de-puesta-en-producción), [calidad (§10.9)](02-produccion-aws-terraform.md#109-calidad-de-datos), [recuperación (§10.10.3)](02-produccion-aws-terraform.md#10103-recuperación) y [observabilidad (§11)](02-produccion-aws-terraform.md#11-observabilidad-prometheus-grafana-y-loki).
 
 ## 6. Dónde vive cada detalle
 
@@ -175,7 +160,7 @@ El detalle de controles y la evidencia requerida están en la guía 02: [gate de
 | Arquitectura, límites, criterios de evolución y trade-offs | Este documento y los [ADR](adr/README.md) |
 | Terraform, comandos, variables, despliegue, operación y runbook | [Guía 02](02-produccion-aws-terraform.md) |
 | Estado de implementación frente a diseño | [Índice de documentación](README.md) |
-| Diseño y operación del entorno reproducible local | [Stack local](01-stack-local.md) y [DataOps local](04-dataops-local.md) |
+| Diseño y operación del entorno reproducible local | [Stack local](01-stack-local.md) y [taller medallion](06-medallion-desde-cero.md) |
 
 Si una decisión cambia, actualizá primero el ADR, después este documento y por último la guía de
 implementación en el mismo cambio. Si solo cambian comandos, archivos o procedimientos, la

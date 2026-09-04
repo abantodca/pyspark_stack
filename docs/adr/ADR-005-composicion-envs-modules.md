@@ -48,7 +48,6 @@ Cada sección de la guía sigue el mismo bucle: pegar el módulo → validarlo a
 
 ## Dónde vive
 
-Guía 02 [guía 02 §3.0](../02-produccion-aws-terraform.md#30-estructura-de-infraestructura-composición-y-módulos)
-(layout y bucle de trabajo), [guía 02 §4](../02-produccion-aws-terraform.md#4-fundamentos-backend-terraform)
-(la composición y la tabla de qué módulo se apendea en qué sección) y el
-[Apéndice C](../02-produccion-aws-terraform.md#apéndice-c--mapa-de-archivos-que-crea-la-guía).
+Guía 02 [§1.4.1](../02-produccion-aws-terraform.md#141-estructura-de-infraestructura-composición-y-módulos)
+(layout), [§3](../02-produccion-aws-terraform.md#3-terraform-y-estado-remoto) (backend y composición)
+y el [mapa de archivos](../02-produccion-aws-terraform.md#apéndice-mapa-de-archivos).

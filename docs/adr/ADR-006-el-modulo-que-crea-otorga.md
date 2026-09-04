@@ -44,7 +44,7 @@ módulo declarando las suyas.
 
 ## Dónde vive
 
-Guía 02 [guía 02 §5.2](../02-produccion-aws-terraform.md#52-iam--key-pair) (el rol base y `_shared/`),
-[guía 02 §6.2](../02-produccion-aws-terraform.md#62-iam-permitir-s3a-a-la-ec2-sin-keys),
+Guía 02 [§4.2](../02-produccion-aws-terraform.md#42-iam-y-key-pair) (el rol base y `_shared/`),
+[§6.2](../02-produccion-aws-terraform.md#62-iam-acceso-s3-del-orquestador-sin-claves),
 [guía 02 §6.4](../02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless) y
-[guía 02 §13.3](../02-produccion-aws-terraform.md#133-permitir-lectura-desde-ec2).
+[§10.3](../02-produccion-aws-terraform.md#103-permitir-lectura-desde-ec2).

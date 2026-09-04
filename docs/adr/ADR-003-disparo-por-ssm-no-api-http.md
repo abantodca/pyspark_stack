@@ -1,6 +1,6 @@
-# ADR-003 — Los DAGs se disparan por SSM, nunca exponiendo la API de Airflow
+# ADR-003 — Disparo por SSM sin exponer la API de Airflow
 
-**Estado:** accepted · 2026-08-12
+**Estado:** superseded en su alcance event-driven · 2026-09-04
 
 ## Contexto
 
@@ -11,7 +11,7 @@ obliga a exponer un puerto y a gestionar credenciales de API.
 El diseño de red del stack es que **la única puerta abierta a Internet** es, opcionalmente, HTTPS
 restringido a tu `/32`. Todo lo demás va por túnel SSH.
 
-## Decisión
+## Decisión original
 
 Una Lambda `trigger-airflow` ejecuta `airflow dags trigger` **dentro** de la instancia vía
 `ssm:SendCommand`. No se abre ningún puerto nuevo, no hay token de API que rotar, y el permiso está
@@ -19,6 +19,13 @@ acotado por ARN a esa instancia y al documento `AWS-RunShellScript`.
 
 La misma Lambda arranca la EC2 si el evento la encuentra apagada, lo que hace compatible el disparo
 por evento con el apagado automático de [ADR-008](ADR-008-apagado-job-aware.md).
+
+## Alcance vigente
+
+La guía 02 simplificada no materializa `trigger-airflow`, SQS ni DLQ. Mantiene el principio de no
+exponer una API pública para automatización: el operador dispara el DAG desde la EC2 mediante el
+Taskfile y usa SSH/SSM como canales restringidos. La automatización por eventos queda diferida y
+deberá recuperar este ADR —junto con reintentos, DLQ y replay— antes de aceptar datos reales.
 
 ## Consecuencias
 
@@ -45,6 +52,6 @@ por evento con el apagado automático de [ADR-008](ADR-008-apagado-job-aware.md)
 
 ## Dónde vive
 
-Guía 02 [guía 02 §7.1](../02-produccion-aws-terraform.md#71-lambda-que-dispara-los-dags-vía-ssm) (módulo
-`triggers`), [guía 02 §7.3](../02-produccion-aws-terraform.md#73-disparo-por-evento-archivo-nuevo-en-s3-vía-sqs)
-y el catálogo de diagnóstico de [guía 02 §8.6](../02-produccion-aws-terraform.md#86-diagnóstico-rápido).
+El disparo operativo vigente está en la guía 02 [§8.3](../02-produccion-aws-terraform.md#83-prueba-end-to-end)
+y su diagnóstico en [§8.6](../02-produccion-aws-terraform.md#86-diagnóstico-rápido). La arquitectura
+event-driven original no forma parte del recorrido actual.

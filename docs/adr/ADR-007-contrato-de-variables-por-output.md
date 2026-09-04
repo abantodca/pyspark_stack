@@ -54,6 +54,6 @@ así que no debe declararse como un gate existente.
 
 ## Dónde vive
 
-Guía 02 [guía 02 §3.1](../02-produccion-aws-terraform.md#31-contrato-de-variables-de-entorno-léalo-antes-de-copiar-cualquier-comando),
-[guía 02 §13.3b](../02-produccion-aws-terraform.md#133b-cerrar-la-configuración-no-secreta-en-ssm) (el mismo
+Guía 02 [§2.3](../02-produccion-aws-terraform.md#23-cargador-scriptsprod-envsh),
+[§10.4](../02-produccion-aws-terraform.md#104-cerrar-la-configuración-no-secreta-en-ssm) (el mismo
 contrato para la EC2) y `scripts/prod-env.sh` (materializado desde la guía y luego versionado).

@@ -1,148 +1,81 @@
 # Documentación de `pyspark_stack`
 
-> **En este documento: ORIENTARSE, ~5 min.** Es el índice y la matriz de estado, no
-> un tutorial.
-> **Salís con**: sabiendo qué documento abrir, en qué orden, y —lo más importante—
-> qué de todo esto **ya funciona** y qué es todavía diseño.
+> **En este documento: ORIENTARSE, ~5 min.** Este es el índice y el contrato de mantenimiento.
 
-Esta carpeta separa lo que ya funciona de la arquitectura objetivo. Un componente se considera
-**implementado** solo cuando existe como código versionado y está cubierto por una validación
-repetible. Lo marcado como **roadmap** no forma parte todavía del runbook de producción.
+Este repositorio contiene **solo documentación canónica**. “Guía completa” significa que reúne los
+bloques necesarios para construir el entorno; no significa que esos archivos existan en el checkout,
+que AWS esté desplegado ni que se haya realizado una validación end-to-end.
 
-> [!IMPORTANT]
-> **La columna «Estado» es la que evita el error caro.** «Guía completa» significa que
-> el documento está entero y es coherente, **no** que se desplegó y se validó de punta
-> a punta en AWS. Antes de ejecutar una sección, mirá acá. Un bloque marcado *roadmap*
-> es una decisión de diseño escrita para el día que la implementes, no un
-> procedimiento probado.
+## Documentos
 
-### Cómo está ordenada la carpeta
-
-Arriba quedan **solo los cuatro documentos que se leen de punta a punta**. Lo que se
-consulta —el material de referencia— vive un nivel adentro, para que abrir `docs/`
-muestre el camino y no el inventario.
-
-```
+```text
 docs/
-├── 01-stack-local.md                  desarrollo local
-├── 02-produccion-aws-terraform.md     producción en AWS: la guía completa
-├── 03-arquitectura.md                 el porqué
-├── 06-medallion-desde-cero.md         el taller: escribir los 15 proyectos, en orden
-├── adr/                               decisiones estructurales, con sus alternativas descartadas
+├── 01-stack-local.md                  construcción y operación local
+├── 02-produccion-aws-terraform.md     construcción y operación en AWS
+├── 03-arquitectura.md                 decisiones y límites de producción
+├── 06-medallion-desde-cero.md         taller de pipelines PySpark
+├── adr/                               decisiones estructurales
 └── README.md                          este índice
 ```
 
-| Documento | Propósito | Estado |
+| Documento | Fuente canónica de | Estado en este checkout |
 |---|---|---|
-| [01 — Stack local](01-stack-local.md) | Anatomía del Compose y de los contenedores | Implementado |
-| [02 — Producción con Terraform](02-produccion-aws-terraform.md) | Guía IaC incremental, gates de producción y runbook, §1–§22 | Referencia copy-paste; artefactos AWS aún no materializados ni probados E2E |
-| [03 — Arquitectura](03-arquitectura.md) | Decisiones, fronteras y criterio de evolución; sin recetas operativas | Referencia de arquitectura; etapa A definida, B/C condicionadas por SLO/riesgo |
-| [06 — Medallion desde cero](06-medallion-desde-cero.md) | Taller copy-paste: los 15 proyectos en orden creciente, más la metodología | **Es la fuente del código de `dags/`** |
+| [01 — Stack local](01-stack-local.md) | Dockerfiles, Compose, configuración y tareas locales | Guía; runtime no materializado |
+| [06 — Medallion](06-medallion-desde-cero.md) | Runtime, DAGs y quince proyectos de datos | Guía/taller; código no materializado |
+| [03 — Arquitectura](03-arquitectura.md) | Topología, invariantes, riesgos y criterio de evolución | Referencia vigente |
+| [02 — Producción](02-produccion-aws-terraform.md) | Terraform, scripts, DAG/job EMR, Compose y operación AWS | Guía; infraestructura no materializada ni validada E2E |
+| [ADR](adr/README.md) | Razones y consecuencias de decisiones estructurales | Registro de decisiones |
 
-Las decisiones que no se rediscuten mientras seguís las guías están en
-[`adr/`](adr/README.md) — nueve ADR con su contexto, sus consecuencias y lo que se descartó.
-
-### Cómo está organizada la guía 02
-
-Es **un solo documento** con numeración continua de §1 a §22, en el orden en que se
-construye la plataforma: cada sección usa lo que dejó la anterior. Se recorre en seis
-tramos, y el [índice](02-produccion-aws-terraform.md#índice) enlaza sección por sección.
-
-La infraestructura objetivo se describe como **composición Terraform**, pero este checkout no
-incluye `infra/` ni los scripts o Compose de producción. La guía 02 es incremental y contiene los
-bloques a materializar, pero no debe declararse desplegada ni promoverse con datos reales desde este
-árbol hasta completar sus gates de producción y probarlos.
-
-| Tramo | Secciones | Qué resuelve |
-|---|---|---|
-| [1 · Fundamentos](02-produccion-aws-terraform.md#1-panorama-de-la-arquitectura) | §1–§4 | Panorama, costo, prerrequisitos y el **contrato de variables** (guía 02 §3.1) |
-| [2 · Núcleo EC2](02-produccion-aws-terraform.md#5-núcleo-ec2-con-docker) | §5 | Red, IAM, EC2+EBS, auto start/stop, deploy y HTTPS |
-| [3 · Datos y cómputo](02-produccion-aws-terraform.md#6-data-lake-en-s3) | §6–§7 | Buckets, backups, EMR Serverless y los disparadores |
-| [4 · Operación](02-produccion-aws-terraform.md#8-operación-diaria-y-diagnóstico) | §8–§10 | Día a día, diagnóstico, patrones DataOps y despliegue |
-| [5 · Entrega y hardening](02-produccion-aws-terraform.md#11-cicd-con-github-actions-y-oidc) | §11–§15 | CI/CD con OIDC, observabilidad, secretos, Compose y runbook |
-| [6 · Gobierno y evolución](02-produccion-aws-terraform.md#16-athena-e-iceberg) | §16–§22 + apéndices | Gate de datos reales: gobierno/costo/recuperación, más Iceberg y extensiones |
-
-## Por dónde empezar
-
-No se leen en orden numérico: se leen según qué querés hacer hoy.
+## Orden de lectura
 
 ```mermaid
-flowchart TD
-    Q([¿Qué querés hacer?])
-
-    Q --> L{"Aprender / desarrollar<br/>en mi máquina"}
-    L --> L1["01 · Stack local<br/><i>cómo está armado el Compose</i>"]
-    L1 --> L6["06 · Medallion desde cero<br/><i>escribir los 15 proyectos</i>"]
-    L6 --> L3["03 · Arquitectura<br/><i>entender los límites antes de producción</i>"]
-
-    Q --> P{"Desplegar en AWS"}
-    P --> P0["03 · Arquitectura<br/><i>el porqué, antes del cómo</i>"]
-    P0 --> P1["02 · Producción con Terraform<br/><i>el camino principal</i>"]
-
-    Q --> O{"Operar / diagnosticar<br/>algo que ya corre"}
-    O --> O1["02 · Operación y diagnóstico<br/><i>sección 8, con el catálogo de 8.6</i>"]
-
-    Q --> H{"Entender por qué<br/>algo está así"}
-    H --> H1["03 · Arquitectura"]
-    H --> H2["adr/<br/><i>las nueve decisiones y lo descartado</i>"]
-
-    style P1 fill:#d1ecf1,stroke:#0c5460
-    style L1 fill:#d1ecf1,stroke:#0c5460
-    style L6 fill:#d4edda,stroke:#155724
+flowchart LR
+    L["01 · Stack local"] --> M["06 · Pipelines medallion"]
+    M --> A["03 · Arquitectura"]
+    A --> P["02 · Producción AWS"]
 ```
 
-**El orden que sí importa**: 01 → **06** → 03 → 02. La 06 es donde se escribe
-el código: `dags/` arranca vacío y esa guía lo entrega completo, en quince pasos.
- El stack local es el
-prerrequisito real del de producción —se desarrolla acá y se despliega allá—, y la
-guía 02 arranca con un gate explícito que lo verifica. Saltar directo a 02 sin un DAG
-que corra en local funciona hasta el primer error, y ahí se paga en minutos de EMR lo
-que en Docker cuesta segundos.
+El orden operativo sí importa: primero se valida el código en local; después se revisan los límites
+de la arquitectura; finalmente se materializa producción. La guía 02 crea recursos facturables y
+exige avanzar por checkpoints.
 
-**02 y 02b son caminos alternativos para lo mismo, no complementarios.** 02
-(Terraform) es el camino principal y la fuente de verdad. 02b (consola) sirve para
-*entender* qué crea cada bloque, o para una cuenta donde no podés correr Terraform.
-**No los mezcles sobre el mismo recurso**: si algo lo creaste a mano y lo querés en
-Terraform, va `terraform import` antes del siguiente `apply`.
+## Organización de la guía 02
 
-## Convenciones comunes a todas las guías
+La guía de producción tiene once secciones acumulativas:
 
-| Convención | Qué significa |
+| Sección | Resultado |
 |---|---|
-| **Dónde corre el bloque** | Tres contextos, no intercambiables: tu máquina (el default), dentro de la EC2 (`# EN LA EC2`, credenciales del rol de instancia) o GitHub Actions con OIDC. Un bloque de CI ejecutado en local no demuestra nada: prueba tus permisos de admin, no los del rol de OIDC |
-| **`task` arriba, desplegable abajo** | Los bloques ejecutables de la guía 02 muestran la task y, en «Qué corre por dentro», el `terraform`/`aws` equivalente. Las tasks de producción se materializan desde [guía 02 §3.0b](02-produccion-aws-terraform.md#30b-el-orquestador-de-comandos-taskfileyml); las locales ya están en el repo |
-| **En esta sección / Salís con** | El encabezado de cada sección dice si toca **leer**, **ejecutar** o **consultar**, y cuánto lleva. Las de «consultar» no se leen de corrido |
-| **Mapa del camino** | Prerrequisitos, diagrama de pasos y reglas de la sección, antes del primer comando |
-| ✅ **Gate** | El criterio de aceptación de una sección. Si no lo cumplís, no sigas a la siguiente |
-| > **Gotcha** | Un fallo real que ya pasó, con su causa. Están donde muerden, no en un anexo |
-| *Roadmap* | Diseño, no runbook. No está implementado ni validado |
+| [1](02-produccion-aws-terraform.md#1-arquitectura-y-prerrequisitos) | Arquitectura, gate, costo y prerrequisitos |
+| [2](02-produccion-aws-terraform.md#2-configuración-de-aws-y-contrato-de-variables) | Contexto operativo derivado de outputs |
+| [3](02-produccion-aws-terraform.md#3-terraform-y-estado-remoto) | Backend y composición Terraform |
+| [4](02-produccion-aws-terraform.md#4-infraestructura-base-red-iam-y-ec2) | Red, IAM, EC2 y automatización de encendido/apagado |
+| [5](02-produccion-aws-terraform.md#5-airflow-en-producción) | Airflow productivo y acceso controlado |
+| [6](02-produccion-aws-terraform.md#6-s3-y-cómputo-con-emr-serverless) | Data lake, backups y EMR Serverless |
+| [7](02-produccion-aws-terraform.md#7-dag-de-airflow-para-emr-serverless) | DAG de integración contra EMR |
+| [8](02-produccion-aws-terraform.md#8-validación-técnica-y-end-to-end) | Smoke, E2E, operación y diagnóstico |
+| [9](02-produccion-aws-terraform.md#9-flujo-diario-de-desarrollo-y-despliegue) | Flujo de entrega y rollback |
+| [10](02-produccion-aws-terraform.md#10-operación-seguridad-y-limpieza) | Secretos, Compose canónico, calidad, recuperación y teardown |
+| [11](02-produccion-aws-terraform.md#11-observabilidad-prometheus-grafana-y-loki) | Alertas y observabilidad |
 
-## Qué contiene el repositorio
+## Convenciones comunes
 
-El repositorio versiona el proyecto local. Que un bloque figure en la guía de producción no
-significa que exista, esté desplegado o haya pasado una prueba integrada en AWS.
-
-| Capacidad | Dónde vive |
+| Marca | Significado |
 |---|---|
-| Spark, HDFS, Jupyter y Airflow en local | [Guía 01 §0](01-stack-local.md#0-construcción-incremental-del-entorno) — bootstrap copy-paste |
-| Los 15 pipelines medallion y su runtime | [Guía 06](06-medallion-desde-cero.md) — el código vive en la guía, no en `dags/` |
-| Orquestador de comandos (`Taskfile.yml` + módulos) | [Guía 01 §0.15](01-stack-local.md#015--crear-los-comandos-repetibles) — lanzador y módulo local; guía 02 §3.0b agrega el módulo de producción cuando se necesita |
-| Terraform de red, EC2, S3, EMR Serverless y automatización | Guía 02 — bloques copy-paste, no materializados ni validados E2E |
-| DAG de Airflow contra EMR Serverless | Guía 02 §9.4 |
-| Jobs Spark para EMR Serverless | Guía 02 §6.4 |
-| Compose de producción y carga de secretos desde SSM | Guía 02 §13.4 y §14.1 |
-| Validación en CI y despliegue con OIDC | Guía 02 §11 |
-| Observabilidad Prometheus/Grafana/Loki | Guía 02 §12 y §14.2 — roadmap |
-| Tablas Iceberg | Guía 02 §16 — roadmap; el job de referencia escribe Parquet |
-| dbt, Great Expectations y OpenLineage | Guía 02 §19–§22 — roadmap |
+| **CREAR/COPIAR** | Crear la ruta indicada con el bloque completo |
+| **AGREGAR** | Ampliar el archivo sin borrar lo construido antes |
+| **REEMPLAZAR** | Sustituir únicamente el bloque identificado |
+| **EJECUTAR** | Correr desde el contexto indicado: local, EC2 o CI |
+| **VALIDAR/Checkpoint** | No avanzar hasta obtener el resultado esperado |
+| **Referencia** | Explicación; no se materializa ni ejecuta |
 
 ## Regla de mantenimiento
 
-Mientras producción exista solo como guía, sus bloques son la fuente de verdad y se copian de forma
-incremental. Después de materializarlos, los archivos versionados pasan a ser canónicos y la guía
-se actualiza en el mismo cambio; cada cambio de arquitectura actualiza esta matriz, la guía 02, la
-arquitectura 03 y el ADR correspondiente.
-
-Los comandos locales no llevan valores escritos a mano: leen las variables de `.env` y el Compose
-versionado. En producción, el contrato de variables de guía 02 §3.1 se materializa antes del primer
-apply y se revisa junto con cada cambio de contrato u operación.
+- El código de local vive en las guías 01 y 06; el de producción, en la guía 02.
+- La guía 03 debe describir exactamente la topología que construye la guía 02.
+- Un cambio estructural actualiza el ADR correspondiente, la arquitectura y la guía ejecutable en
+  el mismo cambio.
+- No se versionan copias materializadas para “demostrar” la guía. La demostración válida consiste
+  en extraer sus bloques a un workspace temporal, validar sintaxis y ejecutar los checkpoints del
+  entorno correspondiente.
+- Roadmap o componentes diferidos deben declararse como tales y no aparecer en diagramas como si
+  ya fueran parte del recorrido ejecutable.

@@ -50,6 +50,6 @@ la mayor parte del tiempo idle.
 
 ## Dónde vive
 
-Guía 02 [guía 02 §6.4](../02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless) (módulo `emr`),
-[guía 02 §6.6](../02-produccion-aws-terraform.md#66-dag-ejecutable-de-referencia) (el DAG) y
-[guía 02 §17](../02-produccion-aws-terraform.md#17-qué-motor-usar-para-cada-tarea) (cuándo usar cada motor).
+Guía 02 [§6.4](../02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless) (módulo `emr`),
+[§7.1](../02-produccion-aws-terraform.md#71-dag-ejecutable-para-el-smoke-controlado) (el DAG) y
+[§9.1](../02-produccion-aws-terraform.md#91-elegir-el-motor) (cuándo usar cada motor).

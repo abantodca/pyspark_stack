@@ -39,5 +39,5 @@ silencio** y te quedás sin lock creyendo que lo tenés.
 
 ## Dónde vive
 
-Guía 02 [guía 02 §4](../02-produccion-aws-terraform.md#4-fundamentos-backend-terraform) (bootstrap y
-`backend.tf`) y el prerrequisito de versión en [guía 02 §3](../02-produccion-aws-terraform.md#3-prerrequisitos).
+Guía 02 [§3](../02-produccion-aws-terraform.md#3-terraform-y-estado-remoto) (bootstrap, `backend.tf`
+y validación de la versión de Terraform).

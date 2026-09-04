@@ -34,7 +34,7 @@ de fallo** para Airflow, Postgres y el monitoreo.
 **Se pierde:**
 
 - **No hay HA.** Si la instancia muere, Airflow no corre hasta que la recrees. El RTO real es el que
-  tarde `terraform apply` + el deploy (§15), y el RPO es el último snapshot de DLM.
+  tarde `terraform apply` más el despliegue (guía 02 §10.8), y el RPO es el último snapshot de DLM.
 - Un `apply` que reemplace la instancia corta lo que esté corriendo. Por eso el runbook exige
   ventana acordada.
 
@@ -55,7 +55,7 @@ entero en vez de llevarse Postgres.
 
 ## Dónde vive
 
-Guía 02 [guía 02 §1](../02-produccion-aws-terraform.md#1-panorama-de-la-arquitectura),
-[guía 02 §5](../02-produccion-aws-terraform.md#5-núcleo-ec2-con-docker) (módulo `orchestrator`) y el
+Guía 02 [§1](../02-produccion-aws-terraform.md#1-arquitectura-y-prerrequisitos),
+[§5](../02-produccion-aws-terraform.md#5-airflow-en-producción) (módulo `orchestrator`) y el
 `[!WARNING]` del encabezado. La discusión de alternativas está en
 [03 — Arquitectura](../03-arquitectura.md).

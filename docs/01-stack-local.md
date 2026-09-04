@@ -1,22 +1,15 @@
 # El stack local, bloque por bloque
 
-> Tramo I del stack: el entorno donde desarrollás y donde todo tiene que funcionar
-> **antes** de tocar AWS. Cómo está construido el `docker-compose.yml` (HDFS + Spark +
+> El entorno donde desarrollás y donde todo tiene que funcionar. Cómo está construido el
+> `docker-compose.yml` (HDFS + Spark +
 > Jupyter + Airflow 3), el porqué de cada decisión y cómo endurecerlo sin romper la
 > comodidad del desarrollo.
 
 > [!IMPORTANT]
-> **Dev y prod no son lo mismo, y la diferencia es deliberada.** Este Compose es el
-> entorno de **desarrollo local**, self-contained: trae su propio HDFS y su propio
-> cluster Spark. En **producción** la arquitectura es híbrida: Airflow sigue
-> orquestando desde una EC2 chica, pero el cómputo Spark se delega a **EMR
-> Serverless** y el storage es **S3** (`s3a://`) — **sin HDFS**. Se desarrolla acá y
-> se despliega allá; el stack local no cambia. Ver
-> [02](02-produccion-aws-terraform.md) y [03](03-arquitectura.md).
->
-> **Qué implica en la práctica**: un job que dependa de rutas `hdfs://` escritas a
-> mano funciona acá y falla allá. Parametrizá la URI base desde el principio; el
-> contrato local está en [06 — Medallion desde cero](06-medallion-desde-cero.md#3-preparar-el-entorno-una-sola-vez).
+> Este Compose es **local y autocontenido**: trae su propio HDFS y su propio cluster Spark.
+> Producción se construye por separado siguiendo [02](02-produccion-aws-terraform.md), después de
+> validar este entorno y revisar la [arquitectura](03-arquitectura.md). Ninguno de los dos runtimes
+> está materializado en este checkout documental.
 
 > **En este documento: CREAR (~30 min), LEER (~40 min) y EJECUTAR el endurecimiento de la sección 8.**
 > **Salís con**: entender por qué cada servicio está donde está —no solo cómo
@@ -51,7 +44,7 @@ la guía, comparalo con el bloque antes de reemplazarlo.
 ```gitignore
 # --- Secretos / entorno ---
 .env
-# Overrides locales del cargador de contexto (guía 02, sección 3.1): rutas y perfil de TU máquina.
+# Overrides locales del cargador de contexto (guía 02, sección 2.3): rutas y perfil de TU máquina.
 # El patrón `.env` de arriba NO lo cubre: gitignore compara nombres completos, y este se
 # llama prod.env. Commitearlo apuntaría los comandos de otra persona a tu cuenta o tu clave.
 **/prod.env
@@ -117,15 +110,14 @@ infra/modules/*/*.zip
 **CREAR:** `requirements.txt`
 
 ```text
-# Providers para Airflow 3.2.2 (Python 3.14).
-# Versiones tomadas del constraints file oficial constraints-3.2.2/constraints-3.14.txt.
+# Providers para Airflow 3.3.1 (Python 3.14).
+# Versiones tomadas del constraints file oficial constraints-3.3.1/constraints-3.14.txt.
 # - apache-spark: SparkSubmitOperator para lanzar los jobs contra el cluster standalone.
 # - fab: necesario en Airflow 3 para el FabAuthManager y el comando `airflow users create`.
-# pyspark==4.2.0 se instala aparte en Dockerfile.airflow (sin constraints) para casar con el cluster Spark 4.2.0.
-apache-airflow-providers-apache-spark==6.0.2
-apache-airflow-providers-fab==3.6.4
-# Producción: EmrServerlessStartJobOperator. Pin compatible con Airflow 3.2.2/Python 3.14.
-apache-airflow-providers-amazon[aiobotocore]==9.29.0
+# PySpark, Pandas y PyArrow se instalan aparte en Dockerfile.airflow: Spark 4.2 exige
+# pandas>=2.2,<3.0, mientras el constraints de Airflow fija pandas 3.x.
+apache-airflow-providers-apache-spark==6.3.1
+apache-airflow-providers-fab==3.8.0
 ```
 
 ### 0.4 · Construir la imagen de Airflow
@@ -133,16 +125,16 @@ apache-airflow-providers-amazon[aiobotocore]==9.29.0
 **CREAR:** `Dockerfile.airflow`
 
 ```dockerfile
-# Airflow 3.2.2 (rama 3.2, la mas madura a jul-2026) sobre Python 3.14 + Spark 4.2.0.
+# Airflow 3.3.1 (release de mantenimiento estable a sep-2026) sobre Python 3.14 + Spark 4.2.0.
 # Stack "lo mas actual manteniendo estabilidad": Python 3.14 obliga a PySpark >= 4.1 (4.0.x
 # solo declara soporte hasta 3.13 y su cloudpickle no serializa contra el bytecode de 3.14).
 # Se usa Spark 4.2.0, que requiere Java 17 -> se instala Temurin (Adoptium) JDK 17 desde
 # tarball (bookworm no trae openjdk-11; y Spark 4 ya no soporta Java 11).
 FROM apache/spark:4.2.0-scala2.13-java17-python3-ubuntu@sha256:84a4eedb1abcf36a90808d5a1310e3e910b78c85d85aaa1599e31af5f862ed59 AS spark-runtime
 
-FROM apache/airflow:3.2.2-python3.14@sha256:db1b6917b2460637faa28fda794fa2c419f4618c7a79062f2e863a62cfc1132f
+FROM apache/airflow:3.3.1-python3.14@sha256:d4ed2a3cf0103b52b69f5ee57cfaefd4274dca56b546c4396b83ccaf93057539
 
-ARG AIRFLOW_VERSION=3.2.2
+ARG AIRFLOW_VERSION=3.3.1
 ARG PYTHON_VERSION=3.14
 ARG SPARK_VERSION=4.2.0
 # JDK 17 (x86_64). Si cambias de arquitectura, ajusta esta URL de Adoptium.
@@ -171,15 +163,21 @@ ENV PATH="${PATH}:${JAVA_HOME}/bin:${SPARK_HOME}/bin"
 
 # ----------------------------
 # 🔁 Switch back to airflow user and install Python providers
-#    Se usa el constraints file OFICIAL de Airflow 3.2.2 para no romper la version de airflow.
+#    Se usa el constraints file OFICIAL de Airflow 3.3.1 para no romper la version de airflow.
 # ----------------------------
 USER airflow
 COPY requirements.txt /
 RUN pip install --no-cache-dir -r /requirements.txt \
       --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
 
-# pyspark 4.2.0 SIN constraints: debe casar con el cluster Spark 4.2.0.
-RUN pip install --no-cache-dir 'pyspark[sql]==4.2.0' 'pytest==8.4.2'
+# Runtime Spark fuera del constraints de Airflow: pandas 2.3.3 es la primera rama 2.x
+# compatible con Python 3.14 y respeta el rango oficial de PySpark 4.2 (>=2.2,<3.0).
+RUN pip install --no-cache-dir \
+      'pyspark[sql]==4.2.0' \
+      'pandas==2.3.3' \
+      'pyarrow==25.0.0' \
+      'pytest==8.4.2' && \
+    pip check
 ```
 
 ### 0.5 · Construir la imagen de Spark
@@ -201,9 +199,10 @@ RUN apt-get update && \
     add-apt-repository -y ppa:deadsnakes/ppa && \
     apt-get update && \
     apt-get install -y --no-install-recommends python3.14 python3.14-venv && \
-    python3.14 -m ensurepip --upgrade && \
-    python3.14 -m pip install --no-cache-dir \
-      'numpy==2.4.6' 'pandas==2.3.3' 'pyarrow==24.0.0' && \
+    python3.14 -m venv /opt/py314 && \
+    /opt/py314/bin/pip install --no-cache-dir \
+      'numpy==2.5.1' 'pandas==2.3.3' 'pyarrow==25.0.0' && \
+    /opt/py314/bin/pip check && \
     apt-get purge -y software-properties-common && apt-get autoremove -y && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -214,28 +213,7 @@ RUN apt-get update && \
 # Los executors PySpark arrancan con este interprete (debe casar con el driver 3.14).
 ENV PYSPARK_PYTHON=python3.14
 ENV PYSPARK_DRIVER_PYTHON=python3.14
-
-# --- Conector S3A: habilita leer/escribir s3a:// usando el rol IAM de la EC2 (sin keys) ---
-# Spark 4.2.0 empaqueta Hadoop 3.5.0 => hadoop-aws debe ser 3.5.0 y el AWS SDK v2 el que
-# declara esa version (bundle 2.35.4). Si aparece ClassNotFound/NoSuchMethod de S3A, ajusta estas versiones.
-ARG HADOOP_AWS_VERSION=3.5.0
-ARG AWS_SDK_BUNDLE_VERSION=2.35.4
-# hadoop-aws 3.5.0 declara ademas el Analytics Accelerator (solo se carga con
-# fs.s3a.input.stream.type=analytics, pero sin el jar seria NoClassDefFoundError).
-ARG AAL_VERSION=1.3.1
-RUN curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
-      -o "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
-    curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar.sha1" -o /tmp/hadoop-aws.jar.sha1 && \
-    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/hadoop-aws.jar.sha1)" "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" | sha1sum -c - && \
-    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" \
-      -o "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" && \
-    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar.sha1" -o /tmp/aws-bundle.jar.sha1 && \
-    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/aws-bundle.jar.sha1)" "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" | sha1sum -c - && \
-    curl -fSL "https://repo1.maven.org/maven2/software/amazon/s3/analyticsaccelerator/analyticsaccelerator-s3/${AAL_VERSION}/analyticsaccelerator-s3-${AAL_VERSION}.jar" \
-      -o "/opt/spark/jars/analyticsaccelerator-s3-${AAL_VERSION}.jar" && \
-    curl -fSL "https://repo1.maven.org/maven2/software/amazon/s3/analyticsaccelerator/analyticsaccelerator-s3/${AAL_VERSION}/analyticsaccelerator-s3-${AAL_VERSION}.jar.sha1" -o /tmp/aal.jar.sha1 && \
-    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/aal.jar.sha1)" "/opt/spark/jars/analyticsaccelerator-s3-${AAL_VERSION}.jar" | sha1sum -c - && \
-    rm -f /tmp/hadoop-aws.jar.sha1 /tmp/aws-bundle.jar.sha1 /tmp/aal.jar.sha1
+ENV PATH="/opt/py314/bin:${PATH}"
 
 USER spark
 ```
@@ -257,33 +235,14 @@ RUN apt-get update && \
     add-apt-repository -y ppa:deadsnakes/ppa && \
     apt-get update && \
     apt-get install -y --no-install-recommends python3.14 python3.14-venv && \
-    python3.14 -m ensurepip --upgrade && \
-    python3.14 -m pip install --no-cache-dir \
+    python3.14 -m venv /opt/py314 && \
+    /opt/py314/bin/pip install --no-cache-dir \
       'jupyterlab==4.6.3' 'pytest==8.4.2' 'six==1.17.0' \
-      'numpy==2.4.6' 'pandas==2.3.3' 'pyarrow==24.0.0' && \
+      'numpy==2.5.1' 'pandas==2.3.3' 'pyarrow==25.0.0' && \
+    /opt/py314/bin/pip check && \
     apt-get purge -y software-properties-common && apt-get autoremove -y && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     mkdir -p /opt/notebooks
-
-# --- Conector S3A: habilita s3a:// desde el notebook usando el rol IAM de la EC2 ---
-ARG HADOOP_AWS_VERSION=3.5.0
-ARG AWS_SDK_BUNDLE_VERSION=2.35.4
-# hadoop-aws 3.5.0 declara ademas el Analytics Accelerator (solo se carga con
-# fs.s3a.input.stream.type=analytics, pero sin el jar seria NoClassDefFoundError).
-ARG AAL_VERSION=1.3.1
-RUN curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
-      -o "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
-    curl -fSL "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar.sha1" -o /tmp/hadoop-aws.jar.sha1 && \
-    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/hadoop-aws.jar.sha1)" "/opt/spark/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" | sha1sum -c - && \
-    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" \
-      -o "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" && \
-    curl -fSL "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_BUNDLE_VERSION}/bundle-${AWS_SDK_BUNDLE_VERSION}.jar.sha1" -o /tmp/aws-bundle.jar.sha1 && \
-    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/aws-bundle.jar.sha1)" "/opt/spark/jars/bundle-${AWS_SDK_BUNDLE_VERSION}.jar" | sha1sum -c - && \
-    curl -fSL "https://repo1.maven.org/maven2/software/amazon/s3/analyticsaccelerator/analyticsaccelerator-s3/${AAL_VERSION}/analyticsaccelerator-s3-${AAL_VERSION}.jar" \
-      -o "/opt/spark/jars/analyticsaccelerator-s3-${AAL_VERSION}.jar" && \
-    curl -fSL "https://repo1.maven.org/maven2/software/amazon/s3/analyticsaccelerator/analyticsaccelerator-s3/${AAL_VERSION}/analyticsaccelerator-s3-${AAL_VERSION}.jar.sha1" -o /tmp/aal.jar.sha1 && \
-    printf '%s  %s\n' "$(tr -d '\r\n ' </tmp/aal.jar.sha1)" "/opt/spark/jars/analyticsaccelerator-s3-${AAL_VERSION}.jar" | sha1sum -c - && \
-    rm -f /tmp/hadoop-aws.jar.sha1 /tmp/aws-bundle.jar.sha1 /tmp/aal.jar.sha1
 
 WORKDIR /opt/notebooks
 EXPOSE 8888
@@ -291,15 +250,14 @@ EXPOSE 8888
 # El driver del notebook y los executors usan Python 3.14 (igual que el cluster).
 ENV PYSPARK_PYTHON=python3.14
 ENV PYSPARK_DRIVER_PYTHON=python3.14
+ENV PATH="/opt/py314/bin:${PATH}"
 # La distribución oficial ya incluye PySpark y Py4J; se exponen al Python de Jupyter
 # sin descargar una segunda copia de 434 MB desde PyPI.
 ENV PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.9-src.zip
 
-# Token controlado por la env var JUPYTER_TOKEN (sh expande la variable y exec
-# entrega las señales directamente a JupyterLab):
-#  - sin definir/vacia -> sin token (entorno local de practica, igual que antes);
-#  - definida (override de prod, ver docs/02, sección 14.1, docker-compose.prod.yml) -> token obligatorio.
-CMD ["sh", "-c", "exec python3.14 -m jupyterlab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token=\"${JUPYTER_TOKEN:-}\" --ServerApp.password= --ServerApp.root_dir=/opt/notebooks"]
+# Jupyter Server 2 lee JUPYTER_TOKEN directamente; no use las opciones obsoletas
+# ServerApp.token ni ServerApp.password. Compose exige que el token no esté vacío.
+CMD ["python3.14", "-m", "jupyterlab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--ServerApp.root_dir=/opt/notebooks"]
 ```
 
 ### 0.7 · Preparar el History Server opcional
@@ -472,7 +430,7 @@ spark.history.fs.logDirectory    file:/tmp/spark-events
 
 ```yaml
 # -----------------------------------------------------------------------------
-# Config comun de los servicios de Airflow 3.2.2 (LocalExecutor).
+# Config comun de los servicios de Airflow 3.3.1 (LocalExecutor).
 # Airflow 3 parte el monolito: api-server (UI+API), scheduler, dag-processor y triggerer
 # son procesos independientes que comparten esta misma imagen, env y volumenes.
 # -----------------------------------------------------------------------------
@@ -485,7 +443,7 @@ x-default-logging: &default-logging
 x-airflow-common: &airflow-common
   # image + build compartidos: la imagen se construye UNA vez y los 5 servicios airflow-*
   # la reutilizan (evita 5 imagenes duplicadas de ~7GB y que 'up' agarre una imagen vieja).
-  image: pyspark_stack-airflow:3.2.2
+  image: pyspark_stack-airflow:3.3.1
   build:
     context: .
     dockerfile: Dockerfile.airflow
@@ -679,9 +637,9 @@ services:
       dockerfile: Dockerfile.jupyter
     image: pyspark_stack-jupyter:4.2.0
     container_name: jupyter-notebook
-    # Jupyter es herramienta de DESARROLLO (explorar/depurar antes de promover a DAG).
-    # En prod el ETL corre por Airflow y los .ipynb por papermill (headless, sin este server),
-    # así que aquí queda bajo el perfil "dev": solo arranca si COMPOSE_PROFILES=dev (ver .env.example)
+    # Jupyter es herramienta de DESARROLLO (explorar/depurar antes de promover a DAG)
+    # y no forma parte de producción. Aquí queda bajo el perfil "dev": solo arranca
+    # si COMPOSE_PROFILES=dev (ver .env.example)
     # o con `docker compose --profile dev up`. Un `docker compose up` "pelado" (prod) NO lo levanta.
     profiles: ["dev"]
     ports:
@@ -703,8 +661,8 @@ services:
       - PYSPARK_PYTHON=python3.14
       - PYSPARK_DRIVER_PYTHON=python3.14
       # Sin esta línea el token del .env nunca llega al contenedor: compose usa el .env para
-      # sustituir en el YAML, no lo inyecta en el proceso. Dockerfile.jupyter lo lee como
-      # --ServerApp.token="${JUPYTER_TOKEN:-}" y, vacío, levanta JupyterLab SIN token.
+      # sustituir en el YAML, no lo inyecta en el proceso. Jupyter Server 2 lee
+      # JUPYTER_TOKEN directamente; Compose rechaza un valor vacío.
       - JUPYTER_TOKEN=${JUPYTER_TOKEN:?define JUPYTER_TOKEN en .env}
     healthcheck:
       test: ["CMD", "python3.14", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/api', timeout=5)"]
@@ -897,8 +855,7 @@ services:
 
 ```dotenv
 # Copiá este archivo a .env y completalo. NO commitear .env (ya está en .gitignore).
-# Estos valores son para el stack LOCAL: en producción los secretos se generan fuertes y se cargan
-# desde AWS SSM (ver docs/02-produccion-aws-terraform.md sección 13).
+# Estos valores son exclusivamente para el stack local; no reutilices sus secretos en otros entornos.
 
 # El arranque normal incluye Jupyter para conservar el laboratorio completo.
 COMPOSE_PROFILES=dev
@@ -1248,7 +1205,7 @@ El Compose levanta cuatro subsistemas en una sola red de Docker (`hadoopnet`):
 | Almacenamiento | `hdfs-namenode`, `hdfs-datanode` | Sistema de archivos distribuido |
 | Cómputo | `spark-master`, `spark-worker` | Cluster Spark 4.2.0 standalone |
 | Interactivo | `jupyter` | Driver PySpark para trabajo exploratorio |
-| Orquestación | `airflow-*` (6) + `airflow-db` | Airflow 3.2.2 + Postgres 16 |
+| Orquestación | `airflow-*` (6) + `airflow-db` | Airflow 3.3.1 + Python 3.14 + Postgres 16 |
 
 **Los comandos del día a día se resuelven desde el `Taskfile.yml` de la raíz**, pero viven en
 `taskfiles/Taskfile.local.yml`, que creaste en la sección 0.15.
@@ -1301,7 +1258,7 @@ Es la sección que hace legible todo lo que viene después: si no reconocés `&a
 
 ```yaml
 x-airflow-common: &airflow-common
-  image: pyspark_stack-airflow:3.2.2
+  image: pyspark_stack-airflow:3.3.1
   build:
     context: .
     dockerfile: Dockerfile.airflow
@@ -1362,9 +1319,7 @@ Volúmenes compartidos:
 > del stack que no se puede recrear alegremente.
 
 > [!NOTE]
-> **HDFS es solo local.** En producción no existe: el storage es S3 (`s3a://`). Está
-> acá para que puedas practicar el modelo de archivos distribuido sin pagar nada, no
-> porque sea el destino. El layout obligatorio se documenta en
+> HDFS es el almacenamiento persistente de este stack. El layout obligatorio se documenta en
 > [06 — Medallion desde cero, sección 3](06-medallion-desde-cero.md#3-preparar-el-entorno-una-sola-vez).
 
 **Archivo:** `docker-compose.yml`, servicios `hdfs-namenode` y `hdfs-datanode`.
@@ -1408,10 +1363,8 @@ Volúmenes compartidos:
 > `spark://spark-master:7077` que van a usar todos los `spark-submit`.
 
 > [!NOTE]
-> **En producción este cluster no existe**: el cómputo se delega a EMR Serverless
-> ([guía 02, sección 6.4](02-produccion-aws-terraform.md#64-cómputo-spark-emr-serverless)). Lo que **sí** viaja
-> es tu código: la lógica de transformación es la misma y por eso conviene mantenerla
-> desacoplada del I/O mediante el runtime compartido.
+> El cluster pertenece al entorno local. Mantené la lógica de transformación desacoplada del I/O
+> mediante el runtime compartido para poder probarla sin depender de la infraestructura.
 
 **Archivo:** `docker-compose.yml`, servicios `spark-master` y `spark-worker`.
 **Tipo:** configuración Compose; inicia procesos de Spark, no contiene una transformación PySpark.
@@ -1467,11 +1420,8 @@ de Spark ni se ejecuta con `spark-submit`.
 > más: se conecta al master y ejecuta en los workers.
 
 > [!WARNING]
-> **Jupyter corre bajo el perfil `dev` y no debe llegar a producción.** Sin token es
-> ejecución remota de código para cualquiera que alcance el puerto — por eso
-> `JUPYTER_TOKEN` está en el checklist de la sección 9 y por eso el stack de
-> producción ([guía 02, sección 14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)) no lo
-> incluye.
+> **Jupyter corre bajo el perfil `dev`.** Sin token permite ejecución remota de código a cualquiera
+> que alcance el puerto; por eso `JUPYTER_TOKEN` es obligatorio y el servicio se liga a loopback.
 
 **Archivo:** `docker-compose.yml`, servicio `jupyter`.
 **Tipo:** configuración Compose; el contenido que escribas en `./notebooks` sí será código propio.
@@ -1500,7 +1450,7 @@ de Spark ni se ejecuta con `spark-submit`.
   usar `task local:up-dev` o `docker compose --profile dev up` de forma explícita.
 
   > **No crees el `.env` todavía solo para leer esta sección.** La creación completa y verificable
-  > está en [sección 8.1](#81-secretos-en-un-env). A diferencia del `.env` de producción (guía 02, sección 13.4),
+  > está en [sección 8.1](#81-secretos-en-un-env). A diferencia del `.env` de producción (guía 02, sección 10.5),
   > este es un único archivo local: se crea una vez en la raíz del repositorio y no crece por
   > secciones.
 - **`Dockerfile.jupyter` se construye sobre `apache/spark:4.2.0`**, no sobre la clásica
@@ -1524,10 +1474,7 @@ en `notebooks/` y son los que contienen tu código.
 > **Salís con**: saber qué hace cada proceso de Airflow 3 y por qué el
 > monolito `webserver`+`scheduler` de Airflow 2 ya no existe.
 
-Importa más que las otras porque **Airflow es lo único de este Compose que sobrevive
-tal cual a producción**: la EC2 corre estos mismos procesos
-([guía 02, sección 14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)). Lo que cambia allá es
-lo que los rodea, no ellos.
+Airflow coordina los DAGs locales y conserva su metadata en Postgres.
 
 Airflow 3 separó el viejo monolito (`webserver` + `scheduler`) en procesos independientes; todos
 heredan de `*airflow-common`.
@@ -1736,8 +1683,7 @@ docker compose -f docker-compose.yml -f docker-compose.local-hardened.yml exec a
 
 `docker compose down -v` sí elimina deliberadamente `airflow_logs`, Postgres y HDFS; no lo use
 como parada rutinaria. La retención por edad limita el histórico y la rotación limita ráfagas de
-los contenedores. En producción, la copia durable va a S3 y se elimina del host tras subirla
-([guía 02, sección 14.1](02-produccion-aws-terraform.md#141-docker-composeprodyml--base)).
+los contenedores.
 
 ### 8.1 Secretos en un `.env`
 
@@ -1809,10 +1755,7 @@ task local:check
 **Resultado esperado:** el comando termina con código 0 y no imprime errores de interpolación ni
 de YAML. El arranque viene en la sección 9.1, después de terminar las decisiones opcionales de esta sección.
 
-> Este override endurece el **stack local completo**, útil si querés correrlo así en una sola
-> máquina. No confundir con producción: el Compose de producción de la
-> [guía 02, sección 14.1](02-produccion-aws-terraform.md) **no levanta** HDFS ni Spark —en la EC2 solo corren
-> Airflow, Postgres y el monitoreo— porque el cómputo va a EMR Serverless y el storage a S3.
+> Este override endurece el **stack local completo**, útil si querés correrlo en una sola máquina.
 
 ### 8.3 Secretos parametrizados en el Compose base
 
@@ -1841,8 +1784,6 @@ x-airflow-common: &airflow-common
 ```
 
 > Los nombres de usuario y base conservan defaults no sensibles; las contraseñas, JWT y token no.
-> El Compose de producción deberá cargarlos desde SSM antes de arrancar
-> ([guía 02, sección 13](02-produccion-aws-terraform.md)).
 
 ### 8.4 Mantener `docker.sock` fuera del stack
 
@@ -1908,8 +1849,8 @@ task local:up      # construye lo que falte y levanta el stack en segundo plano
 `local:up` depende de `local:check`: si falta el `.env`, un secreto es débil o el archivo no es
 privado, aborta antes de tocar Docker.
 
-La primera vez construye las tres imágenes propias y descarga las imágenes base, dependencias de
-Python y el bundle del SDK de AWS; puede mover varios GiB y tardar varios minutos según tu conexión.
+La primera vez construye las tres imágenes propias y descarga las imágenes base y dependencias de
+Python; puede mover varios GiB y tardar varios minutos según tu conexión.
 Las corridas siguientes reutilizan la caché y suelen ser mucho más rápidas.
 
 Un build largo no muestra nada hasta terminar. Para verlo avanzar en vivo:
@@ -1984,10 +1925,7 @@ La tarea imprime el usuario y contraseña de Airflow, y la URL de Jupyter con su
 su salida ni la pegues en tickets, chats o capturas.
 
 Es una comodidad **exclusiva del laboratorio local**: lee tu `.env` para abrir servicios ligados a
-`127.0.0.1`. No existe un equivalente `prod:credentials`: en producción los secretos no se dejan en
-el estado de Terraform ni se imprimen en la terminal; se administran en AWS SSM y la EC2 los carga
-con su rol de instancia. La operación equivalente allí es consultar las URLs e identificadores no
-secretos con `task prod:infra:output`, como explica la [guía 02, sección 8.1](02-produccion-aws-terraform.md#81-cargar-el-contexto-de-producción).
+`127.0.0.1`.
 
 Si necesitás leer los valores directamente desde `.env`:
 
@@ -2022,13 +1960,12 @@ DAGs, su historial y los datos en HDFS.
 
 ## 10. Checklist de calidad
 
-> **En esta sección: VERIFICAR antes de pasar a producción.**
-> **Salís con**: la confirmación de que el Tramo I está sano — que es el gate de
-> entrada del Tramo II ([02](02-produccion-aws-terraform.md)).
+> **En esta sección: VERIFICAR el entorno local.**
+> **Salís con**: la confirmación de que el stack está sano.
 
 - [ ] `.env` fuera de git y con secretos generados con `openssl`.
 - [ ] `AIRFLOW_JWT_SECRET` único por entorno.
-- [ ] `JUPYTER_TOKEN` no vacío (solo aplica en local: en producción Jupyter no corre).
+- [ ] `JUPYTER_TOKEN` no vacío.
 - [x] `restart: unless-stopped` en todos los servicios long-running mediante el override.
 - [x] Healthchecks en HDFS, Spark y Jupyter, no solo en Postgres.
 - [x] Límites de memoria por servicio (`deploy.resources.limits`).
@@ -2037,6 +1974,12 @@ DAGs, su historial y los datos en HDFS.
 - [x] Imágenes base externas pineadas por versión y `@sha256`.
 - [ ] Backup de los volúmenes de Postgres y del namenode de HDFS.
 
-> **Siguiente paso:** [03 — Arquitectura](03-arquitectura.md) para el mapa conceptual. La guía
-> [02 — Producción en AWS](02-produccion-aws-terraform.md) es arquitectura objetivo y no un
-> despliegue ejecutable desde este checkout.
+> **Siguiente paso:** [06 — Medallion desde cero](06-medallion-desde-cero.md) para construir los
+> pipelines sobre este entorno.
+
+Referencias de compatibilidad:
+
+- [Airflow 3.3: versiones de Python soportadas](https://airflow.apache.org/docs/apache-airflow/stable/installation/prerequisites.html)
+- [Airflow: instalación reproducible con constraints](https://airflow.apache.org/docs/apache-airflow/stable/installation/installing-from-pypi.html)
+- [PySpark 4.2: dependencias opcionales y rangos soportados](https://spark.apache.org/docs/4.2.0/api/python/getting_started/install.html)
+- [Pandas 2.3.3: compatibilidad con Python 3.14](https://pandas.pydata.org/docs/whatsnew/v2.3.3.html)
